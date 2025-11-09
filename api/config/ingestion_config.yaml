@@ -1,0 +1,168 @@
+# ==========================================================
+# 🚀 ingestion_config.yaml — Global Ingestion Configuration (v2.0)
+# ==========================================================
+# Centralized configuration for all intelligent ingestion modules
+# (Excel, PDF, DOCX, TXT, JSON, RSS/API) in MarketingAdvantage™ AI
+# ==========================================================
+
+version: 2.0.0
+meta:
+  created_by: "MarketingAdvantage™ AI Core"
+  description: "Unified configuration for all ingestion pipelines with adaptive LLM profiles"
+
+# ==========================================================
+# 🧠 LLM SETTINGS
+# ==========================================================
+llm:
+  model_name: "llama3.1:8b"
+  prompt_version: "4.0-Llama-Hyper-Pro"
+  temperature: 0.2
+  max_retries: 2
+  timeout_seconds: 180
+  ollama_api_url: "http://localhost:11434/api/generate"
+
+# ==========================================================
+# 📏 CHUNKING SETTINGS
+# ==========================================================
+chunking:
+  semantic_chunking: true
+  max_chunk_size: 1200
+  recursive_threshold: 1800
+  overlap_size: 150
+  min_confidence: 0.5
+  enable_language_detection: true
+
+# ==========================================================
+# 🧩 CHROMADB SETTINGS
+# ==========================================================
+chromadb:
+  path: "./chromadb_store"
+  collection_name: "content_knowledge_base"
+
+# ==========================================================
+# 📦 PATH SETTINGS
+# ==========================================================
+paths:
+  uploads: "./data/uploads"
+  logs: "./logs"
+  temp: "./data/temp"
+  cache: "./data/cache"
+
+# ==========================================================
+# 📂 SUPPORTED FORMATS
+# ==========================================================
+formats:
+  supported_extensions:
+    - ".pdf"
+    - ".txt"
+    - ".docx"
+    - ".csv"
+    - ".xlsx"
+    - ".json"
+  rss_support: true
+  api_support: true
+
+# ==========================================================
+# ⚙️ MODULE CONTROL
+# ==========================================================
+modules:
+  enabled:
+    - excel
+    - pdf
+    - docx
+    - text
+    - json
+    - rss
+  recursive_fallback: true
+  semantic_chunking: true
+  auto_detect_file_type: true
+
+# ==========================================================
+# 🌐 RSS / API INGESTION SETTINGS
+# ==========================================================
+rss:
+  default_feeds:
+    - "https://news.google.com/rss/search?q=business+innovation"
+    - "https://feeds.bbci.co.uk/news/business/rss.xml"
+    - "https://feeds.feedburner.com/TechCrunch"
+  refresh_interval_minutes: 60
+  auto_classify_streams: true
+  max_items_per_feed: 10
+  deduplicate_titles: true
+
+# ==========================================================
+# 🧱 TAXONOMY / DATABASE SETTINGS
+# ==========================================================
+taxonomy:
+  enable_auto_linking: true
+  default_group: "content"
+  create_missing_categories: true
+
+database:
+  type: "postgres"
+  pool_size: 10
+  connection_retry_seconds: 5
+
+# ==========================================================
+# ⚙️ ADAPTIVE INGESTION PROFILES
+# ==========================================================
+profiles:
+  active: "balanced"  # Options: light | balanced | deep
+
+  light:
+    llm_enabled: false
+    semantic_chunking: false
+    recursive_fallback: false
+    classification_confidence_threshold: 0.6
+    max_chunk_size: 800
+    enable_trace: false
+    use_embeddings: false
+    description: "Fastest mode — keyword-based categorization, skips deep LLM context."
+
+  balanced:
+    llm_enabled: true
+    semantic_chunking: true
+    recursive_fallback: true
+    classification_confidence_threshold: 0.8
+    max_chunk_size: 1200
+    enable_trace: false
+    use_embeddings: true
+    description: "Recommended default — balanced accuracy and performance."
+
+  deep:
+    llm_enabled: true
+    semantic_chunking: true
+    recursive_fallback: true
+    classification_confidence_threshold: 0.9
+    max_chunk_size: 1600
+    enable_trace: true
+    use_embeddings: true
+    multi_pass_validation: true
+    context_window: 4096
+    description: "Highest accuracy — full semantic recursion, multi-pass validation."
+
+auto_adjust_mode:
+  enabled: true
+  threshold_docs_per_batch: 100
+
+# ==========================================================
+# 🛡️ SAFETY / LOGGING SETTINGS
+# ==========================================================
+logging:
+  level: "INFO"
+  file: "./logs/ingestion_engine.log"
+  rotate_days: 7
+  enable_trace_log: true
+
+telemetry:
+  anonymized: true
+  enabled: true
+  doc_url: "https://docs.trychroma.com/telemetry"
+
+# ==========================================================
+# 🧪 TEST / DEBUG MODE
+# ==========================================================
+debug:
+  dry_run: false
+  verbose_output: false
+  show_internal_trace: false

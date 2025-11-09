@@ -1,0 +1,274 @@
+{
+  "version": "2.1.0",
+  "last_updated": "2025-11-01",
+  "description": "Unified marketing, strategy, trend, and KPI taxonomy for enterprise-level RAG + analytics systems.",
+
+  "Content": {
+    "Purpose": {
+      "values": [
+        "Thought Leadership",
+        "Demand Generation",
+        "Lead Nurturing",
+        "Product Education",
+        "Brand Awareness",
+        "Sales Enablement",
+        "Technical Documentation",
+        "Community Engagement",
+        "Crisis Communication"
+      ],
+      "synonyms": {
+        "Thought Leadership": ["Expert Insight", "Authority Content"],
+        "Demand Generation": ["Inbound", "Growth Marketing"],
+        "Sales Enablement": ["Buyer Enablement", "Conversion Optimization"]
+      }
+    },
+    "Format": {
+      "values": [
+        "Blog Article",
+        "Newsletter",
+        "Case Study",
+        "Ebook/Whitepaper",
+        "Infographic",
+        "Podcast",
+        "Short Video",
+        "Long-form Video",
+        "Social Post",
+        "Webinar",
+        "Interactive Tool"
+      ]
+    },
+    "JourneyStage": {
+      "values": [
+        "Awareness (Top-of-Funnel)",
+        "Consideration (Middle-of-Funnel)",
+        "Decision (Bottom-of-Funnel)",
+        "Adoption",
+        "Retention",
+        "Advocacy"
+      ]
+    },
+    "Industry": {
+      "values": [
+        "FinTech",
+        "HealthTech",
+        "EdTech",
+        "E-Commerce",
+        "TravelTech",
+        "PropTech",
+        "GreenTech",
+        "Manufacturing",
+        "Media",
+        "AI & Data Analytics"
+      ]
+    },
+    "Persona": {
+      "values": [
+        "Marketing Manager",
+        "Growth Hacker",
+        "CMO",
+        "Product Manager",
+        "CEO/Founder",
+        "Sales Director",
+        "Content Strategist",
+        "Customer Success Lead"
+      ]
+    },
+    "Metadata": {
+      "fields": [
+        "Language",
+        "Region",
+        "Platform (LinkedIn, Instagram, etc.)",
+        "AI Generated (Yes/No)",
+        "Review Status (Draft, Approved, Published)",
+        "Embedding Source (RAG/Web)"
+      ]
+    }
+  },
+
+  "Strategy": {
+    "Corporate": {
+      "values": [
+        "Growth Strategy",
+        "Diversification",
+        "Mergers & Acquisitions",
+        "Market Penetration",
+        "Vision & Mission Alignment"
+      ]
+    },
+    "Competitive": {
+      "values": [
+        "Cost Leadership",
+        "Differentiation",
+        "Focus Strategy",
+        "Blue Ocean Strategy",
+        "First Mover Advantage"
+      ]
+    },
+    "Planning Frameworks": {
+      "values": [
+        "SWOT Analysis",
+        "PESTEL",
+        "Ansoff Matrix",
+        "BCG Matrix",
+        "Balanced Scorecard",
+        "Value Chain Analysis",
+        "OKR Planning",
+        "McKinsey 7S Model"
+      ]
+    },
+    "Functional": {
+      "values": [
+        "Operations Strategy",
+        "Financial Strategy",
+        "Human Resource Strategy",
+        "Technology & Innovation",
+        "Customer Success",
+        "Marketing Execution"
+      ]
+    },
+    "AI_Assisted_Strategy": {
+      "values": [
+        "Predictive Strategy Modeling",
+        "AI-Driven Market Forecasting",
+        "Automated Competitive Intelligence"
+      ]
+    }
+  },
+
+  "Trend": {
+    "GlobalBusiness": {
+      "values": [
+        "AI Transformation",
+        "Sustainability & ESG",
+        "Digital Transformation",
+        "Remote Work Evolution",
+        "Circular Economy",
+        "Decentralization (Web3)"
+      ]
+    },
+    "Marketing": {
+      "values": [
+        "AI-Powered Personalization",
+        "Voice Search Optimization",
+        "Community-Led Growth",
+        "Zero-Party Data Marketing",
+        "Creator Economy",
+        "Micro-Influencer Strategies"
+      ]
+    },
+    "Tech": {
+      "values": [
+        "Generative AI",
+        "Edge Computing",
+        "Augmented Reality Marketing",
+        "Predictive Analytics in Ads",
+        "Quantum Marketing",
+        "Chatbot Personalization"
+      ]
+    },
+    "Region": {
+      "values": [
+        "North America",
+        "Europe",
+        "Middle East",
+        "APAC",
+        "Africa",
+        "Global"
+      ]
+    },
+    "SourceType": {
+      "values": [
+        "News",
+        "Social Media",
+        "Research Paper",
+        "Industry Report",
+        "Podcast",
+        "Video Commentary"
+      ]
+    }
+  },
+
+  "KPI": {
+    "MarketingPerformance": {
+      "values": [
+        "CTR (Click-Through Rate)",
+        "Conversion Rate",
+        "Bounce Rate",
+        "Engagement Rate",
+        "Cost per Lead (CPL)",
+        "ROI (Return on Investment)"
+      ]
+    },
+    "SalesPerformance": {
+      "values": [
+        "Lead-to-Customer Conversion",
+        "Pipeline Velocity",
+        "Average Deal Size",
+        "Customer Acquisition Cost (CAC)",
+        "Lifetime Value (LTV)"
+      ]
+    },
+    "CustomerSuccess": {
+      "values": [
+        "Churn Rate",
+        "Retention Rate",
+        "Net Promoter Score (NPS)",
+        "Customer Health Index"
+      ]
+    },
+    "ContentEffectiveness": {
+      "values": [
+        "Time on Page",
+        "Scroll Depth",
+        "Share Rate",
+        "Backlink Count",
+        "Social Mentions"
+      ]
+    }
+  },
+
+  "Business": {
+    "Lifecycle": {
+      "values": [
+        "Ideation",
+        "Validation",
+        "MVP Launch",
+        "Growth Stage",
+        "Scaling",
+        "Maturity",
+        "Exit or IPO"
+      ]
+    },
+    "Model": {
+      "values": [
+        "SaaS",
+        "Marketplace",
+        "D2C",
+        "Consulting",
+        "Subscription",
+        "Freemium",
+        "Licensing"
+      ]
+    },
+    "Vertical": {
+      "values": [
+        "FinTech",
+        "HealthTech",
+        "EdTech",
+        "PropTech",
+        "GreenTech",
+        "Cybersecurity",
+        "Media & Entertainment"
+      ]
+    },
+    "Operational": {
+      "values": [
+        "Risk Management",
+        "Legal Compliance",
+        "Financial Planning",
+        "Technology Stack",
+        "Vendor Management"
+      ]
+    }
+  }
+}

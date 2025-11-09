@@ -1,0 +1,48 @@
+C:\ProjectK\MarketingAdvantage_AI_v1\
+│
+├── .env                                 # Environment variables (models, DB, API URLs)
+├── main.py                              # FastAPI application entrypoint
+│
+├── api/
+│   ├── routes/                          # REST endpoints
+│   │   ├── auth.py
+│   │   ├── strategy.py
+│   │   ├── content.py
+│   │   ├── campaigns.py
+│   │   ├── kpi.py
+│   │   ├── trends.py
+│   │   ├── engagement.py
+│   │   └── persona_system_prompt.txt
+│   │
+│   ├── db/                              # Database management layer
+│   │   ├── connection.py
+│   │   ├── models.py
+│   │   ├── crud.py
+│   │   ├── init.sql
+│   │   ├── init_utf8.sql
+│   │   ├── schema_v1.sql
+│   │   └── seed_data.sql
+│   │
+│   ├── services/                        # AI & business logic layer
+│   │   ├── llm_connector.py
+│   │   ├── prompt_templates.py
+│   │   ├── ad_service.py
+│   │   ├── seo_service.py
+│   │   └── report_service.py
+│   │
+│   └── utils/                           # Helper utilities
+│       ├── auth_utils.py
+│       ├── logger.py
+│       └── validation.py
+│
+├── gpt_core/                            # AI orchestration system
+│   ├── prompts/
+│   │   └── prompt_builder.py
+│   │
+│   ├── memory/
+│   │   └── session_memory_handler.py
+│   │
+│   └── utils/
+│       └── config.yaml
+│
+└── session_memory.json (runtime) 

@@ -1,0 +1,88 @@
+{
+  "version": "1.0.0",
+  "last_updated": "2025-11-02",
+  "description": "Default MarketingAdvantage AI RSS Source Feeds — Business, Strategy, AI, and Startups",
+
+  "sources": [
+    {
+      "name": "McKinsey Insights",
+      "url": "https://www.mckinsey.com/feeds/rss",
+      "category": "Strategy",
+      "sub_category": "Corporate Strategy",
+      "language": "en",
+      "priority": 10
+    },
+    {
+      "name": "Harvard Business Review",
+      "url": "https://hbr.org/feed",
+      "category": "Business Strategy",
+      "sub_category": "Leadership",
+      "language": "en",
+      "priority": 9
+    },
+    {
+      "name": "TechCrunch Startups",
+      "url": "https://techcrunch.com/startups/feed/",
+      "category": "Startups",
+      "sub_category": "Innovation",
+      "language": "en",
+      "priority": 8
+    },
+    {
+      "name": "Entrepreneur",
+      "url": "https://www.entrepreneur.com/latest.rss",
+      "category": "Entrepreneurship",
+      "sub_category": "SMBs",
+      "language": "en",
+      "priority": 8
+    },
+    {
+      "name": "HubSpot Marketing Blog",
+      "url": "https://blog.hubspot.com/marketing/rss.xml",
+      "category": "Digital Marketing",
+      "sub_category": "Inbound Marketing",
+      "language": "en",
+      "priority": 7
+    },
+    {
+      "name": "Google AI Blog",
+      "url": "https://blog.research.google/feed/",
+      "category": "AI & Innovation",
+      "sub_category": "Research",
+      "language": "en",
+      "priority": 6
+    },
+    {
+      "name": "OpenAI Blog",
+      "url": "https://openai.com/blog/rss",
+      "category": "AI & Innovation",
+      "sub_category": "LLM",
+      "language": "en",
+      "priority": 6
+    },
+    {
+      "name": "Forbes Leadership",
+      "url": "https://www.forbes.com/leadership/feed/",
+      "category": "Leadership",
+      "sub_category": "Enterprise Strategy",
+      "language": "en",
+      "priority": 6
+    },
+    {
+      "name": "Crunchbase News",
+      "url": "https://news.crunchbase.com/feed/",
+      "category": "Startups",
+      "sub_category": "Funding & Venture",
+      "language": "en",
+      "priority": 5
+    },
+    {
+      "name": "MIT Sloan Management Review",
+      "url": "https://sloanreview.mit.edu/feed/",
+      "category": "Management",
+      "sub_category": "Business Innovation",
+      "language": "en",
+      "priority": 5
+    }
+  ]
+}
