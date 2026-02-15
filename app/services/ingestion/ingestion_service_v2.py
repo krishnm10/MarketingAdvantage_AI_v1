@@ -24,8 +24,9 @@ from app.services.ingestion.parsers_router_v2 import ParserRouterV2
 from app.services.ingestion.row_segmenter_v2 import parse_dataframe_rows
 from app.services.ingestion.segmenter_v2 import recursive_semantic_chunk
 from app.utils.logger import log_info
-
+from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 from sentence_transformers import SentenceTransformer
+
 import chromadb
 
 
@@ -33,7 +34,7 @@ import chromadb
 # CONFIGURATION
 # =============================================
 CHROMA_PATH = "./chroma_db"
-EMBED_MODEL_NAME = "BAAI/bge-large-en"
+#EMBED_MODEL_NAME = "BAAI/bge-large-en"
 BATCH_SIZE = 256
 
 # Lazy-initialized resources (do not create heavy clients/models at import time)
@@ -256,7 +257,7 @@ def get_embedder():
     """
     global EMBEDDER  # ✅ Fixed - no underscore
     if EMBEDDER is None:  # ✅ Fixed
-        EMBEDDER = SentenceTransformer(EMBED_MODEL_NAME)  # ✅ Fixed
+        EMBEDDER = SentenceTransformer(EMBEDDING_MODEL_NAME)  # ✅ Fixed
     return EMBEDDER  # ✅ Fixed
 
 

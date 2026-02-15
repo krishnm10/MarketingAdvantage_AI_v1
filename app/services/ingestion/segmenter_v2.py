@@ -10,6 +10,7 @@ import hashlib
 from typing import List, Dict, Any
 from datetime import datetime
 from functools import lru_cache
+from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 
 # ❗ Removed embed model usage here — embedding is now centralized in ingestion_service_v2
 # to avoid blocking event loop inside segmenter.
@@ -17,7 +18,7 @@ from functools import lru_cache
 @lru_cache(maxsize=1)
 def get_embed_model():
     from sentence_transformers import SentenceTransformer
-    return SentenceTransformer("all-MiniLM-L6-v2")
+    return SentenceTransformer("EMBEDDING_MODEL_NAME")
 
 # -------------------------------------------------------------------
 # TOKEN COUNTER

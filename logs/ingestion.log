@@ -760,3 +760,57 @@ DETAIL:  Key (id)=(471802ef-85bb-409e-a68c-68132e261961) already exists.
 2026-02-08T21:55:21.196336 | [SAVED] Phase-1_Marketing_Advantage_V1.docx (11c9f634c9019728d9bb51bee664d08cc5bf702a53f72f46f9f7e7337f558fe9) → static\uploads\api\Phase-1_Marketing_Advantage_V1_48fcc20b5ce3418985eb814bc188ec25.docx
 2026-02-08T21:55:21.329552 | [PARSED] Phase-1_Marketing_Advantage_V1.docx using parse_docx
 2026-02-08T21:55:32.013628 | [INGESTED] Phase-1_Marketing_Advantage_V1.docx successfully processed.
+2026-02-14T22:51:37.063864 | [HASH] Crisil.pdf → fdd3debe5b549cf0247778383fd606bae66a32cc48490cb4135212331e51b590
+2026-02-14T22:51:37.075270 | [SAVED] Crisil.pdf (fdd3debe5b549cf0247778383fd606bae66a32cc48490cb4135212331e51b590) → static\uploads\api\Crisil_ac3928cdcce94021ada28686e177bd7b.pdf
+2026-02-14T22:51:38.864723 | [PARSED] Crisil.pdf using parse_pdf
+2026-02-14T22:51:59.250368 | [INGESTED] Crisil.pdf successfully processed.
+2026-02-14T23:40:30.137206 | [HASH] testdata.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-14T23:40:30.152054 | [SAVED] testdata.txt (cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff) → static\uploads\api\testdata_f9f55b2131634d7ab220324792873214.txt
+2026-02-14T23:40:30.163227 | [PARSED] testdata.txt using parse_text
+2026-02-14T23:40:31.010904 | [INGESTED] testdata.txt successfully processed.
+2026-02-15T04:39:19.822133 | [HASH] testdata.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:39:19.921189 | [SAVED] testdata.txt (cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff) → static\uploads\api\testdata_e180d447e4214f6ab131444bb4105e12.txt
+2026-02-15T04:39:19.929190 | [PARSED] testdata.txt using parse_text
+2026-02-15T04:43:08.437324 | [INGESTED] testdata.txt successfully processed.
+2026-02-15T04:43:08.466404 | [HASH] Phase-1_Marketing_Advantage_V1.docx → 11c9f634c9019728d9bb51bee664d08cc5bf702a53f72f46f9f7e7337f558fe9
+2026-02-15T04:43:08.470411 | [SAVED] Phase-1_Marketing_Advantage_V1.docx (11c9f634c9019728d9bb51bee664d08cc5bf702a53f72f46f9f7e7337f558fe9) → static\uploads\api\Phase-1_Marketing_Advantage_V1_bd18f6a1f47c4c6485dfac0f80fc9cf0.docx
+2026-02-15T04:43:08.565170 | [PARSED] Phase-1_Marketing_Advantage_V1.docx using parse_docx
+2026-02-15T04:43:12.685334 | [INGESTED] Phase-1_Marketing_Advantage_V1.docx successfully processed.
+2026-02-15T04:47:55.182132 | [HASH] testdata.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:47:55.189028 | [SKIPPED_DB_DUPLICATE] testdata.txt
+2026-02-15T04:51:10.355435 | [HASH] testdata.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:51:10.358306 | [SAVED] testdata.txt (cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff) → static\uploads\api\testdata_b5c6012eb87048cc9ddab30a4773233a.txt
+2026-02-15T04:51:10.358306 | [PARSED] testdata.txt using parse_text
+2026-02-15T04:51:10.780042 | [INGESTED] testdata.txt successfully processed.
+2026-02-15T04:52:11.917877 | [HASH] New Text Document.txt → e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+2026-02-15T04:52:11.922496 | [SAVED] New Text Document.txt (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) → static\uploads\api\New Text Document_033dde30c7924014b4965fcf156c7f25.txt
+2026-02-15T04:52:11.925556 | [FAILED] New Text Document.txt: [text_parser_v2] Text file is empty: static\uploads\api\New Text Document_033dde30c7924014b4965fcf156c7f25.txt
+2026-02-15T04:52:15.113087 | [HASH] tttttt.txt → e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+2026-02-15T04:52:15.118804 | [SAVED] tttttt.txt (e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) → static\uploads\api\tttttt_91645394a9a647c084bfcc984b4f9fd0.txt
+2026-02-15T04:52:15.118804 | [FAILED] tttttt.txt: [text_parser_v2] Text file is empty: static\uploads\api\tttttt_91645394a9a647c084bfcc984b4f9fd0.txt
+2026-02-15T04:52:30.617891 | [HASH] tttttt.txt → bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47
+2026-02-15T04:52:30.625925 | [SAVED] tttttt.txt (bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47) → static\uploads\api\tttttt_93a043180c1a4b319e50983cb86d9597.txt
+2026-02-15T04:52:30.642951 | [PARSED] tttttt.txt using parse_text
+2026-02-15T04:52:31.215379 | [INGESTED] tttttt.txt successfully processed.
+2026-02-15T04:53:19.039504 | [HASH] tttttt.txt → bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47
+2026-02-15T04:53:19.039504 | [SAVED] tttttt.txt (bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47) → static\uploads\api\tttttt_63b114aecd734be691e985421e12ac4f.txt
+2026-02-15T04:53:19.052318 | [PARSED] tttttt.txt using parse_text
+2026-02-15T04:53:19.658732 | [INGESTED] tttttt.txt successfully processed.
+2026-02-15T04:53:38.121315 | [HASH] testdata.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:53:38.125328 | [SAVED] testdata.txt (cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff) → static\uploads\api\testdata_3039c04ddcda4a02b6971bfce2e87768.txt
+2026-02-15T04:53:38.129343 | [PARSED] testdata.txt using parse_text
+2026-02-15T04:53:38.615631 | [INGESTED] testdata.txt successfully processed.
+2026-02-15T04:53:38.622809 | [HASH] tttttt.txt → bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47
+2026-02-15T04:53:38.628222 | [SKIPPED_DB_DUPLICATE] tttttt.txt
+2026-02-15T04:56:43.116087 | [HASH] tttttt_v1.txt → bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47
+2026-02-15T04:56:43.226697 | [SAVED] tttttt_v1.txt (bcf32dafe18bab752f6b01b0843d142a7997b4da1e1b524f872d1795ecb0ec47) → static\uploads\api\tttttt_v1_67f5e807f1184fac9d4e89c45639aa88.txt
+2026-02-15T04:56:43.246280 | [PARSED] tttttt_v1.txt using parse_text
+2026-02-15T04:56:47.508747 | [INGESTED] tttttt_v1.txt successfully processed.
+2026-02-15T04:56:47.519478 | [HASH] testdata_v1.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:56:47.520757 | [SAVED] testdata_v1.txt (cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff) → static\uploads\api\testdata_v1_7c09efe1a5154eb28da8b6e00e1f4149.txt
+2026-02-15T04:56:47.523859 | [PARSED] testdata_v1.txt using parse_text
+2026-02-15T04:56:47.875567 | [INGESTED] testdata_v1.txt successfully processed.
+2026-02-15T04:59:23.398390 | [HASH] testdata_v3.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:59:23.400395 | [SKIPPED_DB_DUPLICATE] testdata_v3.txt
+2026-02-15T04:59:32.627369 | [HASH] testdata_v3.txt → cca71414ca5a4fabc8952e07b819934edc49e5afb07396fd7278f9d1412402ff
+2026-02-15T04:59:32.633595 | [SKIPPED_DB_DUPLICATE] testdata_v3.txt

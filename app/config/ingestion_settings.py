@@ -5,6 +5,16 @@
 
 from typing import Final
 
+
+
+# -------------------------------------------------------------------
+# 🧠 EMBEDDING MODEL CONFIGURATION (CRITICAL)
+# -------------------------------------------------------------------
+# The source of truth for all ingestion and retrieval. 
+# Changing this requires re-indexing the entire database and ChromaDB.
+EMBEDDING_MODEL_NAME: Final[str] = "BAAI/bge-large-en-v1.5"
+EMBEDDING_DIMENSION: Final[int] = 1024  # bge-large models use 1024 dims
+
 # -------------------------------------------------------------------
 # 🧠 LLM MODE SELECTION (Dynamic toggle for factual vs creative)
 # -------------------------------------------------------------------

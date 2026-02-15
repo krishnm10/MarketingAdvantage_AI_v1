@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 from sentence_transformers import SentenceTransformer
 
 from app.retrieval.runtime import RetrievalRuntime
@@ -19,14 +20,14 @@ from app.services.retrieval.chroma_search import get_chroma_search
 # =========================================================
 
 _EMBEDDER = None
-EMBED_MODEL_NAME = "BAAI/bge-large-en"
+#EMBED_MODEL_NAME = "BAAI/bge-large-en"
 
 
 def get_query_embedder():
     global _EMBEDDER
     if _EMBEDDER is None:
-        print(f"🔧 Loading embedding model: {EMBED_MODEL_NAME}...")
-        _EMBEDDER = SentenceTransformer(EMBED_MODEL_NAME)
+        print(f"🔧 Loading embedding model: {EMBEDDING_MODEL_NAME}...")
+        _EMBEDDER = SentenceTransformer(EMBEDDING_MODEL_NAME)
         print("✅ Model loaded successfully")
     return _EMBEDDER
 
