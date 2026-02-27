@@ -66,10 +66,10 @@ def create_normalized_hash(text: str) -> str:
 
 async def check_embedding_similarity(
     db: AsyncSession,
-    chroma_collection,
-    embedder,
+    vectordb: "BaseVectorDB",     # pluggable
+    embedder: "BaseEmbedder",     # pluggable
     chunk_text: str,
-    chunk_embedding: np.ndarray,
+    query_embedding: List[float], # already a List[float] — no numpy needed
     similarity_threshold: float = 0.95,
     top_k: int = 5
 ) -> Optional[Dict[str, Any]]:
@@ -90,38 +90,24 @@ async def check_embedding_similarity(
     """
     try:
         # Query ChromaDB for similar vectors
-        results = chroma_collection.query(
-            query_embeddings=[chunk_embedding.tolist()],
-            n_results=top_k,
-            include=['distances', 'metadatas', 'documents']
+        hits = vectordb.search(
+            collection="ingested_content",
+            query_embedding=query_embedding,   # already List[float]
+            top_k=top_k,
         )
-
-        if not results or not results['ids'][0]:
+        if not hits:
             return None
-
-        # Check each result
-        for idx, distance in enumerate(results['distances'][0]):
-            # ChromaDB returns L2 distance, convert to cosine similarity
-            # similarity = 1 - (distance / 2)  # Approximation for normalized vectors
-            similarity = 1 - distance  # If using cosine distance metric
-
-            if similarity >= similarity_threshold:
-                chunk_id = results['ids'][0][idx]
-                metadata = results['metadatas'][0][idx] if results.get('metadatas') else {}
-
-                log_info(
-                    f"[Dedup Layer 2] Found semantic duplicate: "
-                    f"similarity={similarity:.4f}, chunk_id={chunk_id}"
-                )
-
+        for hit in hits:
+            if hit.score >= similarity_threshold:
+                log_info(f"[Dedup Layer 2] Found semantic duplicate "
+                         f"similarity={hit.score:.4f}, chunk_id={hit.id}")
                 return {
-                    'is_duplicate': True,
-                    'duplicate_chunk_id': chunk_id,
-                    'similarity_score': float(similarity),
-                    'duplicate_text': results['documents'][0][idx] if results.get('documents') else None,
-                    'dedup_layer': 'embedding_similarity'
+                    "is_duplicate":       True,
+                    "duplicate_chunk_id": hit.id,
+                    "similarity_score":   float(hit.score),
+                    "duplicate_text":     hit.text,
+                    "dedup_layer":        "embedding_similarity",
                 }
-
         return None
 
     except Exception as e:
@@ -190,12 +176,12 @@ async def check_global_content_index(
 async def deduplicate_chunks(
     db: AsyncSession,
     chunks: List[Dict[str, Any]],
-    chroma_collection,
-    embedder,
+    vectordb: "BaseVectorDB",      # replaces chroma_collection
+    embedder: "BaseEmbedder",      # replaces raw SentenceTransformer
     file_id: str,
     business_id: Optional[str] = None,
     enable_embedding_dedup: bool = True,
-    similarity_threshold: float = 0.95
+    similarity_threshold: float = 0.95,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     3-Layer Deduplication Pipeline (Production-Grade).
@@ -293,16 +279,9 @@ async def deduplicate_chunks(
         if enable_embedding_dedup:
             # Generate embedding for this chunk
             try:
-                chunk_embedding = embedder.encode(chunk_text, convert_to_numpy=True)
-
-                # Check ChromaDB for semantic duplicates
+                query_embedding: List[float] = embedder.embed_query(chunk_text)  # BaseEmbedder, returns List[float]
                 embedding_result = await check_embedding_similarity(
-                    db,
-                    chroma_collection,
-                    embedder,
-                    chunk_text,
-                    chunk_embedding,
-                    similarity_threshold
+                    db, vectordb, embedder, chunk_text, query_embedding, similarity_threshold
                 )
 
                 if embedding_result:

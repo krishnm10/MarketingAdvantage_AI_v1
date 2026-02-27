@@ -1,6 +1,7 @@
 # file_router_v2.py — Production-Safe Unified Version with DB-Based Deduplication
 # Updated to integrate with enhanced ingestion_service_v2 (GlobalContentIndex-ready)
 # (PATCH: filename sanitization + unique saved filename to prevent path traversal/overwrite)
+# Gap-2: replaced hardwired if/elif connector routing with ingestor_registry lookup
 import os
 import uuid
 import hashlib
@@ -17,13 +18,15 @@ from app.services.ingestion.csv_parser_v2 import parse_csv
 from app.services.ingestion.text_parser_v2 import parse_text
 from app.services.ingestion.json_parser_v2 import parse_json
 from app.services.ingestion.xml_parser_v2 import parse_xml
-from app.services.ingestion.web_scraper_v2 import ingest_webpage
-from app.services.ingestion.rss_ingestor_v2 import parse_rss
-from app.services.ingestion.api_ingestor_v2 import ingest_api_data
+
+
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
 from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.session_v2 import async_engine
 from app.utils.logger import log_info, log_warning
+
+# ✅ Gap-2: registry imports
+from app.core.plugin_registry import ingestor_registry, PluginNotFoundError
 
 # -----------------------------------------------------------
 # CONFIGURATION
@@ -39,14 +42,14 @@ async_session = async_sessionmaker(async_engine, expire_on_commit=False, autoflu
 # ROUTER MAP (EXTENSION → PARSER)
 # -----------------------------------------------------------
 PARSER_MAP = {
-    ".pdf": parse_pdf,
+    ".pdf":  parse_pdf,
     ".docx": parse_docx,
     ".xlsx": parse_excel,
-    ".xls": parse_excel,
-    ".csv": parse_csv,
-    ".txt": parse_text,
+    ".xls":  parse_excel,
+    ".csv":  parse_csv,
+    ".txt":  parse_text,
     ".json": parse_json,
-    ".xml": parse_xml,
+    ".xml":  parse_xml,
 }
 
 # -----------------------------------------------------------
@@ -92,15 +95,13 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         # -----------------------
         # SANITIZE + UNIQUE SAVE
         # -----------------------
-        # Remove any path parts from filename and create a unique saved filename
-        safe_name = Path(original_file_name).name  # strips any path components
+        safe_name = Path(original_file_name).name
         safe_stem = Path(safe_name).stem
         safe_suffix = Path(safe_name).suffix or file_ext
         unique_suffix = uuid.uuid4().hex
         saved_file_name = f"{safe_stem}_{unique_suffix}{safe_suffix}"
         saved_path = os.path.join(UPLOAD_DIR, saved_file_name)
 
-        # Save file temporarily to compute hash
         content = await file.read()
         temp_path = f"{saved_path}.tmp"
         with open(temp_path, "wb") as tmpf:
@@ -123,18 +124,15 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
                 os.remove(temp_path)
                 return {"status": "skipped", "reason": "db_duplicate", "file_name": original_file_name}
 
-        # Move temp file to permanent location (safe unique name chosen above)
         os.rename(temp_path, saved_path)
         _write_log(f"[SAVED] {original_file_name} ({file_hash}) → {saved_path}")
 
-        # Parse and store
         parsed_output = await parser_func(saved_path)
         _write_log(f"[PARSED] {original_file_name} using {parser_func.__name__}")
 
         file_id = str(uuid.uuid4())
 
         async with async_session() as db:
-            # ✅ Insert into DB before ingestion
             await db.execute(
                 insert(IngestedFileV2).values(
                     id=file_id,
@@ -157,7 +155,6 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             )
             await db.commit()
 
-        # ✅ Unified ingestion (ensures global content index)
         await IngestionServiceV2.ingest_parsed_output(file_id, parsed_output)
         _write_log(f"[INGESTED] {original_file_name} successfully processed.")
         log_info(f"[file_router_v2] ✅ Ingestion complete for {original_file_name}")
@@ -171,23 +168,64 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
 
 
 # -----------------------------------------------------------
-# EXTERNAL INGESTION ROUTES (RSS / API / WEB)
+# EXTERNAL INGESTION ROUTES (RSS / API / WEB / + future sources)
 # -----------------------------------------------------------
 async def route_external_ingestion(source_type: str, source_url: str, business_id: str = None):
     try:
         log_info(f"[file_router_v2] Routing {source_type.upper()} source: {source_url}")
         _write_log(f"[ROUTING] {source_type.upper()} → {source_url}")
 
-        # ✅ Pass DB session into all external parsers for GCI + deduplication
         async with async_session() as db:
-            if source_type == "web":
-                parsed_output = await ingest_webpage(source_url, db_session=db)
-            elif source_type == "rss":
-                parsed_output = await parse_rss(source_url, db_session=db)
-            elif source_type == "api":
-                parsed_output = await ingest_api_data(source_url, db_session=db)
-            else:
-                raise HTTPException(status_code=400, detail=f"Unsupported source type: {source_type}")
+
+            # ✅ Gap-2: registry lookup replaces hardwired if/elif
+            # Adding a new source type = register it in plugin_registry.py only.
+            # This function never needs to change again.
+            # ✅ REPLACE with this block:
+            try:
+                # ── Layer-4 Security: sanitize business_id before using in file path ──
+                # Prevents path traversal attacks e.g. business_id = "../../etc/passwd"
+                auth = None
+                if business_id:
+                    import re
+                    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "", str(business_id))
+                    if not safe_id:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid business_id: contains no valid characters."
+                        )
+                
+                    cfg_path = os.path.join("app", "core", "configs", f"client_{safe_id}.json")
+                
+                    # ── Extra guard: confirm resolved path stays inside configs dir ──
+                    configs_dir   = os.path.realpath(os.path.join("app", "core", "configs"))
+                    resolved_path = os.path.realpath(cfg_path)
+                    if not resolved_path.startswith(configs_dir + os.sep):
+                        raise HTTPException(
+                            status_code=400,
+                            detail="Invalid business_id: path escapes config directory."
+                        )
+                
+                    if os.path.exists(resolved_path):
+                        from app.core.config.client_config_schema import ClientConfig
+                        from app.core.connectors.auth.resolver import resolve_auth
+                        client_cfg = ClientConfig.from_json_file(resolved_path)
+                        if client_cfg.connector:
+                            auth = resolve_auth(client_cfg.connector.auth)
+                
+                connector = ingestor_registry.build(source_type, auth=auth)
+
+            except PluginNotFoundError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Unsupported source type: '{source_type}'. "
+                        f"Available: {list(ingestor_registry.list().keys())}"
+                    ),
+                )
+
+
+            result = await connector.fetch(source_url, db_session=db)
+            parsed_output = result.to_dict()
 
             # ✅ Create DB entry for source
             safe_business_id = _safe_uuid(business_id)

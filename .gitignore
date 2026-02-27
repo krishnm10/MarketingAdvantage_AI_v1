@@ -3,3 +3,21 @@
 *.zip
 *.7z
 ffmpeg/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+logs/
+*.log
+
+# Chroma DB
+chroma_db/
+*.sqlite3
+
+# Virtual env
+venv/
+.env
+static/

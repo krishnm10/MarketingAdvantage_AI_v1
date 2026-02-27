@@ -1,5 +1,6 @@
 # parsers_router_v2.py — Unified Parser Router (Production-Ready)
-# Minimal safe fixes: await async ingestors + normalize file_type
+# Gap-3 fix: replaced 10 individual if-statements with PARSER_MAP dict.
+# Zero behavior change — same parsers, same fallback, same async handling.
 from app.utils.logger import log_info, log_warning
 
 from app.services.ingestion.pdf_parser_v2 import parse_pdf
@@ -13,6 +14,24 @@ from app.services.ingestion.web_scraper_v2 import ingest_webpage
 from app.services.ingestion.api_ingestor_v2 import ingest_api_data
 from app.services.ingestion.rss_ingestor_v2 import parse_rss
 
+# ---------------------------------------------------------------------------
+# PARSER MAP — single source of truth for all supported types.
+# Adding a new format = 1 import above + 1 line here. Nothing else changes.
+# ---------------------------------------------------------------------------
+PARSER_MAP = {
+    "pdf":  parse_pdf,
+    "docx": parse_docx,
+    "txt":  parse_text,
+    "json": parse_json,
+    "csv":  parse_csv,
+    "xlsx": parse_excel,
+    "xls":  parse_excel,
+    "xml":  parse_xml,
+    "web":  ingest_webpage,
+    "rss":  parse_rss,
+    "api":  ingest_api_data,
+}
+
 
 class ParserRouterV2:
 
@@ -20,66 +39,35 @@ class ParserRouterV2:
     async def parse(file_path_or_url: str, file_type: str):
         """
         Unified router that dynamically delegates ingestion
-        to appropriate parser or ingestor based on extension or type.
+        to the appropriate parser or ingestor based on extension or type.
         Handles: file uploads, web URLs, RSS feeds, and APIs.
+
+        Adding a new file type:
+            1. Create app/services/ingestion/<type>_parser_v2.py
+            2. Import the parse function above
+            3. Add one entry to PARSER_MAP
+            Done. This method never needs to change.
         """
 
         # Normalize file_type: accept ".pdf", "pdf", "application/pdf", etc.
         ext = (file_type or "").lower()
         if "/" in ext:
-            # if MIME type like application/pdf -> take subtype
+            # MIME type like "application/pdf" → take subtype "pdf"
             ext = ext.split("/")[-1]
         ext = ext.lstrip(".").split("?")[0]
 
         log_info(f"[ParserRouterV2] Selecting parser for {file_path_or_url} ({ext})")
 
-        # ---------------------------
-        # FILE-BASED PARSERS
-        # ---------------------------
-        if ext == "pdf":
-            return await parse_pdf(file_path_or_url)
+        parser_func = PARSER_MAP.get(ext)
 
-        if ext == "docx":
-            return await parse_docx(file_path_or_url)
+        if not parser_func:
+            log_warning(f"[ParserRouterV2] Unsupported file or source type: {ext}")
+            return {
+                "raw_text":     "",
+                "cleaned_text": "",
+                "chunks":       [],
+                "metadata":     {"source": ext},
+                "source_type":  ext,
+            }
 
-        if ext == "txt":
-            return await parse_text(file_path_or_url)
-
-        if ext == "json":
-            return await parse_json(file_path_or_url)
-
-        if ext == "csv":
-            return await parse_csv(file_path_or_url)
-
-        if ext in {"xlsx", "xls"}:
-            return await parse_excel(file_path_or_url)
-
-        if ext == "xml":
-            return await parse_xml(file_path_or_url)
-
-        # ---------------------------
-        # WEB / API / RSS INGESTORS
-        # ---------------------------
-        if ext == "web":
-            # ingest_webpage is async — await it
-            return await ingest_webpage(file_path_or_url)
-
-        if ext == "rss":
-            # parse_rss is async — await it
-            return await parse_rss(file_path_or_url)
-
-        if ext == "api":
-            # ingest_api_data is async — await it
-            return await ingest_api_data(file_path_or_url)
-
-        # ---------------------------
-        # DEFAULT FALLBACK
-        # ---------------------------
-        log_warning(f"[ParserRouterV2] Unsupported file or source type: {ext}")
-        return {
-            "raw_text": "",
-            "cleaned_text": "",
-            "chunks": [],
-            "metadata": {"source": ext},
-            "source_type": ext,
-        }
+        return await parser_func(file_path_or_url)

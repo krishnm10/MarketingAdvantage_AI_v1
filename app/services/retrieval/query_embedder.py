@@ -6,13 +6,13 @@ Matches ingestion embedding exactly (BAAI/bge-large-en)
 from sentence_transformers import SentenceTransformer
 from typing import List
 from app.utils.logger import log_debug, log_info
-
+from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 
 # =========================================================
 # CONFIGURATION
 # =========================================================
 
-EMBED_MODEL_NAME = "BAAI/bge-large-en"
+EMBED_MODEL_NAME = ""
 EMBEDDING_DIMENSION = 1024
 
 _EMBEDDER = None

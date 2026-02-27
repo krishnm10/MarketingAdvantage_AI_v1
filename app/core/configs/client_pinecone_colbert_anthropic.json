@@ -1,0 +1,51 @@
+{
+  "client_id": "enterprise_client_pinecone_colbert",
+  "client_name": "Acme Corp — Premium AI Stack",
+  "description": "Pinecone + OpenAI Embed + ColBERT + Anthropic Claude",
+
+  "vectordb": {
+    "type": "pinecone",
+    "collection": "acme_marketing_prod",
+    "pinecone": {
+      "api_key_env":    "PINECONE_API_KEY_ACME",
+      "index_name":     "acme-marketing",
+      "namespace":      "production",
+      "embedding_dim":  1536,
+      "metric":         "cosine",
+      "cloud":          "aws",
+      "region":         "us-east-1"
+    }
+  },
+
+  "embedder": {
+    "type": "openai",
+    "openai": {
+      "model":        "text-embedding-3-small",
+      "api_key_env":  "OPENAI_API_KEY_ACME",
+      "normalize":    true
+    }
+  },
+
+  "llm": {
+    "single": {
+      "type":          "anthropic",
+      "model":         "claude-3-5-sonnet-20241022",
+      "api_key_env":   "ANTHROPIC_API_KEY_ACME",
+      "temperature":   0.2,
+      "max_tokens":    2048,
+      "system_prompt": "You are a senior marketing analyst. Answer with precision and cite your sources."
+    }
+  },
+
+  "reranker": {
+    "type":       "colbert",
+    "model":      "colbert-ir/colbertv2.0",
+    "top_k":      5
+  },
+
+  "retrieval": {
+    "top_k_retrieval":      20,
+    "top_k_final":          5,
+    "enable_trust_scoring": true
+  }
+}

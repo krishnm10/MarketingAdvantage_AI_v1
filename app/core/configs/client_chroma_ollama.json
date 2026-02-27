@@ -1,0 +1,38 @@
+{
+  "client_id": "internal_marketing_team",
+  "client_name": "Internal Team (Chroma)",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "marketing_docs",
+    "chroma": {
+      "persist_directory": "./chroma_db"
+    }
+  },
+  "embedder": {
+    "type": "ollama",
+    "ollama": {
+      "model": "nomic-embed-text",
+      "base_url": "http://localhost:11434"
+    }
+  },
+  "llm": {
+    "chain": [
+      {
+        "type": "ollama",
+        "model": "llama3.2",
+        "system_prompt": "Extract the key marketing intent from this query.",
+        "max_tokens": 256
+      },
+      {
+        "type": "ollama",
+        "model": "mistral",
+        "system_prompt": "Using the extracted intent, generate a detailed marketing answer.",
+        "max_tokens": 1024
+      }
+    ]
+  },
+  "retrieval": {
+    "top_k_retrieval": 20,
+    "top_k_final": 5
+  }
+}

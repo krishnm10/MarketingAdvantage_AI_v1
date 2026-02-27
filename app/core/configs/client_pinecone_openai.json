@@ -1,0 +1,44 @@
+{
+  "client_id": "saas_client_B",
+  "client_name": "Reliance Brands",
+  "vectordb": {
+    "type": "pinecone",
+    "collection": "reliance_docs",
+    "pinecone": {
+      "api_key_env": "PINECONE_API_KEY_RELIANCE",
+      "index_name": "reliance-marketing",
+      "namespace": "production",
+      "embedding_dim": 1536,
+      "metric": "cosine",
+      "cloud": "aws",
+      "region": "us-east-1"
+    }
+  },
+  "embedder": {
+    "type": "openai",
+    "openai": {
+      "model": "text-embedding-3-small",
+      "api_key_env": "OPENAI_API_KEY_RELIANCE",
+      "normalize": true
+    }
+  },
+  "llm": {
+    "single": {
+      "type": "openai",
+      "model": "gpt-4o-mini",
+      "api_key_env": "OPENAI_API_KEY_RELIANCE",
+      "temperature": 0.2,
+      "max_tokens": 2048
+    }
+  },
+  "reranker": {
+    "type": "cohere",
+    "api_key_env": "COHERE_API_KEY_RELIANCE",
+    "top_k": 5
+  },
+  "retrieval": {
+    "top_k_retrieval": 30,
+    "top_k_final": 5,
+    "enable_trust_scoring": true
+  }
+}

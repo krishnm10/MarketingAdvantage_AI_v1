@@ -28,6 +28,12 @@ from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 from sentence_transformers import SentenceTransformer
 
 import chromadb
+# ── Gap-1: Pluggable pipeline factory ───────────────────────────────────
+import json as _json
+import os as _os
+from app.core.pipeline_factory import pipeline_factory
+from app.core.config.client_config_schema import ClientConfig
+
 
 # =============================================
 # ✅ NEW IMPORT: 3-Layer Deduplication Engine
@@ -93,6 +99,29 @@ def _resolve_text(payload: dict) -> str:
         )
     except Exception:
         return ""
+        
+# ── Gap-1: Per-client pipeline resolver ─────────────────────────────────
+_DEFAULT_PIPELINE_CONFIG = "app/core/configs/client_chroma_ollama.json"
+
+def _get_pipeline(business_id: Optional[str] = None):
+    """
+    Resolve a live AssembledPipeline from pipeline_factory.
+    Uses a per-business JSON config if it exists, otherwise falls back
+    to the default Chroma + Ollama config.
+
+    NOTE: Do NOT use this inside dedup_chunks() — the dedup engine
+    still uses the raw ChromaDB collection and SentenceTransformer directly.
+    """
+    cfg_path = (
+        f"app/core/configs/client_{business_id}.json"
+        if business_id
+        else None
+    )
+    if not cfg_path or not _os.path.exists(cfg_path):
+        cfg_path = _DEFAULT_PIPELINE_CONFIG
+    with open(cfg_path) as _f:
+        return pipeline_factory.build(ClientConfig(**_json.loads(_f.read())))
+
 
 # ============================================================
 # ADDITIVE BLOCK 1: VISUAL / CHART-LIKE CONTENT DETECTOR
@@ -728,46 +757,40 @@ class IngestionServiceV2:
     # ----------------------------------------------------------
     @staticmethod
     async def _dedup_chunks(
-        db: AsyncSession, 
-        chunks: List[Dict[str, Any]], 
+        db: AsyncSession,
+        chunks: List[Dict[str, Any]],
         file_id: str,
-        business_id: Optional[str] = None
+        business_id: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """
-        ✅ UPDATED: 3-layer deduplication with cross-file duplicate detection.
-    
-        Returns:
-            Tuple of (unique_chunks, dedup_stats)
-        """
+        """UPDATED: 3-layer deduplication with cross-file duplicate detection."""
         if not chunks:
-            return [], {'total': 0, 'unique': 0, 'duplicates': 0, 'dedup_ratio': 0.0}
+            return [], {"total": 0, "unique": 0, "duplicates": 0, "dedup_ratio": 0.0}
     
-        # Get ChromaDB and embedder
-        _, collection = get_chroma_collection(skip_count=True)
-        embedder = get_embedder()
+        # ── Gap-2 Change-3: Replace get_chroma_collection() + get_embedder() ──
+        pipeline = _get_pipeline(business_id)          # reuse Gap-1 helper
     
-        # Run 3-layer deduplication
         unique_chunks, stats = await deduplicate_chunks(
             db=db,
             chunks=chunks,
-            chroma_collection=collection,
-            embedder=embedder,
+            vectordb=pipeline.vectordb,      # BaseVectorDB ← pluggable
+            embedder=pipeline.embedder,      # BaseEmbedder ← pluggable
             file_id=file_id,
             business_id=business_id,
-            enable_embedding_dedup=True,  # Enable Layer 2 (semantic similarity)
-            similarity_threshold=0.95  # 95% similarity threshold
+            enable_embedding_dedup=True,     # Layer 2 semantic similarity
+            similarity_threshold=0.95        # 95% similarity threshold
         )
+        # ──────────────────────────────────────────────────────────────────────
     
         log_info(
             f"[IngestionV2] Dedup complete for file {file_id}: "
             f"{stats['unique']} unique, {stats['duplicates']} duplicates "
-            f"({stats['dedup_ratio']:.2f}% reduction) | "
-            f"L1: {stats.get('layer1_hash_duplicates', 0)}, "
-            f"L2: {stats.get('layer2_embedding_duplicates', 0)}, "
-            f"L3: {stats.get('layer3_gci_duplicates', 0)}"
+            f"{stats['dedup_ratio']:.2f}% reduction "
+            f"[L1={stats.get('layer1_hash_duplicates', 0)}, "
+            f"L2={stats.get('layer2_embedding_duplicates', 0)}, "
+            f"L3={stats.get('layer3_gci_duplicates', 0)}]"
         )
-    
         return unique_chunks, stats
+
 
     # ----------------------------------------------------------
     # Insert + Embeddings (Unified Chroma Dedup Safe)
@@ -820,15 +843,18 @@ class IngestionServiceV2:
         try:
             # normalize cleaned texts
             clean_texts = [
-                re.sub(r'\s*---(BLOCK|ENTRY) BREAK---\s*', '\n\n',
+                re.sub(r'\\s*---(BLOCK|ENTRY) BREAK---\\s*', '\\n\\n',
                        c.get("cleaned_text", c.get("cleaned", "")))
                 for c in chunks
             ]
-
-            # ensure chroma collection exists (lazy)
-            _, collection = get_chroma_collection()
-            print(_, collection)
-
+    
+            # ── Gap-1 Change 1: Resolve pipeline from registry ───────────
+            pipeline = _get_pipeline(business_id)
+            embedder = pipeline.embedder   # BaseEmbedder (pluggable)
+            vectordb = pipeline.vectordb   # BaseVectorDB (pluggable)
+            vectordb.ensure_collection("ingested_content", embedding_dim=embedder.info.dim or 1024)
+            # ─────────────────────────────────────────────────────────────
+    
             # gather semantic_hashes for all chunks (keep mapping)
             hash_to_chunk = {}
             all_hashes = []
@@ -838,124 +864,100 @@ class IngestionServiceV2:
                     continue
                 all_hashes.append(sh)
                 hash_to_chunk[sh] = c
-
+    
             if not all_hashes:
                 log_info(f"[IngestionV2] 0 semantic hashes for embedding for file {file_id}")
                 return
-
-            # Query GlobalContentIndexV2 for known hashes (mapping semantic_hash -> gci_id)
+    
+            # Query GlobalContentIndexV2 for known hashes
             async with async_session() as db:
                 q = select(GlobalContentIndexV2.semantic_hash, GlobalContentIndexV2.id).where(
                     GlobalContentIndexV2.semantic_hash.in_(all_hashes)
                 )
                 res = await db.execute(q)
                 rows = res.all()
-                # build set of known hashes (present in DB)
                 known_hashes = {row[0] for row in rows}
-
-            # For the known hashes, check Chroma whether a vector exists (by id = semantic_hash)
-            # Note: calling collection.get for specific ids is OK (not enumerating whole collection).
+    
+            # ── Gap-1 Change 2: Replace _chroma_get block with vectordb.exists() ──
             loop = asyncio.get_running_loop()
-            present_in_chroma = set()
             try:
-                # run collection.get(ids=...) in executor to avoid blocking
-                def _chroma_get(ids):
-                    try:
-                        # call collection.get with ids — returns entries for found ids
-                        return collection.get(ids=ids)
-                    except Exception:
-                        # if Chroma client raises (e.g. unsupported param), return empty
-                        return {}
-
-                chroma_resp = await loop.run_in_executor(None, lambda: _chroma_get(list(known_hashes)))
-                # chroma_resp can be dict-like with 'ids' or 'metadatas' depending on client;
-                # defensively extract returned ids or metadatas
-                found_ids = set()
-                if isinstance(chroma_resp, dict):
-                    # Try common keys
-                    if "ids" in chroma_resp and isinstance(chroma_resp["ids"], list):
-                        found_ids.update(chroma_resp["ids"])
-                    elif "metadatas" in chroma_resp and isinstance(chroma_resp["metadatas"], list):
-                        # If metadatas present, assume same ordering and use any id list if available
-                        # best-effort: try to extract 'id' inside each meta if exists
-                        for md in chroma_resp["metadatas"]:
-                            if isinstance(md, dict) and "semantic_hash" in md:
-                                found_ids.add(md["semantic_hash"])
-                elif isinstance(chroma_resp, list):
-                    # some clients may return list of item dicts
-                    for item in chroma_resp:
-                        if isinstance(item, dict) and item.get("id"):
-                            found_ids.add(item.get("id"))
-                # fallback: assume no ids found if we can't parse
-                present_in_chroma = set(found_ids) & set(known_hashes)
+                present_in_chroma = set(
+                    await loop.run_in_executor(
+                        None,
+                        lambda: vectordb.exists(
+                            collection="ingested_content",
+                            ids=list(known_hashes)
+                        )
+                    )
+                )
             except Exception as e:
-                # If Chroma check fails, log and continue — we will attempt to embed all hashes not found in GCI
-                log_info(f"[IngestionV2] Warning: Chroma check failed: {e}")
+                log_info(f"[IngestionV2] Warning: VectorDB exists check failed: {e}")
                 present_in_chroma = set()
-
-            # Determine which hashes truly need embedding:
-            # - If hash not found in GCI -> treat as new (should be embedded)
-            # - If hash found in GCI but not present_in_chroma -> needs embedding
+            # ──────────────────────────────────────────────────────────────────────
+    
+            # Determine which hashes truly need embedding
             hashes_needing_embedding = set()
             for h in all_hashes:
                 if h not in known_hashes:
                     hashes_needing_embedding.add(h)
                 elif h not in present_in_chroma:
                     hashes_needing_embedding.add(h)
-
+    
             if not hashes_needing_embedding:
-                log_info(f"[IngestionV2] No new vectors to add (Chroma already has vectors for all hashes)")
+                log_info(f"[IngestionV2] No new vectors to add (VectorDB already has vectors for all hashes)")
                 return
-
+    
             # Build list of chunks to embed (preserve order)
             new_chunks = [hash_to_chunk[h] for h in all_hashes if h in hashes_needing_embedding]
-
-            # Prepare ids to be semantic_hash (tie Chroma id to semantic_hash)
-            # This makes future existence checks straightforward and idempotent.
-            ids = [c.get("semantic_hash") for c in new_chunks]
-
-            # Batched embedding + upsert (embedder offloaded to executor)
-            embedder = get_embedder()
+    
+            # Batched embedding + upsert
+            # ── Gap-1 Change 3: embedder already set above — NO get_embedder() call ──
             for i in range(0, len(new_chunks), BATCH_SIZE):
-                batch = new_chunks[i:i + BATCH_SIZE]
-                texts = [c.get("cleaned_text", c.get("cleaned", "")) for c in batch]
+                batch     = new_chunks[i:i + BATCH_SIZE]
+                texts     = [c.get("cleaned_text", c.get("cleaned", "")) for c in batch]
                 batch_ids = [c.get("semantic_hash") for c in batch]
-
-                # Offload embedding to executor to avoid blocking event loop
-                embeddings = await loop.run_in_executor(None, lambda: embedder.encode(texts, normalize_embeddings=True))
-
-                # Normalize embedding output to list-of-lists
-                try:
-                    emb_list = embeddings.tolist()
-                except Exception:
-                    emb_list = list(embeddings)
-
+    
+                # ── Gap-1 Change 3: Replace embedder.encode() + .tolist() ──────────
+                emb_list = await loop.run_in_executor(
+                    None, lambda: embedder.embed_documents(texts)
+                )
+                # ────────────────────────────────────────────────────────────────────
+    
                 metadatas = [
                     {
-                        "file_id": str(file_id),
-                        "business_id": str(business_id) if business_id else "",
-                        "source_type": str(file_type) if file_type else "",
+                        "file_id":       str(file_id),
+                        "business_id":   str(business_id) if business_id else "",
+                        "source_type":   str(file_type) if file_type else "",
                         "semantic_hash": str(c.get("semantic_hash", "")),
                     }
                     for c in batch
                 ]
-
-
-                # Upsert to Chroma using semantic_hash as id — offload to executor
+    
+                # ── Gap-1 Change 4: Replace collection.upsert() with vectordb.upsert() ──
                 await loop.run_in_executor(
                     None,
-                    lambda ids=batch_ids, emb=emb_list, met=metadatas, docs=texts: collection.upsert(
-                        ids=ids, embeddings=emb, metadatas=met, documents=docs
-                    ),
+                    lambda ids=batch_ids, emb=emb_list, met=metadatas, docs=texts: [
+                        vectordb.upsert(
+                            collection="ingested_content",
+                            doc_id=ids[j],
+                            embedding=emb[j],
+                            text=docs[j],
+                            metadata=met[j],
+                        )
+                        for j in range(len(ids))
+                    ]
                 )
-                log_info(f"[IngestionV2] ✅ Upserted batch {i//BATCH_SIZE + 1}: {len(batch)} vectors to ChromaDB")
-            log_info(f"[IngestionV2] Stored {len(new_chunks)} new unique vectors in ChromaDB for file {file_id}")
-
+                # ─────────────────────────────────────────────────────────────────────
+    
+                log_info(f"[IngestionV2] ✅ Upserted batch {i//BATCH_SIZE + 1}: {len(batch)} vectors via {vectordb.kind}")
+    
+            log_info(f"[IngestionV2] Stored {len(new_chunks)} new unique vectors via {vectordb.kind} for file {file_id}")
+    
         except Exception as e:
-            log_info(f"[ERROR] Embedding or Chroma storage failed: {e}")
+            log_info(f"[ERROR] Embedding or VectorDB storage failed: {e}")
             return
-
-
+    
+    
     # ----------------------------------------------------------
     # Error Handling + File Status
     # ----------------------------------------------------------

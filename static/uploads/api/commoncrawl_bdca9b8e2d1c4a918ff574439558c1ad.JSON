@@ -1,0 +1,245 @@
+{
+  "fields": [
+    {
+      "id": "a",
+      "label": " Year",
+      "type": "string "
+    },
+    {
+      "id": "b",
+      "label": "New business - Sum assured per annum",
+      "type": "string"
+    },
+    {
+      "id": "c",
+      "label": "New business - Annuities per annum",
+      "type": "string"
+    },
+    {
+      "id": "d",
+      "label": "New business - Notional cash option",
+      "type": "string"
+    },
+    {
+      "id": "e",
+      "label": "Total business in force at the end of the year - Sum assured and bonus",
+      "type": "string"
+    },
+    {
+      "id": "f",
+      "label": "Total business in force at the end of the year - Annuities per annum",
+      "type": "string"
+    },
+    {
+      "id": "g",
+      "label": "Total business in force at the end of the year - Notional cash option",
+      "type": "string"
+    },
+    {
+      "id": "h",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "i",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "j",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "k",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "l",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "m",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "n",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "o",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "p",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "q",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "r",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "s",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "t",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "u",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "v",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "w",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "x",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "y",
+      "label": null,
+      "type": "string"
+    },
+    {
+      "id": "z",
+      "label": null,
+      "type": "string"
+    }
+  ],
+  "data": [
+    [
+      "2000-01",
+      "1249506",
+      "9083",
+      "NA",
+      "6450419",
+      "29626",
+      "NA",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2001-02",
+      "1927850",
+      "73369",
+      "NA",
+      "8110173",
+      "104605",
+      "NA",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2002-03",
+      "1798112",
+      "174",
+      "35834",
+      "9566752",
+      "103493",
+      "35834",
+      "                                         ",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2003-04",
+      "2000394",
+      "321",
+      "28266",
+      "11131887",
+      "100179",
+      "60517",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2004-05",
+      "1785413",
+      "33",
+      "36040",
+      "12734687",
+      "43261",
+      "637795",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2005-06",
+      "2882258",
+      "86",
+      "2882",
+      "15354396",
+      "45042",
+      "639115",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2006-07",
+      "3028916",
+      "12026",
+      "2192",
+      "17751038",
+      "45193",
+      "870274",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2007-08",
+      "2795212",
+      "37",
+      "1677",
+      "19841373",
+      "38898",
+      "472807",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2008-09",
+      "3952568",
+      "62",
+      "4979",
+      "23194057",
+      "39460",
+      "469760",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2009-10",
+      "4341087",
+      "322",
+      "6665",
+      "26458692",
+      "39510",
+      "469337",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2010-11",
+      "4734354",
+      "454",
+      "5538",
+      "29128719",
+      "35500",
+      "460849",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null],
+    [
+      "2011-12",
+      "5095380",
+      "3887",
+      "11933",
+      "32470231",
+      "12614",
+      "303152",
+      null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null]
+  ]
+}
