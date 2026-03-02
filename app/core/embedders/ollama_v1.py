@@ -49,6 +49,11 @@ class OllamaEmbedder(BaseEmbedder):
     @property
     def info(self) -> EmbedderInfo:
         return EmbedderInfo(provider="ollama", model=self._model, dim=int(self._dim))
+        
+    @property
+    def kind(self) -> str:
+        return "ollama"
+
 
     def _embed_one(self, text: str) -> List[float]:
         vec = self._client.embeddings(model=self._model, prompt=text)["embedding"]

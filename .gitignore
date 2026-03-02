@@ -21,3 +21,8 @@ chroma_db/
 venv/
 .env
 static/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3

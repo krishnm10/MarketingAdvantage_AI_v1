@@ -1,0 +1,90 @@
+{
+  "client_id": "acme_corp",
+  "client_name": "ACME Corporation",
+  "version": "1.0",
+
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingestion_content",
+    "chroma": {
+      "persist_directory": "./chroma_db"
+    }
+  },
+
+  "embedder": {
+    "type": "ollama",
+    "ollama": {
+      "model": "qwen3-embedding:8b",
+      "base_url": "http://localhost:11434"
+    }
+  },
+
+  "llm": {
+    "chain": [
+      {
+        "step_name": "extract",
+        "type": "openai",
+        "model": "gpt-4o-mini",
+        "api_key_env": "ACME_OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "system_prompt": "Extract key facts from the context.",
+        "max_tokens": 512
+      },
+      {
+        "step_name": "answer",
+        "type": "openai",
+        "model": "gpt-4o",
+        "api_key_env": "ACME_OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+        "system_prompt": "You are ACME Corp AI assistant.",
+        "max_tokens": 2048
+      }
+    ]
+  },
+
+  "reranker": {
+    "type": "cohere",
+    "model": "rerank-english-v3.0",
+    "api_key_env": "ACME_COHERE_API_KEY",
+    "top_k": 5
+  },
+
+  "retrieval": {
+    "search_mode": "hybrid",
+    "top_k_retrieval": 30,
+    "top_k_final": 8,
+    "hybrid_alpha": 0.7,
+    "metadata_filters": { "business_id": "acme_corp" }
+  },
+
+  "ingestion": {
+    "batch_size": 512,
+    "max_file_size_mb": 500,
+    "chunking": {
+      "strategy": "recursive",
+      "chunk_size": 768,
+      "chunk_overlap": 96
+    },
+    "deduplication": {
+      "similarity_threshold": 0.97
+    },
+    "enable_visual_llm_explanation": true
+  },
+
+  "parsers": {
+    "enable_pdf": true,
+    "enable_docx": true,
+    "enable_audio": true,
+    "enable_video": true,
+    "enable_ocr": true,
+    "ocr_language": "eng+hin"
+  },
+
+  "features": {
+    "enable_rag": true,
+    "enable_reranking": true,
+    "enable_hybrid_search": true,
+    "enable_audit_log": true,
+    "max_concurrent_ingestions": 20
+  }
+}

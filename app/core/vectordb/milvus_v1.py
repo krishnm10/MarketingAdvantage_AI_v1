@@ -1,65 +1,30 @@
-"""
-================================================================================
-Marketing Advantage AI — Milvus VectorDB Connector
-File: app/core/vectordb/milvus_v1.py
-
-Supports:
-  - Milvus Standalone (local Docker)          → host + port
-  - Milvus Cluster   (on-premise enterprise)  → host + port
-  - Zilliz Cloud     (managed Milvus)         → uri + token
-
-Milvus concepts mapped to our interface:
-  - collection   → Milvus Collection
-  - doc_id       → stored as primary key field "doc_id" (VARCHAR)
-  - embedding    → Milvus FLOAT_VECTOR field "embedding"
-  - text         → VARCHAR field "_text"
-  - metadata     → JSON field "_metadata" (Milvus supports JSON natively)
-
-Milvus is the strongest choice for:
-  - Billion-scale vectors on-premise
-  - Strict data-residency requirements (India DPDP compliance)
-  - Hybrid search (vector + scalar filtering)
-
-Installation:
-  pip install pymilvus>=2.4.0
-
-IMPORTANT: This file does NOT touch any existing Chroma ingestion/retrieval
-code in app/services/ingestion or app/services/retrieval.
-================================================================================
-"""
-
+# ============================================================
+# app/core/vectordb/milvus_v1.py
+# ============================================================
 from __future__ import annotations
 
 import json
 import logging
 from typing import Any, Dict, List, Optional
 
-from app.core.vectordb.base import BaseVectorDB, VectorHit
+from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
 
 logger = logging.getLogger(__name__)
 
-
-# Milvus field name constants (single source of truth)
-_FIELD_ID        = "doc_id"
-_FIELD_VECTOR    = "embedding"
-_FIELD_TEXT      = "_text"
-_FIELD_METADATA  = "_metadata"
-_INDEX_NAME      = "embedding_idx"
-_METRIC_TYPE     = "COSINE"
+_FIELD_ID       = "doc_id"
+_FIELD_VECTOR   = "embedding"
+_FIELD_TEXT     = "_text"
+_FIELD_METADATA = "_metadata"
+_INDEX_NAME     = "embedding_idx"
+_METRIC_TYPE    = "COSINE"
 
 
 class MilvusVectorDB(BaseVectorDB):
     """
-    Milvus / Zilliz connector.
-
-    Args:
-        host:           Milvus host (used for local/standalone/cluster).
-        port:           Milvus gRPC port (default 19530).
-        uri:            Zilliz Cloud URI (takes precedence over host/port).
-        token:          Zilliz Cloud API token or Milvus username:password.
-        db_name:        Milvus database (Milvus 2.4+ supports multi-DB).
-        alias:          Connection alias — useful when connecting to multiple
-                        Milvus instances in the same process.
+    Milvus / Zilliz Cloud connector.
+    Supports: local Docker, on-premise cluster, Zilliz Cloud.
+    Best for: billion-scale vectors, data-residency (India DPDP).
+    Install: pip install pymilvus>=2.4.0
     """
 
     def __init__(
@@ -67,119 +32,43 @@ class MilvusVectorDB(BaseVectorDB):
         *,
         host: str = "localhost",
         port: int = 19530,
-        uri: Optional[str] = None,         # Zilliz Cloud → provide URI
-        token: Optional[str] = None,       # Zilliz token or "user:pass"
+        uri: Optional[str] = None,
+        token: Optional[str] = None,
         db_name: str = "default",
         alias: str = "default",
     ):
         try:
             from pymilvus import connections
         except ImportError:
-            raise ImportError(
-                "PyMilvus not installed. Run: pip install pymilvus>=2.4.0"
-            )
+            raise ImportError("PyMilvus not installed. Run: pip install pymilvus>=2.4.0")
 
         from pymilvus import connections
-
-        self._alias = alias
+        self._alias   = alias
         self._db_name = db_name
 
         if uri:
-            # Zilliz Cloud or remote Milvus with URI
             connections.connect(alias=alias, uri=uri, token=token or "")
         else:
-            # Local or cluster Milvus
-            connect_kwargs: Dict[str, Any] = {
-                "alias": alias,
-                "host": host,
-                "port": str(port),
-                "db_name": db_name,
+            kw: Dict[str, Any] = {
+                "alias": alias, "host": host,
+                "port": str(port), "db_name": db_name,
             }
             if token:
-                connect_kwargs["token"] = token
-            connections.connect(**connect_kwargs)
+                kw["token"] = token
+            connections.connect(**kw)
 
         logger.info(
             "[MilvusVectorDB] Connected | uri=%s | host=%s:%d | alias=%s",
             uri or "N/A", host, port, alias,
         )
 
-    # -------------------------------------------------------------------
-    # Private helpers
-    # -------------------------------------------------------------------
-
-    def _get_collection(self, collection: str):
-        from pymilvus import Collection
-        return Collection(name=collection, using=self._alias)
-
-    def _schema(self, embedding_dim: int):
-        """
-        Build Milvus collection schema.
-        Fields:
-          doc_id       VARCHAR(512) — primary key (string type for UUID support)
-          embedding    FLOAT_VECTOR(dim)
-          _text        VARCHAR(65535) — raw document text
-          _metadata    JSON           — arbitrary metadata
-        """
-        from pymilvus import CollectionSchema, FieldSchema, DataType
-
-        fields = [
-            FieldSchema(
-                name=_FIELD_ID,
-                dtype=DataType.VARCHAR,
-                max_length=512,
-                is_primary=True,
-                auto_id=False,
-                description="Document ID (UUID or hash)",
-            ),
-            FieldSchema(
-                name=_FIELD_VECTOR,
-                dtype=DataType.FLOAT_VECTOR,
-                dim=int(embedding_dim),
-                description="Dense embedding vector",
-            ),
-            FieldSchema(
-                name=_FIELD_TEXT,
-                dtype=DataType.VARCHAR,
-                max_length=65_535,
-                description="Raw document chunk text",
-            ),
-            FieldSchema(
-                name=_FIELD_METADATA,
-                dtype=DataType.JSON,
-                description="Document metadata as JSON",
-            ),
-        ]
-        return CollectionSchema(
-            fields=fields,
-            description="Marketing Advantage AI — document chunks",
-            enable_dynamic_field=True,     # allows extra fields later
-        )
-
-    def _create_index(self, collection) -> None:
-        """
-        Create HNSW index on the embedding field after collection creation.
-        HNSW is the best choice for in-memory ANN on Milvus.
-        """
-        index_params = {
-            "metric_type": _METRIC_TYPE,
-            "index_type":  "HNSW",
-            "params": {"M": 16, "efConstruction": 256},
-        }
-        collection.create_index(
-            field_name=_FIELD_VECTOR,
-            index_params=index_params,
-            index_name=_INDEX_NAME,
-        )
-        logger.info("[MilvusVectorDB] HNSW index created on '%s'.", collection.name)
-
-    # -------------------------------------------------------------------
-    # BaseVectorDB implementation
-    # -------------------------------------------------------------------
+    # ── Identity ──────────────────────────────────────────────────────
 
     @property
     def kind(self) -> str:
         return "milvus"
+
+    # ── Lifecycle ─────────────────────────────────────────────────────
 
     def health_check(self) -> bool:
         try:
@@ -190,33 +79,50 @@ class MilvusVectorDB(BaseVectorDB):
             logger.warning("[MilvusVectorDB] health_check failed: %s", exc)
             return False
 
-    def ensure_collection(self, collection: str, *, embedding_dim: int) -> None:
+    def ensure_collection(
+        self,
+        collection: str,
+        *,
+        embedding_dim: int,
+        distance_metric: str = "cosine",
+    ) -> None:
         """
-        Create a Milvus collection + HNSW index if it doesn't exist.
-        Load the collection into memory (required before search in Milvus).
+        Create collection + HNSW index if it doesn't exist.
+        distance_metric is mapped to Milvus metric type.
+        Loads the collection into memory (required before search).
         """
         from pymilvus import Collection, utility
 
+        _metric_map = {
+            "cosine":     "COSINE",
+            "dotproduct": "IP",
+            "euclidean":  "L2",
+        }
+        metric = _metric_map.get(distance_metric.lower(), "COSINE")
+
         if utility.has_collection(collection, using=self._alias):
-            # Already exists — just make sure it's loaded
             self._get_collection(collection).load()
-            logger.debug(
-                "[MilvusVectorDB] Collection '%s' exists — loaded.", collection
-            )
+            logger.debug("[MilvusVectorDB] Collection '%s' exists — loaded.", collection)
             return
 
         schema = self._schema(embedding_dim)
-        col = Collection(
-            name=collection,
-            schema=schema,
-            using=self._alias,
-        )
-        self._create_index(col)
+        col = Collection(name=collection, schema=schema, using=self._alias)
+        self._create_index(col, metric)
         col.load()
         logger.info(
-            "[MilvusVectorDB] Created + loaded collection '%s' (dim=%d).",
-            collection, embedding_dim,
+            "[MilvusVectorDB] Created + loaded '%s' | dim=%d | metric=%s",
+            collection, embedding_dim, metric,
         )
+
+    def delete_collection(self, collection: str) -> None:
+        from pymilvus import utility
+        try:
+            utility.drop_collection(collection, using=self._alias)
+            logger.info("[MilvusVectorDB] Collection '%s' deleted.", collection)
+        except Exception as exc:
+            logger.warning("[MilvusVectorDB] delete_collection failed: %s", exc)
+
+    # ── Write ─────────────────────────────────────────────────────────
 
     def upsert(
         self,
@@ -227,52 +133,75 @@ class MilvusVectorDB(BaseVectorDB):
         text: str,
         metadata: Dict[str, Any],
     ) -> None:
-        """
-        Upsert a document vector.
-
-        Milvus doesn't have native upsert for primary-key string fields
-        in all versions, so we: delete if exists → insert.
-        """
         col = self._get_collection(collection)
-
-        # Delete existing record to simulate upsert
         col.delete(expr=f'{_FIELD_ID} == "{doc_id}"')
+        col.insert(data={
+            _FIELD_ID:       [doc_id],
+            _FIELD_VECTOR:   [embedding],
+            _FIELD_TEXT:     [str(text)[:65_530] if text else ""],
+            _FIELD_METADATA: [json.dumps(metadata or {}, ensure_ascii=False)],
+        })
+        col.flush()
 
-        # Serialize metadata to JSON string for storage
-        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+    def batch_upsert(
+        self,
+        *,
+        collection: str,
+        doc_ids: List[str],
+        embeddings: List[List[float]],
+        texts: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> BatchUpsertResult:
+        """
+        Batch upsert for Milvus.
+        Milvus does not have native upsert for VARCHAR PKs,
+        so we: bulk delete existing IDs → bulk insert all.
+        This is the most efficient pattern for Milvus.
+        """
+        if not doc_ids:
+            return BatchUpsertResult()
+        col = self._get_collection(collection)
+        try:
+            # Check which already exist for inserted vs updated count
+            existing = set(self.exists(collection=collection, ids=doc_ids))
+            updated  = len(existing)
+            inserted = len(doc_ids) - updated
 
-        # Clamp text to Milvus VARCHAR max length
-        safe_text = str(text)[:65_530] if text else ""
+            # Bulk delete existing (single expression is faster than N deletes)
+            if existing:
+                ids_expr = ", ".join(f'"{i}"' for i in existing)
+                col.delete(expr=f'{_FIELD_ID} in [{ids_expr}]')
 
-        col.insert(
-            data={
-                _FIELD_ID:       [doc_id],
-                _FIELD_VECTOR:   [embedding],
-                _FIELD_TEXT:     [safe_text],
-                _FIELD_METADATA: [metadata_json],
-            }
-        )
-        col.flush()                         # persist to disk
+            col.insert(data={
+                _FIELD_ID:       doc_ids,
+                _FIELD_VECTOR:   embeddings,
+                _FIELD_TEXT:     [str(t)[:65_530] if t else "" for t in texts],
+                _FIELD_METADATA: [
+                    json.dumps(m or {}, ensure_ascii=False) for m in metadatas
+                ],
+            })
+            col.flush()
+            logger.info(
+                "[MilvusVectorDB] batch_upsert '%s': +%d new, ~%d updated",
+                collection, inserted, updated,
+            )
+            return BatchUpsertResult(inserted=inserted, updated=updated)
+        except Exception as exc:
+            logger.error("[MilvusVectorDB] batch_upsert failed: %s", exc)
+            return BatchUpsertResult(failed=len(doc_ids))
+
+    # ── Read ──────────────────────────────────────────────────────────
 
     def search(
         self,
         *,
         collection: str,
         query_embedding: List[float],
-        top_k: int,
+        top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
-        """
-        Vector ANN search in Milvus.
-
-        Milvus supports hybrid search via an expression string.
-        We convert a flat metadata dict into a Milvus boolean expr:
-          {"client_id": "abc", "lang": "en"}
-          → '_metadata["client_id"] == "abc" && _metadata["lang"] == "en"'
-        """
         col = self._get_collection(collection)
 
-        # Build Milvus JSON-field expression
         expr = None
         if filters:
             clauses = []
@@ -283,9 +212,8 @@ class MilvusVectorDB(BaseVectorDB):
 
         search_params = {
             "metric_type": _METRIC_TYPE,
-            "params": {"ef": min(top_k * 4, 512)},     # ef >= top_k for accuracy
+            "params": {"ef": min(top_k * 4, 512)},
         }
-
         res = col.search(
             data=[query_embedding],
             anns_field=_FIELD_VECTOR,
@@ -299,27 +227,125 @@ class MilvusVectorDB(BaseVectorDB):
         for result in res[0]:
             raw_meta = result.entity.get(_FIELD_METADATA) or "{}"
             meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
-            hits.append(
-                VectorHit(
-                    id=str(result.id),
-                    text=str(result.entity.get(_FIELD_TEXT) or ""),
-                    score=float(result.score),
-                    metadata=meta,
-                )
-            )
+            hits.append(VectorHit(
+                id=str(result.id),
+                text=str(result.entity.get(_FIELD_TEXT) or ""),
+                score=float(result.score),
+                metadata=meta,
+            ))
         return hits
 
     def exists(self, *, collection: str, ids: List[str]) -> List[str]:
-        return []   # TODO: implement per-backend
+        """
+        Check which IDs already exist by querying the primary key field.
+        Returns only the IDs that were found.
+        """
+        if not ids:
+            return []
+        col = self._get_collection(collection)
+        try:
+            ids_expr = ", ".join(f'"{i}"' for i in ids)
+            results = col.query(
+                expr=f'{_FIELD_ID} in [{ids_expr}]',
+                output_fields=[_FIELD_ID],
+            )
+            return [r[_FIELD_ID] for r in results]
+        except Exception as exc:
+            logger.warning("[MilvusVectorDB] exists() failed: %s", exc)
+            return []
 
+    def get_by_ids(self, *, collection: str, ids: List[str]) -> List[VectorHit]:
+        if not ids:
+            return []
+        col = self._get_collection(collection)
+        try:
+            ids_expr = ", ".join(f'"{i}"' for i in ids)
+            results = col.query(
+                expr=f'{_FIELD_ID} in [{ids_expr}]',
+                output_fields=[_FIELD_ID, _FIELD_TEXT, _FIELD_METADATA],
+            )
+            hits = []
+            for r in results:
+                raw_meta = r.get(_FIELD_METADATA) or "{}"
+                meta = json.loads(raw_meta) if isinstance(raw_meta, str) else {}
+                hits.append(VectorHit(
+                    id=str(r[_FIELD_ID]),
+                    text=str(r.get(_FIELD_TEXT) or ""),
+                    score=1.0,
+                    metadata=meta,
+                ))
+            return hits
+        except Exception as exc:
+            logger.warning("[MilvusVectorDB] get_by_ids() failed: %s", exc)
+            return []
+
+    def count(self, collection: str) -> int:
+        try:
+            col = self._get_collection(collection)
+            return col.num_entities
+        except Exception as exc:
+            logger.warning("[MilvusVectorDB] count() failed: %s", exc)
+            return 0
+
+    # ── Delete ────────────────────────────────────────────────────────
 
     def delete(self, *, collection: str, doc_id: str) -> None:
         col = self._get_collection(collection)
         col.delete(expr=f'{_FIELD_ID} == "{doc_id}"')
         col.flush()
 
+    def delete_many(self, *, collection: str, doc_ids: List[str]) -> int:
+        if not doc_ids:
+            return 0
+        col = self._get_collection(collection)
+        try:
+            existing = self.exists(collection=collection, ids=doc_ids)
+            if not existing:
+                return 0
+            ids_expr = ", ".join(f'"{i}"' for i in existing)
+            col.delete(expr=f'{_FIELD_ID} in [{ids_expr}]')
+            col.flush()
+            return len(existing)
+        except Exception as exc:
+            logger.warning("[MilvusVectorDB] delete_many failed: %s", exc)
+            return 0
+
+    # ── Internal helpers ──────────────────────────────────────────────
+
+    def _get_collection(self, collection: str):
+        from pymilvus import Collection
+        return Collection(name=collection, using=self._alias)
+
+    def _schema(self, embedding_dim: int):
+        from pymilvus import CollectionSchema, FieldSchema, DataType
+        fields = [
+            FieldSchema(name=_FIELD_ID, dtype=DataType.VARCHAR,
+                        max_length=512, is_primary=True, auto_id=False),
+            FieldSchema(name=_FIELD_VECTOR, dtype=DataType.FLOAT_VECTOR,
+                        dim=int(embedding_dim)),
+            FieldSchema(name=_FIELD_TEXT, dtype=DataType.VARCHAR,
+                        max_length=65_535),
+            FieldSchema(name=_FIELD_METADATA, dtype=DataType.JSON),
+        ]
+        return CollectionSchema(
+            fields=fields,
+            description="MarketingAdvantage AI — document chunks",
+            enable_dynamic_field=True,
+        )
+
+    def _create_index(self, collection, metric: str = "COSINE") -> None:
+        collection.create_index(
+            field_name=_FIELD_VECTOR,
+            index_params={
+                "metric_type": metric,
+                "index_type": "HNSW",
+                "params": {"M": 16, "efConstruction": 256},
+            },
+            index_name=_INDEX_NAME,
+        )
+        logger.info("[MilvusVectorDB] HNSW index created on '%s'.", collection.name)
+
     def __del__(self):
-        """Cleanly disconnect Milvus connection on teardown."""
         try:
             from pymilvus import connections
             connections.disconnect(self._alias)
