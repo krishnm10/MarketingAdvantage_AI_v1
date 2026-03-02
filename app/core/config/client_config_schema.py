@@ -3,22 +3,28 @@
 Marketing Advantage AI — Client Configuration Schema
 File: app/core/config/client_config_schema.py
 
-PURPOSE:
-  Defines strict Pydantic config models for each pluggable component.
-  Every enterprise client supplies a config JSON/YAML — this schema
-  validates it BEFORE any pipeline is built.
+SINGLE SOURCE OF TRUTH for all per-client pipeline configuration.
+
+COVERS:
+  - VectorDB        (Chroma, Qdrant, Weaviate, Pinecone, Milvus)
+  - Embedder        (Ollama, OpenAI, HuggingFace, Cohere)
+  - LLM             (Ollama, OpenAI, Groq, Anthropic, Gemini) — single or chain
+  - Reranker        (CrossEncoder, BGE, FlashRank, Cohere, ColBERT)
+  - Retrieval       (top_k, filters, hybrid search, trust scoring)
+  - Ingestion       (batch size, chunk size, dedup settings)
+  - Parsers         (OCR, audio, video, image flags per client)
+  - Features        (feature flags — enable/disable per client)
 
 DESIGN RULES:
-  - vectordb.type is REQUIRED — no default, no fallback.
-  - embedder.type is REQUIRED — no default, no fallback.
-  - llm is optional (for retrieval-only clients).
-  - reranker is optional (feature flag per client).
-  - ALL secrets (api_keys) come from environment or secret manager,
-    NEVER from client config directly. We only accept key names (env var names).
+  1. ZERO hardcoding. ZERO defaults that silently hide config errors.
+  2. Every secret is referenced by ENV VAR NAME only — never the value.
+  3. REQUIRED fields raise ValueError at load time — never at runtime.
+  4. Optional fields = feature not enabled for that client.
+  5. Supports JSON and YAML formats equally.
 
 USAGE:
-  config = ClientConfig.from_json_file("configs/client_abc.json")
-  config = ClientConfig.from_yaml_file("configs/client_abc.yaml")
+  config = ClientConfig.from_json_file("app/core/configs/acme_corp.json")
+  config = ClientConfig.from_yaml_file("app/core/configs/acme_corp.yaml")
   config = ClientConfig.from_dict({...})
 ================================================================================
 """
@@ -29,14 +35,14 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator, field_validator
+from pydantic import BaseModel, Field, model_validator
 
 
-# ─────────────────────────────────────────────────────────────
-# Supported plugin types (explicit whitelist — fail fast)
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# ENUMS — explicit whitelists, fail fast on unknown values
+# ══════════════════════════════════════════════════════════════
 
 class VectorDBType(str, Enum):
     CHROMA   = "chroma"
@@ -47,9 +53,9 @@ class VectorDBType(str, Enum):
 
 
 class EmbedderType(str, Enum):
-    HUGGINGFACE = "huggingface"
     OLLAMA      = "ollama"
     OPENAI      = "openai"
+    HUGGINGFACE = "huggingface"
     COHERE      = "cohere"
 
 
@@ -68,109 +74,101 @@ class RerankerType(str, Enum):
     COHERE        = "cohere"
     COLBERT       = "colbert"
 
-# ─────────────────────────────────────────────────────────────
-# VectorDB Configs
-# ─────────────────────────────────────────────────────────────
+
+class ChunkStrategy(str, Enum):
+    RECURSIVE   = "recursive"    # semantic recursive splitting (default)
+    FIXED       = "fixed"        # fixed token size
+    SENTENCE    = "sentence"     # sentence boundary aware
+    PARAGRAPH   = "paragraph"    # paragraph boundary aware
+
+
+class SearchMode(str, Enum):
+    SEMANTIC  = "semantic"       # vector similarity only
+    KEYWORD   = "keyword"        # BM25 / full-text only
+    HYBRID    = "hybrid"         # semantic + keyword combined
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 1 — VECTORDB CONFIGS
+# ══════════════════════════════════════════════════════════════
 
 class ChromaConfig(BaseModel):
-    """ChromaDB — local persistent client config."""
+    """ChromaDB — local persistent store."""
     persist_directory: str = Field(
         ...,
-        description="Absolute or relative path to ChromaDB storage directory."
+        description=(
+            "REQUIRED. Absolute path to ChromaDB storage. "
+            "Must be unique per client — never shared."
+        )
     )
     anonymized_telemetry: bool = False
 
 
 class QdrantConfig(BaseModel):
-    """Qdrant — local Docker or Qdrant Cloud config."""
-    # Cloud path: provide url + api_key_env
+    """Qdrant — local Docker or Qdrant Cloud."""
     url: Optional[str] = Field(
         None,
-        description="Qdrant Cloud URL e.g. https://xyz.qdrant.tech"
+        description="Qdrant Cloud URL. Takes precedence over host/port."
     )
     api_key_env: Optional[str] = Field(
         None,
-        description="Name of environment variable holding Qdrant API key."
+        description="Env var NAME holding Qdrant API key. Never the key itself."
     )
-    # Local path: provide host + port
-    host: str = "localhost"
-    port: int = 6333
-    prefer_grpc: bool = False
-    timeout: float = 30.0
+    host:         str   = "localhost"
+    port:         int   = 6333
+    prefer_grpc:  bool  = False
+    timeout:      float = 30.0
 
     @model_validator(mode="after")
     def validate_cloud_or_local(self) -> "QdrantConfig":
         if not self.url and not self.host:
-            raise ValueError("QdrantConfig: provide either 'url' (cloud) or 'host' (local).")
+            raise ValueError("QdrantConfig: provide 'url' (cloud) or 'host' (local).")
         return self
 
 
 class WeaviateConfig(BaseModel):
-    """Weaviate — WCS cloud or local Docker config."""
-    url: str = Field(..., description="Weaviate URL e.g. http://localhost:8080")
+    """Weaviate — WCS cloud or local Docker."""
+    url: str = Field(..., description="e.g. http://localhost:8080 or WCS URL")
     api_key_env: Optional[str] = Field(
-        None,
-        description="Name of env var holding Weaviate API key (WCS only)."
+        None, description="Env var NAME for WCS API key."
     )
-    embedded: bool = Field(
-        False,
-        description="Use embedded in-process Weaviate (local dev only)."
-    )
-    additional_headers: Dict[str, str] = Field(
-        default_factory=dict,
-        description="Extra HTTP headers e.g. X-Cohere-Api-Key for built-in modules."
-    )
+    embedded:           bool             = False
+    additional_headers: Dict[str, str]   = Field(default_factory=dict)
 
 
 class PineconeConfig(BaseModel):
-    """Pinecone — fully managed cloud vector DB config."""
-    api_key_env: str = Field(
-        ...,
-        description="Name of env var holding Pinecone API key."
-    )
-    index_name: str = Field(..., description="Pinecone index name (unique per client).")
-    namespace: str = "default"
-    embedding_dim: int = Field(
-        ...,
-        description="Embedding dimension — must match embedder output exactly."
-    )
-    metric: str = "cosine"
-    cloud: str = "aws"
-    region: str = "us-east-1"
+    """Pinecone — fully managed cloud VectorDB."""
+    api_key_env:    str  = Field(..., description="Env var NAME for Pinecone API key.")
+    index_name:     str  = Field(..., description="Pinecone index name — unique per client.")
+    namespace:      str  = "default"
+    embedding_dim:  int  = Field(..., description="Must match embedder output dimension exactly.")
+    metric:         str  = "cosine"
+    cloud:          str  = "aws"
+    region:         str  = "us-east-1"
     pod_type: Optional[str] = None
 
 
 class MilvusConfig(BaseModel):
-    """Milvus — local standalone, cluster, or Zilliz Cloud config."""
-    uri: Optional[str] = Field(
-        None,
-        description="Zilliz Cloud URI (takes precedence over host/port)."
-    )
-    token_env: Optional[str] = Field(
-        None,
-        description="Env var name for Zilliz Cloud token or Milvus user:pass."
-    )
-    host: str = "localhost"
-    port: int = 19530
-    db_name: str = "default"
-    alias: str = "default"
+    """Milvus — standalone, cluster, or Zilliz Cloud."""
+    uri:           Optional[str] = Field(None, description="Zilliz Cloud URI.")
+    token_env:     Optional[str] = Field(None, description="Env var for Zilliz token.")
+    host:          str  = "localhost"
+    port:          int  = 19530
+    db_name:       str  = "default"
+    alias:         str  = "default"
 
 
 class VectorDBConfig(BaseModel):
     """
-    Top-level VectorDB config block in client config.
-    Exactly ONE of: chroma, qdrant, weaviate, pinecone, milvus must be set.
+    Top-level VectorDB config.
+    Exactly ONE sub-config matching 'type' must be present.
     """
-    type: VectorDBType = Field(
+    type:       VectorDBType = Field(..., description="REQUIRED. No default.")
+    collection: str          = Field(
         ...,
-        description="REQUIRED. VectorDB plugin to use. No default."
-    )
-    collection: str = Field(
-        ...,
-        description="Collection / index / class name to use for this client."
+        description="REQUIRED. Unique collection/index name for this client."
     )
 
-    # Sub-configs — only the one matching 'type' is expected to be set
     chroma:   Optional[ChromaConfig]   = None
     qdrant:   Optional[QdrantConfig]   = None
     weaviate: Optional[WeaviateConfig] = None
@@ -179,116 +177,117 @@ class VectorDBConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_sub_config_present(self) -> "VectorDBConfig":
-        """Ensure the sub-config matching 'type' is actually provided."""
-        type_to_field = {
+        mapping = {
             VectorDBType.CHROMA:   "chroma",
             VectorDBType.QDRANT:   "qdrant",
             VectorDBType.WEAVIATE: "weaviate",
             VectorDBType.PINECONE: "pinecone",
             VectorDBType.MILVUS:   "milvus",
         }
-        field = type_to_field[self.type]
+        field = mapping[self.type]
         if getattr(self, field) is None:
             raise ValueError(
-                f"VectorDBConfig: type='{self.type.value}' but "
-                f"'{field}' sub-config is missing."
+                f"VectorDBConfig: type='{self.type.value}' "
+                f"requires '{field}' sub-config."
             )
         return self
 
 
-# ─────────────────────────────────────────────────────────────
-# Embedder Configs
-# ─────────────────────────────────────────────────────────────
-
-class HuggingFaceEmbedderConfig(BaseModel):
-    model: str = Field(..., description="HuggingFace model ID e.g. BAAI/bge-base-en-v1.5")
-    device: str = "cpu"
-    batch_size: int = 32
-    normalize: bool = True
-
+# ══════════════════════════════════════════════════════════════
+# SECTION 2 — EMBEDDER CONFIGS
+# ══════════════════════════════════════════════════════════════
 
 class OllamaEmbedderConfig(BaseModel):
-    model: str = Field(..., description="Ollama model name e.g. nomic-embed-text")
-    base_url: str = "http://localhost:11434"
-    max_workers: int = 4
-    normalize: bool = True
+    model:       str  = Field(..., description="e.g. nomic-embed-text, mxbai-embed-large")
+    base_url:    str  = Field(..., description="Ollama server URL — per client, not global.")
+    max_workers: int  = 4
+    normalize:   bool = True
 
 
 class OpenAIEmbedderConfig(BaseModel):
-    model: str = Field(
-        ...,
-        description="OpenAI embedding model e.g. text-embedding-3-small"
-    )
-    api_key_env: str = Field(
-        ...,
-        description="Env var name holding OpenAI API key."
-    )
+    model:            str            = Field(..., description="e.g. text-embedding-3-small")
+    api_key_env:      str            = Field(..., description="Env var NAME for API key.")
     organization_env: Optional[str] = None
-    normalize: bool = True
+    normalize:        bool           = True
+
+
+class HuggingFaceEmbedderConfig(BaseModel):
+    model:      str  = Field(..., description="e.g. BAAI/bge-base-en-v1.5")
+    device:     str  = "cpu"
+    batch_size: int  = 32
+    normalize:  bool = True
 
 
 class CohereEmbedderConfig(BaseModel):
-    model: str = Field(..., description="Cohere model e.g. embed-english-v3.0")
-    api_key_env: str = Field(..., description="Env var name holding Cohere API key.")
-    normalize: bool = True
+    model:       str = Field(..., description="e.g. embed-english-v3.0")
+    api_key_env: str = Field(..., description="Env var NAME for Cohere API key.")
+    normalize:   bool = True
 
 
 class EmbedderConfig(BaseModel):
-    type: EmbedderType = Field(..., description="REQUIRED. Embedder plugin to use.")
-    query_prefix: str   = Field("", description="Optional prefix for query embedding.")
-    document_prefix: str = Field("", description="Optional prefix for document embedding.")
+    """
+    Top-level Embedder config.
+    query_prefix / document_prefix used for models like E5 / BGE
+    that require instruction prefixes.
+    """
+    type:            EmbedderType = Field(..., description="REQUIRED. No default.")
+    query_prefix:    str          = Field("", description="Prefix for query embeddings.")
+    document_prefix: str          = Field("", description="Prefix for document embeddings.")
 
-    huggingface: Optional[HuggingFaceEmbedderConfig] = None
     ollama:      Optional[OllamaEmbedderConfig]      = None
     openai:      Optional[OpenAIEmbedderConfig]       = None
+    huggingface: Optional[HuggingFaceEmbedderConfig] = None
     cohere:      Optional[CohereEmbedderConfig]       = None
 
     @model_validator(mode="after")
     def validate_sub_config_present(self) -> "EmbedderConfig":
-        type_to_field = {
-            EmbedderType.HUGGINGFACE: "huggingface",
+        mapping = {
             EmbedderType.OLLAMA:      "ollama",
             EmbedderType.OPENAI:      "openai",
+            EmbedderType.HUGGINGFACE: "huggingface",
             EmbedderType.COHERE:      "cohere",
         }
-        field = type_to_field[self.type]
+        field = mapping[self.type]
         if getattr(self, field) is None:
             raise ValueError(
-                f"EmbedderConfig: type='{self.type.value}' but "
-                f"'{field}' sub-config is missing."
+                f"EmbedderConfig: type='{self.type.value}' "
+                f"requires '{field}' sub-config."
             )
         return self
 
 
-# ─────────────────────────────────────────────────────────────
-# LLM Config
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SECTION 3 — LLM CONFIGS
+# ══════════════════════════════════════════════════════════════
 
 class SingleLLMConfig(BaseModel):
-    type: LLMType   = Field(..., description="LLM backend type.")
-    model: str      = Field(..., description="Model name/id for the LLM.")
-    api_key_env: Optional[str] = None
-    base_url: str   = "http://localhost:11434"
-    temperature: float = 0.3
-    max_tokens: int    = 1024
+    """Single LLM for RAG generation."""
+    type:          LLMType       = Field(..., description="REQUIRED.")
+    model:         str           = Field(..., description="Model name e.g. llama3.2")
+    api_key_env:   Optional[str] = Field(None, description="Env var NAME for API key.")
+    base_url:      str           = Field(..., description="LLM server URL — per client.")
+    temperature:   float         = 0.3
+    max_tokens:    int           = 1024
     system_prompt: Optional[str] = None
+    timeout:       int           = 60
 
 
 class ChainStepConfig(BaseModel):
-    """One step in a Chain-of-LLM pipeline."""
-    type: LLMType
-    model: str
-    api_key_env: Optional[str] = None
-    base_url: str = "http://localhost:11434"
+    """One step in a multi-LLM chain (e.g. extract → summarize → generate)."""
+    step_name:     str           = Field(..., description="e.g. extract, summarize, answer")
+    type:          LLMType       = Field(..., description="REQUIRED.")
+    model:         str           = Field(..., description="Model name.")
+    api_key_env:   Optional[str] = None
+    base_url:      str           = Field(..., description="LLM server URL.")
     system_prompt: Optional[str] = None
-    temperature: float = 0.3
-    max_tokens: int = 1024
+    temperature:   float         = 0.3
+    max_tokens:    int           = 1024
 
 
 class LLMConfig(BaseModel):
     """
-    LLM config — either a single LLM or a chain of LLMs.
-    If chain is provided, it takes precedence over single.
+    LLM config — single LLM or ordered chain of LLMs.
+    chain takes precedence over single when both are provided.
     """
     single: Optional[SingleLLMConfig]       = None
     chain:  Optional[List[ChainStepConfig]] = None
@@ -296,55 +295,171 @@ class LLMConfig(BaseModel):
     @model_validator(mode="after")
     def validate_at_least_one(self) -> "LLMConfig":
         if not self.single and not self.chain:
-            raise ValueError("LLMConfig: must specify 'single' or 'chain'.")
-        if self.chain and len(self.chain) < 1:
-            raise ValueError("LLMConfig: chain must have at least 1 step.")
+            raise ValueError("LLMConfig: requires 'single' or 'chain'.")
         return self
 
 
-# ─────────────────────────────────────────────────────────────
-# Reranker Config
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SECTION 4 — RERANKER CONFIG
+# ══════════════════════════════════════════════════════════════
 
 class RerankerConfig(BaseModel):
-    type: RerankerType = Field(..., description="Reranker plugin to use.")
-    model: Optional[str] = None
-    api_key_env: Optional[str] = None
-    device: str = "cpu"
-    top_k: int  = Field(5, description="Number of results to return after reranking.")
+    """
+    Optional reranker — improves retrieval precision.
+    If absent, reranking is skipped for this client.
+    """
+    type:        RerankerType  = Field(..., description="REQUIRED if reranker block present.")
+    model:       Optional[str] = Field(None, description="Model path or HF model ID.")
+    api_key_env: Optional[str] = Field(None, description="Env var NAME (Cohere only).")
+    device:      str           = "cpu"
+    top_k:       int           = Field(5, description="Final results returned after reranking.")
+    batch_size:  int           = 32
 
 
-# ─────────────────────────────────────────────────────────────
-# Retrieval Config
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SECTION 5 — RETRIEVAL CONFIG
+# ══════════════════════════════════════════════════════════════
 
 class RetrievalConfig(BaseModel):
-    top_k_retrieval: int = Field(20, description="Candidates fetched from VectorDB.")
-    top_k_final: int     = Field(5,  description="Final results after reranking.")
-    metadata_filters: Optional[Dict[str, Any]] = None
-    enable_trust_scoring: bool = True
+    """Controls how documents are fetched and scored."""
+    search_mode:          SearchMode             = SearchMode.SEMANTIC
+    top_k_retrieval:      int                    = Field(20, description="Candidates from VectorDB.")
+    top_k_final:          int                    = Field(5,  description="Final results after reranking.")
+    similarity_threshold: float                  = Field(0.0, description="Minimum similarity score.")
+    metadata_filters:     Optional[Dict[str, Any]] = None
+    enable_trust_scoring: bool                   = True
+    # Hybrid search weights (only used when search_mode=hybrid)
+    hybrid_alpha:         float                  = Field(
+        0.7, description="Weight for semantic vs keyword. 1.0=semantic only, 0.0=keyword only."
+    )
 
 
-# ─────────────────────────────────────────────────────────────
-# Root Client Config
-# ─────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# SECTION 6 — INGESTION CONFIG  ← NEW
+# ══════════════════════════════════════════════════════════════
+
+class DeduplicationConfig(BaseModel):
+    """3-layer deduplication settings per client."""
+    enable_hash_dedup:      bool  = True
+    enable_embedding_dedup: bool  = True
+    enable_gci_dedup:       bool  = True
+    similarity_threshold:   float = Field(
+        0.95, description="Cosine similarity above which a chunk is a duplicate."
+    )
+
+
+class ChunkConfig(BaseModel):
+    """Text chunking settings per client."""
+    strategy:     ChunkStrategy = ChunkStrategy.RECURSIVE
+    chunk_size:   int           = Field(512,  description="Max tokens per chunk.")
+    chunk_overlap: int          = Field(64,   description="Overlap between consecutive chunks.")
+    min_chunk_len: int          = Field(30,   description="Discard chunks shorter than this.")
+
+
+class IngestionConfig(BaseModel):
+    """Controls the ingestion pipeline behaviour for this client."""
+    batch_size:      int                 = Field(256, description="Vectors per VectorDB upsert.")
+    max_file_size_mb: int                = Field(100, description="Reject files larger than this.")
+    chunking:        ChunkConfig         = Field(default_factory=ChunkConfig)
+    deduplication:   DeduplicationConfig = Field(default_factory=DeduplicationConfig)
+    enable_visual_llm_explanation: bool  = Field(
+        True,
+        description="Use LLM to explain charts/graphs/tables during ingestion."
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 7 — PARSER CONFIG  ← NEW
+# ══════════════════════════════════════════════════════════════
+
+class ParserConfig(BaseModel):
+    """
+    Controls which parsers are active for this client.
+    Disable expensive parsers (audio, video) for clients
+    that only need text/PDF ingestion.
+    """
+    enable_pdf:      bool = True
+    enable_docx:     bool = True
+    enable_xlsx:     bool = True
+    enable_csv:      bool = True
+    enable_pptx:     bool = True
+    enable_html:     bool = True
+    enable_json:     bool = True
+    enable_txt:      bool = True
+    enable_ocr:      bool = Field(False, description="OCR for scanned PDFs and images.")
+    enable_audio:    bool = Field(False, description="Audio transcription (Whisper etc.)")
+    enable_video:    bool = Field(False, description="Video frame + audio extraction.")
+    enable_image:    bool = Field(False, description="Image captioning via vision model.")
+    # OCR settings (only used when enable_ocr=True)
+    ocr_language:    str  = "eng"
+    ocr_engine:      str  = "tesseract"
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 8 — FEATURE FLAGS  ← NEW
+# ══════════════════════════════════════════════════════════════
+
+class FeatureFlags(BaseModel):
+    """
+    Per-client feature toggles.
+    New features can be rolled out to specific clients
+    before enabling globally.
+    """
+    enable_rag:                 bool = True
+    enable_reranking:           bool = True
+    enable_hybrid_search:       bool = False
+    enable_multi_tenant_isolation: bool = True
+    enable_audit_log:           bool = True
+    enable_realtime_ingestion:  bool = True
+    enable_scheduler_validation: bool = True
+    enable_conflict_detection:  bool = True
+    enable_temporal_validation: bool = True
+    enable_websocket_progress:  bool = True
+    max_concurrent_ingestions:  int  = Field(
+        5, description="Max parallel ingestion tasks for this client."
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# ROOT — ClientConfig  (single source of truth)
+# ══════════════════════════════════════════════════════════════
 
 class ClientConfig(BaseModel):
     """
-    Root config for a Marketing Advantage AI enterprise client.
-    Every field is validated before any connection is opened.
+    ┌─────────────────────────────────────────────────────────┐
+    │  Marketing Advantage AI — Per-Client Pipeline Config    │
+    │                                                         │
+    │  One file per client. Controls everything:              │
+    │    VectorDB / Embedder / LLM / Reranker /               │
+    │    Retrieval / Ingestion / Parsers / Features           │
+    │                                                         │
+    │  Load via:                                              │
+    │    ClientConfig.from_json_file("configs/acme.json")     │
+    │    ClientConfig.from_yaml_file("configs/acme.yaml")     │
+    └─────────────────────────────────────────────────────────┘
     """
-    client_id:   str = Field(..., description="Unique client identifier.")
-    client_name: str = Field("", description="Human-readable client name.")
-    description: str = Field("", description="Optional notes about this config.")
 
-    vectordb:  VectorDBConfig           = Field(..., description="REQUIRED VectorDB config.")
-    embedder:  EmbedderConfig           = Field(..., description="REQUIRED embedder config.")
-    llm:       Optional[LLMConfig]      = Field(None, description="Optional LLM for RAG generation.")
-    reranker:  Optional[RerankerConfig] = Field(None, description="Optional reranker.")
-    retrieval: RetrievalConfig          = Field(default_factory=RetrievalConfig)
+    # ── Identity ────────────────────────────────────────────
+    client_id:   str = Field(..., description="REQUIRED. Unique client/tenant identifier.")
+    client_name: str = Field("",  description="Human-readable display name.")
+    description: str = Field("",  description="Notes about this configuration.")
+    version:     str = Field("1.0", description="Config schema version for migration tracking.")
 
-    # ── convenience loaders ────────────────────────────────────
+    # ── Pipeline components (REQUIRED) ─────────────────────
+    vectordb: VectorDBConfig = Field(..., description="REQUIRED.")
+    embedder: EmbedderConfig = Field(..., description="REQUIRED.")
+
+    # ── Pipeline components (OPTIONAL) ─────────────────────
+    llm:       Optional[LLMConfig]      = Field(None, description="Required for RAG generation.")
+    reranker:  Optional[RerankerConfig] = Field(None, description="Optional. Improves precision.")
+
+    # ── Behaviour configs ───────────────────────────────────
+    retrieval:  RetrievalConfig = Field(default_factory=RetrievalConfig)
+    ingestion:  IngestionConfig = Field(default_factory=IngestionConfig)
+    parsers:    ParserConfig    = Field(default_factory=ParserConfig)
+    features:   FeatureFlags    = Field(default_factory=FeatureFlags)
+
+    # ── Loaders ─────────────────────────────────────────────
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ClientConfig":
@@ -360,6 +475,23 @@ class ClientConfig(BaseModel):
         try:
             import yaml
         except ImportError:
-            raise ImportError("PyYAML not installed. Run: pip install pyyaml")
+            raise ImportError("PyYAML required: pip install pyyaml")
         raw = Path(path).read_text(encoding="utf-8")
         return cls.from_dict(yaml.safe_load(raw))
+
+    # ── Convenience helpers ──────────────────────────────────
+
+    def get_chroma_path(self) -> Optional[str]:
+        """Returns Chroma persist_directory or None if not Chroma."""
+        if self.vectordb.type == VectorDBType.CHROMA and self.vectordb.chroma:
+            return self.vectordb.chroma.persist_directory
+        return None
+
+    def get_collection_name(self) -> str:
+        return self.vectordb.collection
+
+    def is_reranking_enabled(self) -> bool:
+        return self.reranker is not None and self.features.enable_reranking
+
+    def is_rag_enabled(self) -> bool:
+        return self.llm is not None and self.features.enable_rag
