@@ -1,6 +1,5 @@
 import uuid
 from datetime import datetime
-import os
 from sqlalchemy import Column, String, JSON, Integer, Float, TIMESTAMP, Text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -10,36 +9,6 @@ from uuid import UUID as UUIDType
 
 from app.db.base import Base
 from app.utils.logger import log_info, log_warning
-
-
-def _default_embedding_model() -> str:
-    """
-    Resolve embedding model from environment without provider-specific branching.
-
-    Resolution order:
-    1) MAI_EMBED_MODEL (fully explicit, provider-agnostic)
-    2) <MAI_EMBEDDER>_EMBED_MODEL (e.g., OLLAMA_EMBED_MODEL, OPENAI_EMBED_MODEL)
-    3) First available *_EMBED_MODEL env var
-    4) "unknown-embed-model" fallback
-    """
-    explicit = os.getenv("MAI_EMBED_MODEL")
-    if explicit:
-        return explicit
-
-    embedder_type = os.getenv("MAI_EMBEDDER", "").strip().upper()
-    if embedder_type:
-        inferred_key = f"{embedder_type}_EMBED_MODEL"
-        inferred_value = os.getenv(inferred_key)
-        if inferred_value:
-            return inferred_value
-
-    for key, value in os.environ.items():
-        if key.endswith("_EMBED_MODEL") and value:
-            return value
-
-    return "unknown-embed-model"
-
-
 
 
 class GlobalContentIndexV2(Base):
@@ -64,8 +33,7 @@ class GlobalContentIndexV2(Base):
     # -----------------------------------------------------------
     # SEMANTIC TRACKING
     # -----------------------------------------------------------
-    #embedding_model = Column(String(128), default="BAAI/bge-large-en-v1.5")
-    embedding_model = Column(String(128), default=_default_embedding_model)
+    embedding_model = Column(String(128), default="BAAI/bge-large-en-v1.5")
     confidence_avg = Column(Float, default=0.0)
     occurrence_count = Column(Integer, default=1)
 
