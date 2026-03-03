@@ -776,10 +776,25 @@ class IngestionServiceV2:
         file_id     = file_record.id
         business_id = file_record.business_id
         file_type   = file_record.file_type
+        pipeline = _get_pipeline(business_id)
+        embedding_model = pipeline.embedder.info.model
+        log_info(
+            f"[IngestionV2] Active embedding model for {file_id}: {embedding_model}"
+        )
 
         chunks = await IngestionServiceV2._extract_chunks(
-            parsed_payload, file_id, file_type, business_id, db
+            parsed_payload,
+            file_id,
+            file_type,
+            business_id,
+            db,
+            embedding_model=embedding_model,
         )
+        IngestionServiceV2._assert_chunk_embedding_model(
+            chunks=chunks,
+            expected_model=embedding_model,
+            file_id=str(file_id),
+        )   
 
         if not chunks:
             log_info(f"[IngestionV2] No chunks to ingest for {file_id}")
@@ -856,9 +871,18 @@ class IngestionServiceV2:
     # ----------------------------------------------------------
     @staticmethod
     async def _extract_chunks(
-        parsed_payload, file_id, file_type, business_id, db
+        parsed_payload,
+        file_id,
+        file_type,
+        business_id,
+        db,
+        embedding_model: str,
     ):
         try:
+
+            pipeline = _get_pipeline(business_id)
+            embedding_model = pipeline.embedder.info.model 
+            
             if asyncio.iscoroutine(parsed_payload):
                 parsed_payload = await parsed_payload
 
@@ -928,6 +952,7 @@ class IngestionServiceV2:
                                 file_id=str(file_id),
                                 business_id=business_id,
                                 source_type=file_type,
+                                embedding_model=embedding_model,
                             )
                             for ch in explained_chunks:
                                 ch.setdefault("reasoning_ingestion", {})
@@ -947,6 +972,7 @@ class IngestionServiceV2:
                         file_id=str(file_id),
                         business_id=business_id,
                         source_type=file_type,
+                        embedding_model=embedding_model,
                     )
                     enriched_chunks.extend(subchunks)
                 return enriched_chunks
@@ -967,6 +993,7 @@ class IngestionServiceV2:
                         file_id=str(file_id),
                         business_id=business_id,
                         source_type=file_type,
+                        embedding_model=embedding_model,
                     )
                     for ch in explained_chunks:
                         ch.setdefault("reasoning_ingestion", {})
@@ -985,11 +1012,38 @@ class IngestionServiceV2:
                 file_id=str(file_id),
                 business_id=business_id,
                 source_type=file_type,
+                embedding_model=embedding_model,
             )
 
         except Exception as e:
             log_info(f"[CRITICAL] Chunk extraction failed: {e}")
             raise RuntimeError(f"Chunk extraction failed: {e}")
+    
+    @staticmethod
+    def _assert_chunk_embedding_model(
+        chunks: List[Dict[str, Any]],
+        expected_model: str,
+        file_id: str,
+    ) -> None:
+        """Fail fast if chunk metadata drifts from runtime embedding model."""
+        mismatches = []
+        for idx, chunk in enumerate(chunks):
+            chunk_model = chunk.get("embedding_model")
+            if not chunk_model:
+                chunk["embedding_model"] = expected_model
+                continue
+            if chunk_model != expected_model:
+                mismatches.append((idx, chunk_model))
+
+        if mismatches:
+            sample = ", ".join(
+                f"idx={idx}:'{model}'" for idx, model in mismatches[:5]
+            )
+            raise ValueError(
+                "[IngestionV2] Embedding model mismatch detected "
+                f"for file {file_id}. expected='{expected_model}', "
+                f"mismatches={len(mismatches)} [{sample}]"
+            )
 
     # ----------------------------------------------------------
     # Deduplication (3-layer, batched for performance)

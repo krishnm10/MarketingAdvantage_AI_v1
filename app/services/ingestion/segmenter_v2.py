@@ -10,7 +10,7 @@ import hashlib
 from typing import List, Dict, Any
 from datetime import datetime
 from functools import lru_cache
-from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
+#from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
 
 # =============================================
 # ✅ NEW IMPORT: Normalized Hash from Deduplication Engine
@@ -170,6 +170,7 @@ async def recursive_semantic_chunk(
     file_id=None,
     business_id=None,
     source_type: str = None,
+    embedding_model: str | None = None,
 ) -> List[Dict[str, Any]]:
 
     cleaned = clean_text(text)
@@ -183,6 +184,7 @@ async def recursive_semantic_chunk(
             file_id=file_id,
             business_id=business_id,
             source_type=source_type,
+            embedding_model=embedding_model,
         )
         return [chunk]
 
@@ -196,6 +198,7 @@ async def recursive_semantic_chunk(
             file_id=file_id,
             business_id=business_id,
             source_type=source_type,
+            embedding_model=embedding_model,
         )
         right = await recursive_semantic_chunk(
             cleaned[mid:],
@@ -203,6 +206,7 @@ async def recursive_semantic_chunk(
             file_id=file_id,
             business_id=business_id,
             source_type=source_type,
+            embedding_model=embedding_model,
         )
         return left + right
 
@@ -226,6 +230,7 @@ async def recursive_semantic_chunk(
                     file_id=file_id,
                     business_id=business_id,
                     source_type=source_type,
+                    embedding_model=embedding_model,
                 )
             )
         else:
@@ -241,6 +246,7 @@ async def recursive_semantic_chunk(
             file_id=file_id,
             business_id=business_id,
             source_type=source_type,
+            embedding_model=embedding_model,
         )
         result.append(c)
 
@@ -255,6 +261,7 @@ async def make_chunk_dict(
     file_id=None,
     business_id=None,
     source_type: str = None,
+    embedding_model: str | None = None,
 ) -> Dict[str, Any]:
     """
     ✅ UPDATED: Enhanced chunk dictionary builder with normalized hash support.
@@ -286,6 +293,7 @@ async def make_chunk_dict(
             business_id=business_id,
             first_seen_file_id=file_id,
             source_type=source_type,
+            embedding_model=embedding_model,
             occurrence_count=1,
             created_at=now,
             updated_at=now,
@@ -333,6 +341,7 @@ async def make_chunk_dict(
         "confidence": 1.0,
         "global_content_id": str(gci_id) if gci_id else None,
         "source_type": source_type,
+        "embedding_model": embedding_model,
 
         # ✅ STEP-1 ADDITIVE METADATA (SAFE)
         "reasoning_ingestion": build_reasoning_ingestion_metadata(
@@ -341,3 +350,4 @@ async def make_chunk_dict(
             semantic_hash=semantic_hash,
         ),
     }
+    

@@ -4,7 +4,7 @@
 *.7z
 ffmpeg/
 # Python
-__pycache__/
+*/__pycache__/
 *.pyc
 *.pyo
 *.pyd
@@ -25,4 +25,4 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.sqlite3
+.env

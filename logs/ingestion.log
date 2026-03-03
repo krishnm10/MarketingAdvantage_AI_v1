@@ -1385,3 +1385,15 @@ DETAIL:  Key (id)=(471802ef-85bb-409e-a68c-68132e261961) already exists.
 2026-03-02T21:03:27.798488 | [SAVED] Crisil_51f9b7993eb3480bafbe787ddb3a0c8f.pdf (fdd3debe5b549cf0247778383fd606bae66a32cc48490cb4135212331e51b590) → static\uploads\api\Crisil_51f9b7993eb3480bafbe787ddb3a0c8f_3317668bebb4401aad12530259f906e0.pdf
 2026-03-02T21:03:29.541749 | [PARSED] Crisil_51f9b7993eb3480bafbe787ddb3a0c8f.pdf using parse_pdf
 2026-03-02T21:09:19.345121 | [INGESTED] Crisil_51f9b7993eb3480bafbe787ddb3a0c8f.pdf successfully processed.
+2026-03-03T15:59:17.935042 | [HASH] global_content_index_table_chroma.csv → 080c68649b3abeae05be20795beb28d15f81eb5884ae82702f8fc8321d6428fd
+2026-03-03T15:59:17.958848 | [SAVED] global_content_index_table_chroma.csv (080c68649b3abeae05be20795beb28d15f81eb5884ae82702f8fc8321d6428fd) → static\uploads\api\global_content_index_table_chroma_199ee3c88b984f0c9f32e98b187abf9c.csv
+2026-03-03T15:59:18.041521 | [PARSED] global_content_index_table_chroma.csv using parse_csv
+2026-03-03T16:09:46.148497 | [INGESTED] global_content_index_table_chroma.csv successfully processed.
+2026-03-03T21:00:17.629131 | [HASH] 023-A-DOG-ON-A-LOG-Free-Childrens-Book-By-Monkey-Pen.pdf → 9c18cf9d516bd60de0b8bc23b66eb848624a15cf4f398b228bd5debd2a95201c
+2026-03-03T21:00:17.645131 | [SAVED] 023-A-DOG-ON-A-LOG-Free-Childrens-Book-By-Monkey-Pen.pdf (9c18cf9d516bd60de0b8bc23b66eb848624a15cf4f398b228bd5debd2a95201c) → static\uploads\api\023-A-DOG-ON-A-LOG-Free-Childrens-Book-By-Monkey-Pen_64fd27e834aa40eda6149e8cf6bffb3e.pdf
+2026-03-03T21:00:18.838953 | [PARSED] 023-A-DOG-ON-A-LOG-Free-Childrens-Book-By-Monkey-Pen.pdf using parse_pdf
+2026-03-03T21:01:04.803389 | [INGESTED] 023-A-DOG-ON-A-LOG-Free-Childrens-Book-By-Monkey-Pen.pdf successfully processed.
+2026-03-03T21:15:31.972585 | [HASH] updated_ingested_file.csv → 4cb2064bc4293cfdde9419badc293e8edd50075347b252b57422b7692b42361f
+2026-03-03T21:15:32.129018 | [SAVED] updated_ingested_file.csv (4cb2064bc4293cfdde9419badc293e8edd50075347b252b57422b7692b42361f) → static\uploads\api\updated_ingested_file_12f2a16592d64b28b7bdd4392b47a0d7.csv
+2026-03-03T21:15:32.200372 | [PARSED] updated_ingested_file.csv using parse_csv
+2026-03-03T21:25:42.870265 | [INGESTED] updated_ingested_file.csv successfully processed.
