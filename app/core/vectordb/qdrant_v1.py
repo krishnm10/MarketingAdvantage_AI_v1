@@ -42,7 +42,7 @@ class QdrantVectorDB(BaseVectorDB):
 
     def __init__(
         self,
-        url: str = "http://localhost:6333",
+        url: Optional[str] = None,
         host: Optional[str] = None,
         port: int = 6333,
         api_key: Optional[str] = None,
@@ -54,15 +54,42 @@ class QdrantVectorDB(BaseVectorDB):
                 "qdrant-client is not installed. "
                 "Install it: pip install qdrant-client"
             )
-        self._client = QdrantClient(
-            url=url if not host else None,
-            host=host,
-            port=port if host else None,
-            api_key=api_key,
-            prefer_grpc=prefer_grpc,
-            timeout=timeout,
-        )
-        logger.info("[QdrantVectorDB] Initialized | url=%s | grpc=%s", url, prefer_grpc)
+    
+        # ---- LOCAL MODE (default) ----
+        if not url:
+            host = host or "localhost"
+    
+            self._client = QdrantClient(
+                host=host,
+                port=port,
+                prefer_grpc=prefer_grpc,
+                timeout=timeout,
+            )
+    
+            logger.info(
+                "[QdrantVectorDB] Initialized LOCAL | host=%s | port=%s | grpc=%s",
+                host, port, prefer_grpc,
+            )
+    
+        # ---- CLOUD MODE ----
+        else:
+            if not api_key:
+                raise ValueError(
+                    "Qdrant Cloud requires api_key. "
+                    "Provide api_key when using url."
+                )
+    
+            self._client = QdrantClient(
+                url=url,
+                api_key=api_key,
+                prefer_grpc=prefer_grpc,
+                timeout=timeout,
+            )
+    
+            logger.info(
+                "[QdrantVectorDB] Initialized CLOUD | url=%s | grpc=%s",
+                url, prefer_grpc,
+            )
 
     @property
     def kind(self) -> str:
