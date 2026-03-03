@@ -211,11 +211,12 @@ class OpenAIEmbedderConfig(BaseModel):
     normalize:        bool           = True
 
 
+# ✅ EXACT FIX — change only device default
 class HuggingFaceEmbedderConfig(BaseModel):
-    model:      str  = Field(..., description="e.g. BAAI/bge-base-en-v1.5")
-    device:     str  = "cpu"
-    batch_size: int  = 32
-    normalize:  bool = True
+    model: str = Field(..., description="e.g. BAAI/bge-large-en-v1.5")
+    device: str = "auto"         # ← "auto" → _resolve_device() in HuggingFaceSTEmbedder
+    batch_size: int = 32
+    normalize: bool = True
 
 
 class CohereEmbedderConfig(BaseModel):

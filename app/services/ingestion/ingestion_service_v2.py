@@ -213,12 +213,20 @@ def _build_config_from_env(
                 api_key_env="OPENAI_API_KEY",
             ),
         )
+    # ✅ FIXED — all HF env vars forwarded into config
     elif embedder_type == "huggingface":
         from app.core.config.client_config_schema import HuggingFaceEmbedderConfig
         emb_cfg = EmbedderConfig(
             type=EmbedderType.HUGGINGFACE,
             huggingface=HuggingFaceEmbedderConfig(
-                model=os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en"),
+                model=os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5"),
+                device=os.getenv("HF_EMBED_DEVICE", "auto"),
+                normalize=os.getenv("HF_NORMALIZE_EMBEDDINGS", "true").lower() == "true",
+                batch_size=int(os.getenv("HF_BATCH_SIZE", "32")),
+                query_instruction=os.getenv(
+                    "HF_EMBED_QUERY_INSTRUCTION",
+                    "Represent this sentence for searching relevant passages:",
+                ),
             ),
         )
     else:

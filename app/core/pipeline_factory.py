@@ -258,9 +258,11 @@ class PipelineFactory:
             "[PipelineFactory] Probing embedder dimension for '%s'...",
             embedder.info.model,
         )
-        embedding_dim = embedder.info.dim
-        if embedding_dim <= 0:
-            # Some embedders (Cohere) don't know dim until first call
+        # ✅ FIX — check embedding_dim property first (set after _load_model)
+        # For HuggingFaceSTEmbedder: embedding_dim triggers _load_model() → returns real dim
+        # This avoids a SECOND embed_query probe call during build()
+        embedding_dim = getattr(embedder, "embedding_dim", None) or embedder.info.dim
+        if not embedding_dim or embedding_dim <= 0:
             probe = embedder.embed_query("dimension probe")
             embedding_dim = len(probe)
             logger.info(
