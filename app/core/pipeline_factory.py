@@ -258,9 +258,11 @@ class PipelineFactory:
             "[PipelineFactory] Probing embedder dimension for '%s'...",
             embedder.info.model,
         )
-        embedding_dim = embedder.info.dim
-        if embedding_dim <= 0:
-            # Some embedders (Cohere) don't know dim until first call
+        # ✅ FIX — check embedding_dim property first (set after _load_model)
+        # For HuggingFaceSTEmbedder: embedding_dim triggers _load_model() → returns real dim
+        # This avoids a SECOND embed_query probe call during build()
+        embedding_dim = getattr(embedder, "embedding_dim", None) or embedder.info.dim
+        if not embedding_dim or embedding_dim <= 0:
             probe = embedder.embed_query("dimension probe")
             embedding_dim = len(probe)
             logger.info(
@@ -339,16 +341,46 @@ class PipelineFactory:
 
         if t == VectorDBType.QDRANT:
             c = cfg.qdrant
+            
+            # Determine if we are in CLOUD mode or LOCAL mode
+            # Cloud mode → URL is explicitly provided AND not localhost
+            is_cloud = bool(c.url and "localhost" not in c.url)
+            
+            if is_cloud:
+                if not c.api_key_env:
+                    raise EnvironmentError(
+                        "[PipelineFactory] Qdrant Cloud requires api_key_env in config."
+                    )
+            
+                api_key = _env(c.api_key_env)
+            
+                logger.info(
+                    "[PipelineFactory] Qdrant CLOUD mode | url=%s",
+                    c.url,
+                )
+            
+                return vectordb_registry.build(
+                    "qdrant",
+                    url=c.url,
+                    api_key=api_key,
+                    prefer_grpc=c.prefer_grpc,
+                    timeout=c.timeout,
+                )
+            
+            # ---- LOCAL MODE (default) ----
+            logger.info(
+                "[PipelineFactory] Qdrant LOCAL mode | host=%s | port=%s",
+                c.host or "localhost",
+                c.port or 6333,
+            )
+            
             return vectordb_registry.build(
                 "qdrant",
-                url=c.url,
-                host=c.host,
-                port=c.port,
-                api_key=_env(c.api_key_env) if c.api_key_env else None,
+                host=c.host or "localhost",
+                port=c.port or 6333,
                 prefer_grpc=c.prefer_grpc,
                 timeout=c.timeout,
             )
-
         if t == VectorDBType.WEAVIATE:
             c = cfg.weaviate
             return vectordb_registry.build(
