@@ -1,20 +1,537 @@
-# app/api/v2/ingestion_health.py
+# ============================================================
+# app/api/v2/ingestion_health.py  —  Comprehensive System Health
+#
+# IMPORTANT: This file must NEVER import gRPC-based VDB client
+# libraries (pymilvus, qdrant-client, weaviate-client) because
+# their internal event-loops deadlock inside FastAPI's asyncio
+# loop.  All network checks use httpx / raw sockets only.
+# ============================================================
+from __future__ import annotations
+
 from fastapi import APIRouter
+import asyncio
 import datetime
+import os
+import socket
 
 router = APIRouter(prefix="/api/v2/ingestion", tags=["Ingestion Health"])
+
+_T = 4  # default per-service timeout in seconds
+
+
+# ── helpers ───────────────────────────────────────────────────────────
+
+def _ok(msg: str) -> dict:
+    return {"status": "online", "message": msg}
+
+def _fail(msg: str) -> dict:
+    return {"status": "offline", "message": msg[:200]}
+
+def _skip(msg: str) -> dict:
+    return {"status": "not_configured", "message": msg}
+
+def _tcp_reachable(host: str, port: int, timeout: float = 2) -> bool:
+    """True if a TCP connect succeeds within *timeout* seconds."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect((host, port))
+        s.close()
+        return True
+    except Exception:
+        return False
+
+
+# ── async httpx helper (no threads, native async) ────────────────────
+
+async def _http_get(url: str, *, headers: dict | None = None,
+                    timeout: float = _T) -> dict | None:
+    """GET via httpx.AsyncClient.  Returns parsed JSON or None."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.get(url, headers=headers or {})
+            if r.status_code < 400:
+                return r.json()
+            return None
+    except Exception:
+        return None
+
+async def _http_post(url: str, *, json: dict, headers: dict | None = None,
+                     timeout: float = _T) -> tuple[int, dict | None]:
+    """POST via httpx.AsyncClient.  Returns (status_code, json | None)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            r = await c.post(url, json=json, headers=headers or {})
+            return r.status_code, (r.json() if r.status_code < 500 else None)
+    except Exception as e:
+        return 0, {"error": str(e)[:200]}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  1. DATABASES
+# ══════════════════════════════════════════════════════════════════════
+
+async def _check_postgres() -> dict:
+    try:
+        from app.db.session_v2 import async_engine
+        from sqlalchemy import text
+        async with async_engine.connect() as conn:
+            await asyncio.wait_for(conn.execute(text("SELECT 1")), timeout=_T)
+        return _ok("Connected")
+    except asyncio.TimeoutError:
+        return _fail(f"Timed out ({_T}s)")
+    except Exception as e:
+        return _fail(str(e))
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  2. VECTOR DATABASES — pure httpx / socket checks (NO client libs)
+# ══════════════════════════════════════════════════════════════════════
+
+async def _check_qdrant() -> dict:
+    """Qdrant REST API   GET /collections"""
+    host = os.getenv("QDRANT_HOST", "localhost")
+    port = int(os.getenv("QDRANT_PORT", "6333"))
+    url  = os.getenv("QDRANT_URL") or f"http://{host}:{port}"
+    api_key = os.getenv("QDRANT_API_KEY") or None
+    hdrs = {"api-key": api_key} if api_key else {}
+    data = await _http_get(f"{url}/collections", headers=hdrs)
+    if data and "result" in data:
+        n = len(data["result"].get("collections", []))
+        return _ok(f"{n} collection(s) | {host}:{port}")
+    return _fail(f"Cannot reach {host}:{port}")
+
+
+async def _check_chroma() -> dict:
+    """ChromaDB — remote HttpClient OR local PersistentClient.
+
+    Remote mode: CHROMA_HOST is set → use httpx to hit /api/v1/collections.
+    Local mode:  CHROMA_HOST is empty → use PersistentClient singleton.
+    """
+    chroma_host = os.getenv("CHROMA_HOST")
+
+    if chroma_host:
+        # ── Remote mode — httpx (no client libs, no gRPC) ─────────
+        port   = int(os.getenv("CHROMA_PORT", "8000"))
+        use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+        scheme = "https" if use_ssl else "http"
+        url    = f"{scheme}://{chroma_host}:{port}"
+        api_key = os.getenv("CHROMA_API_KEY") or None
+        hdrs   = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        data   = await _http_get(f"{url}/api/v1/collections", headers=hdrs)
+        if data is not None:
+            n = len(data) if isinstance(data, list) else 0
+            return _ok(f"{n} collection(s) | {chroma_host}:{port}")
+        return _fail(f"Cannot reach {chroma_host}:{port}")
+
+    # ── Local mode — PersistentClient singleton ───────────────────
+    # MUST use identical Settings as chroma_v1.py (anonymized_telemetry=False)
+    # so that chromadb returns the existing singleton instead of raising
+    # 'instance already exists with different settings'.
+    try:
+        import chromadb
+        from chromadb.config import Settings
+        chroma_path = os.getenv("CHROMA_PATH", "./chroma_db")
+        client = chromadb.PersistentClient(
+            path=chroma_path,
+            settings=Settings(anonymized_telemetry=False),
+        )
+        colls = client.list_collections()
+        return _ok(f"{len(colls)} collection(s) | {chroma_path}")
+    except Exception as e:
+        return _fail(str(e))
+
+
+async def _check_milvus() -> dict:
+    """Milvus — TCP socket check + optional REST health (port 9091).
+    NEVER imports pymilvus here (gRPC deadlocks w/ asyncio)."""
+    host = os.getenv("MILVUS_HOST", "localhost")
+    port = int(os.getenv("MILVUS_PORT", "19530"))
+    uri  = os.getenv("MILVUS_URI")
+
+    target_host, target_port = host, port
+    if uri:
+        from urllib.parse import urlparse
+        p = urlparse(uri if "://" in uri else f"http://{uri}")
+        target_host = p.hostname or host
+        target_port = p.port or port
+
+    # 1) fast TCP probe on gRPC port
+    tcp_ok = await asyncio.get_event_loop().run_in_executor(
+        None, _tcp_reachable, target_host, target_port, 3
+    )
+    if not tcp_ok:
+        return _fail(f"Cannot reach {target_host}:{target_port}")
+
+    # 2) try REST health endpoint (Milvus 2.3+ exposes port 9091)
+    web_port = int(os.getenv("MILVUS_WEB_PORT", "9091"))
+    data = await _http_get(f"http://{target_host}:{web_port}/healthz", timeout=3)
+    if data is not None:
+        return _ok(f"Healthy | {target_host}:{target_port}")
+
+    # TCP connected but REST unavailable — still report online
+    return _ok(f"Reachable (gRPC) | {target_host}:{target_port}")
+
+
+async def _check_pinecone() -> dict:
+    api_key = os.getenv("PINECONE_API_KEY", "")
+    if not api_key:
+        return _skip("PINECONE_API_KEY not set")
+    data = await _http_get(
+        "https://api.pinecone.io/indexes",
+        headers={"Api-Key": api_key},
+        timeout=_T + 3,
+    )
+    if data and "indexes" in data:
+        n = len(data["indexes"])
+        return _ok(f"{n} index(es) | {os.getenv('PINECONE_REGION','us-east-1')}")
+    if data is None:
+        return _fail("Cannot reach Pinecone API")
+    return _fail("Unexpected response")
+
+
+async def _check_weaviate() -> dict:
+    url = os.getenv("WEAVIATE_URL", "http://localhost:8080")
+    api_key = os.getenv("WEAVIATE_API_KEY") or None
+    hdrs = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    data = await _http_get(f"{url}/v1/.well-known/ready", headers=hdrs)
+    if data is not None:
+        return _ok(f"Ready | {url}")
+    return _fail(f"Cannot reach {url}")
+
+
+async def _check_redis() -> dict:
+    url = os.getenv("REDIS_URL")
+    host = os.getenv("REDIS_HOST", "localhost")
+    port = int(os.getenv("REDIS_PORT", "6379"))
+    # quick TCP probe
+    reachable = await asyncio.get_event_loop().run_in_executor(
+        None, _tcp_reachable, host, port, 2
+    )
+    if not reachable:
+        return _fail(f"Cannot reach {host}:{port}")
+    try:
+        import redis as redis_lib
+        if url:
+            c = redis_lib.Redis.from_url(url, socket_timeout=_T)
+        else:
+            c = redis_lib.Redis(host=host, port=port,
+                                password=os.getenv("REDIS_PASSWORD") or None,
+                                socket_timeout=_T)
+        pong = c.ping()
+        c.close()
+        addr = url or f"{host}:{port}"
+        return _ok(f"Connected | {addr}") if pong else _fail("Ping failed")
+    except ImportError:
+        return {"status": "not_installed", "message": "redis-py not installed"}
+    except Exception as e:
+        return _fail(str(e))
+
+
+_VECTORDB_CHECKS = {
+    "qdrant":   _check_qdrant,
+    "chroma":   _check_chroma,
+    "pinecone": _check_pinecone,
+    "milvus":   _check_milvus,
+    "weaviate": _check_weaviate,
+    "redis":    _check_redis,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  3. EMBEDDERS
+# ══════════════════════════════════════════════════════════════════════
+
+async def _check_emb_huggingface() -> dict:
+    model = os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+    try:
+        cache_dir = os.path.join(
+            os.getenv("SENTENCE_TRANSFORMERS_HOME",
+                      os.path.join(os.path.expanduser("~"), ".cache", "torch", "sentence_transformers")),
+        )
+        model_safe = model.replace("/", "_")
+        cached = any(
+            model_safe in d or model in d
+            for d in (os.listdir(cache_dir) if os.path.isdir(cache_dir) else [])
+        )
+        if cached:
+            return _ok(f"{model} | cached locally")
+        # check if library is importable
+        import importlib
+        if importlib.util.find_spec("sentence_transformers"):
+            return _ok(f"{model} | library installed")
+        return {"status": "not_installed", "message": "sentence-transformers not installed"}
+    except Exception as e:
+        return _fail(str(e))
+
+
+async def _check_emb_ollama() -> dict:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model    = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+    code, data = await _http_post(
+        f"{base_url}/api/embeddings",
+        json={"model": model, "prompt": "health"},
+        timeout=_T + 5,
+    )
+    if code == 200 and data:
+        dim = len(data.get("embedding", []))
+        return _ok(f"{model} | dim={dim}")
+    return _fail(f"HTTP {code}" if code else "Ollama unreachable")
+
+
+async def _check_emb_openai() -> dict:
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return _skip("OPENAI_API_KEY not set")
+    model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+    code, data = await _http_post(
+        "https://api.openai.com/v1/embeddings",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": model, "input": "health"},
+        timeout=_T + 5,
+    )
+    if code == 200 and data:
+        dim = len(data["data"][0]["embedding"])
+        return _ok(f"{model} | dim={dim}")
+    return _fail(f"HTTP {code}")
+
+
+async def _check_emb_cohere() -> dict:
+    api_key = os.getenv("COHERE_API_KEY", "")
+    if not api_key:
+        return _skip("COHERE_API_KEY not set")
+    model = os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0")
+    code, data = await _http_post(
+        "https://api.cohere.ai/v1/embed",
+        headers={"Authorization": f"Bearer {api_key}"},
+        json={"model": model, "texts": ["health"], "input_type": "search_document"},
+        timeout=_T + 5,
+    )
+    if code == 200 and data:
+        dim = len(data["embeddings"][0])
+        return _ok(f"{model} | dim={dim}")
+    return _fail(f"HTTP {code}")
+
+
+_EMBEDDER_CHECKS = {
+    "huggingface": _check_emb_huggingface,
+    "ollama":      _check_emb_ollama,
+    "openai":      _check_emb_openai,
+    "cohere":      _check_emb_cohere,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  4. LLMs
+# ══════════════════════════════════════════════════════════════════════
+
+async def _check_llm_ollama() -> dict:
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    model    = os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
+    data = await _http_get(f"{base_url}/api/tags", timeout=_T)
+    if data:
+        models = data.get("models", [])
+        names  = [m.get("name", "") for m in models]
+        found  = model in names or any(model in n for n in names)
+        return _ok(f"{model} | {len(models)} model(s)" + (" | loaded" if found else " | NOT loaded"))
+    return _fail("Ollama unreachable")
+
+
+async def _check_llm_openai() -> dict:
+    api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return _skip("OPENAI_API_KEY not set")
+    model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+    data = await _http_get(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=_T + 5,
+    )
+    return _ok(f"{model} | API key valid") if data else _fail("OpenAI unreachable")
+
+
+async def _check_llm_groq() -> dict:
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        return _skip("GROQ_API_KEY not set")
+    model = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+    data = await _http_get(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=_T + 5,
+    )
+    return _ok(f"{model} | API key valid") if data else _fail("Groq unreachable")
+
+
+async def _check_llm_anthropic() -> dict:
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return _skip("ANTHROPIC_API_KEY not set")
+    model = os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022")
+    code, data = await _http_post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        json={"model": model, "max_tokens": 1,
+              "messages": [{"role": "user", "content": "hi"}]},
+        timeout=_T + 5,
+    )
+    if code == 200:
+        return _ok(f"{model} | API key valid")
+    if code == 429:
+        return _ok(f"{model} | rate-limited but reachable")
+    return _fail(f"HTTP {code}")
+
+
+async def _check_llm_gemini() -> dict:
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return _skip("GEMINI_API_KEY not set")
+    model = os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash")
+    data = await _http_get(
+        f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+        timeout=_T + 5,
+    )
+    if data:
+        n = len(data.get("models", []))
+        return _ok(f"{model} | {n} model(s)")
+    return _fail("Gemini unreachable")
+
+
+_LLM_CHECKS = {
+    "ollama":    _check_llm_ollama,
+    "openai":    _check_llm_openai,
+    "groq":      _check_llm_groq,
+    "grok":      _check_llm_groq,       # alias
+    "anthropic": _check_llm_anthropic,
+    "gemini":    _check_llm_gemini,
+}
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  5. MAIN HEALTH ENDPOINT
+# ══════════════════════════════════════════════════════════════════════
+
+# What makes a backend "worth pinging"?
+_VDB_CONFIGURED = {
+    "qdrant":   lambda: True,
+    "chroma":   lambda: True,
+    "milvus":   lambda: bool(os.getenv("MILVUS_HOST") and os.getenv("MILVUS_HOST") != "localhost") or bool(os.getenv("MILVUS_URI")),
+    "pinecone": lambda: bool(os.getenv("PINECONE_API_KEY")),
+    "weaviate": lambda: bool(os.getenv("WEAVIATE_API_KEY")) or (os.getenv("WEAVIATE_URL", "").replace("http://localhost:8080", "") != ""),
+    "redis":    lambda: bool(os.getenv("REDIS_URL")) or bool(os.getenv("REDIS_PASSWORD")),
+}
+
+_EMB_CONFIGURED = {
+    "huggingface": lambda: True,
+    "ollama":      lambda: True,
+    "openai":      lambda: bool(os.getenv("OPENAI_API_KEY")),
+    "cohere":      lambda: bool(os.getenv("COHERE_API_KEY")),
+}
+
+_LLM_CONFIGURED = {
+    "ollama":    lambda: True,
+    "openai":    lambda: bool(os.getenv("OPENAI_API_KEY")),
+    "groq":      lambda: bool(os.getenv("GROQ_API_KEY")),
+    "anthropic": lambda: bool(os.getenv("ANTHROPIC_API_KEY")),
+    "gemini":    lambda: bool(os.getenv("GEMINI_API_KEY")),
+}
+
 
 @router.get("/health")
 async def ingestion_health():
     """
-    Health endpoint for ingestion system.
-    Checks DB, vector DB (Chroma), and LLM connectivity.
+    Comprehensive health — pings active + configured services only.
+    All checks are native-async (httpx / socket). No gRPC libs imported.
+    Typically completes in 1-5 s.
     """
+    active_vdb = os.getenv("MAI_VECTORDB", "qdrant").lower()
+    active_emb = os.getenv("MAI_EMBEDDER", "huggingface").lower()
+    active_llm = os.getenv("MAI_LLM", "ollama").lower()
+
+    # ── collect coroutines ───────────────────────────────────────────
+    tasks: dict[str, any] = {}
+    tasks["db__postgresql"] = _check_postgres()
+
+    for name, fn in _VECTORDB_CHECKS.items():
+        if name == active_vdb or _VDB_CONFIGURED.get(name, lambda: False)():
+            tasks[f"vdb__{name}"] = fn()
+
+    for name, fn in _EMBEDDER_CHECKS.items():
+        if name == active_emb or _EMB_CONFIGURED.get(name, lambda: False)():
+            tasks[f"emb__{name}"] = fn()
+
+    seen: set = set()
+    for name, fn in _LLM_CHECKS.items():
+        if fn in seen:
+            continue
+        if name == active_llm or _LLM_CONFIGURED.get(name, lambda: False)():
+            tasks[f"llm__{name}"] = fn()
+            seen.add(fn)
+
+    # ── execute with a hard overall timeout ──────────────────────────
+    keys = list(tasks.keys())
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*tasks.values(), return_exceptions=True),
+            timeout=15,
+        )
+    except asyncio.TimeoutError:
+        results = [{"status": "offline", "message": "Global timeout (15 s)"}] * len(keys)
+
+    flat: dict = {}
+    for k, r in zip(keys, results):
+        if isinstance(r, Exception):
+            flat[k] = _fail(str(r))
+        elif isinstance(r, dict):
+            flat[k] = r
+        else:
+            flat[k] = _fail("Unexpected result")
+
+    # ── build categorised response ───────────────────────────────────
+    def _entry(key, prefix, checks, active_name, cfg_map):
+        tk = f"{prefix}__{key}"
+        is_active = key == active_name
+        if tk in flat:
+            return {**flat[tk], "active": is_active}
+        cfg = cfg_map.get(key, lambda: False)
+        if not cfg():
+            return {"status": "not_configured", "message": "Not configured", "active": is_active}
+        return {"status": "offline", "message": "Skipped", "active": is_active}
+
+    databases = {
+        "postgresql": {**(flat.get("db__postgresql", _fail("Unknown"))), "active": True}
+    }
+    vectordbs = {k: _entry(k, "vdb", _VECTORDB_CHECKS, active_vdb, _VDB_CONFIGURED) for k in _VECTORDB_CHECKS}
+    embedders = {k: _entry(k, "emb", _EMBEDDER_CHECKS, active_emb, _EMB_CONFIGURED) for k in _EMBEDDER_CHECKS}
+
+    llms: dict = {}
+    seen2: set = set()
+    for k in _LLM_CHECKS:
+        if _LLM_CHECKS[k] in seen2 and k != active_llm:
+            continue
+        llms[k] = _entry(k, "llm", _LLM_CHECKS, active_llm, _LLM_CONFIGURED)
+        seen2.add(_LLM_CHECKS[k])
+
+    active_entries = [
+        databases.get("postgresql", {}),
+        vectordbs.get(active_vdb, {}),
+        embedders.get(active_emb, {}),
+        llms.get(active_llm, {}),
+    ]
+    all_ok = all(s.get("status") == "online" for s in active_entries if s)
+
     return {
-        "status": "ok",
+        "status": "ok" if all_ok else "degraded",
         "timestamp": datetime.datetime.utcnow().isoformat(),
-        "db_connected": True,
-        "chroma_connected": True,
-        "llm_ready": True,
-        "uptime_seconds": 12345,
+        "active": {"vectordb": active_vdb, "embedder": active_emb, "llm": active_llm},
+        "databases": databases,
+        "vectordbs": vectordbs,
+        "embedders": embedders,
+        "llms":      llms,
     }

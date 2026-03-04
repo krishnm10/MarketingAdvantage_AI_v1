@@ -19,10 +19,10 @@ export default function Button({
     "inline-flex items-center justify-center px-4 py-2 rounded-md text-sm font-medium focus:outline-none transition";
 
   const variants = {
-    primary: "bg-primary text-white hover:bg-teal-700",
-    secondary: "bg-gray-700 text-white hover:bg-gray-800",
-    outline: "border border-gray-300 hover:bg-gray-100",
-    danger: "bg-red-600 text-white hover:bg-red-700",
+    primary: "bg-gradient-to-r from-primary-600 to-primary-500 text-white shadow-lg shadow-primary-600/25 hover:shadow-primary-600/40",
+    secondary: "bg-slate-700 text-white hover:bg-slate-800",
+    outline: "border border-slate-200 text-slate-600 hover:bg-slate-50 hover:border-slate-300",
+    danger: "bg-gradient-to-r from-red-600 to-red-500 text-white shadow-lg shadow-red-600/25 hover:shadow-red-600/40",
   };
 
   return (

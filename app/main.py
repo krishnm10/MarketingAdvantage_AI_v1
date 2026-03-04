@@ -53,6 +53,8 @@ from app.api.v2.admin_audit_api         import router as admin_audit_router
 from app.api.v2.auth_api                import router as auth_router
 from app.api.v2.ingestion_ws_api        import router as ingestion_ws_router
 from app.api.v2.ingestion_health        import router as ingestion_health_router
+from app.api.v2.config_api              import router as config_router
+from app.api.v2.retrieve_api            import router as retrieve_router
 
 # ─────────────────────────────────────────────────────────────────────────────
 # New Pluggable RAG Router (NEW — additive only)
@@ -309,7 +311,6 @@ app.add_middleware(
 # ── Existing routers (ALL PRESERVED — prefixes/tags unchanged) ──────────────
 app.include_router(
     ingestion_router,
-    prefix="/api/v2",
     tags=["Ingestion v2"],
 )
 app.include_router(ingestion_admin_router,     tags=["Admin"])
@@ -319,6 +320,8 @@ app.include_router(admin_audit_router,         tags=["Audit"])
 app.include_router(auth_router,                tags=["Auth"])
 app.include_router(ingestion_health_router,    tags=["Health"])
 app.include_router(ingestion_ws_router,        tags=["WebSocket"])
+app.include_router(config_router,              tags=["Configuration"])
+app.include_router(retrieve_router,            tags=["Retrieval"])
 
 # ── New pluggable RAG router (NEW — additive, own prefix) ───────────────────
 app.include_router(

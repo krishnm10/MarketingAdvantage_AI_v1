@@ -1,11 +1,11 @@
 "use client";
 
-import RequireRole from "@/components/RequireRole";
+import AppShell from "@/components/layout/AppShell";
 
 export default function DashboardLayout({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  return <RequireRole>{children}</RequireRole>;
+  return <AppShell>{children}</AppShell>;
 }

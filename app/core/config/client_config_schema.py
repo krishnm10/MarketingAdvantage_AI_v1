@@ -50,6 +50,7 @@ class VectorDBType(str, Enum):
     WEAVIATE = "weaviate"
     PINECONE = "pinecone"
     MILVUS   = "milvus"
+    REDIS    = "redis"
 
 
 class EmbedderType(str, Enum):
@@ -93,15 +94,39 @@ class SearchMode(str, Enum):
 # ══════════════════════════════════════════════════════════════
 
 class ChromaConfig(BaseModel):
-    """ChromaDB — local persistent store."""
-    persist_directory: str = Field(
-        ...,
+    """ChromaDB — local persistent store OR remote server (HttpClient)."""
+    persist_directory: Optional[str] = Field(
+        None,
         description=(
-            "REQUIRED. Absolute path to ChromaDB storage. "
-            "Must be unique per client — never shared."
+            "Path to local ChromaDB storage. "
+            "Required for local mode. Ignored when host is set."
         )
     )
-    anonymized_telemetry: bool = False
+    host: Optional[str] = Field(
+        None,
+        description=(
+            "Remote ChromaDB server host (e.g. 'localhost' or '10.0.0.5'). "
+            "If set, uses HttpClient instead of PersistentClient."
+        )
+    )
+    port:         int            = 8000
+    ssl:          bool           = False
+    api_key_env:  Optional[str]  = Field(
+        None,
+        description="Env var NAME holding ChromaDB API key (for auth-enabled servers)."
+    )
+    tenant:       str            = "default_tenant"
+    database:     str            = "default_database"
+    anonymized_telemetry: bool   = False
+
+    @model_validator(mode="after")
+    def validate_local_or_remote(self) -> "ChromaConfig":
+        if not self.host and not self.persist_directory:
+            raise ValueError(
+                "ChromaConfig: provide 'host' (remote server) "
+                "or 'persist_directory' (local disk)."
+            )
+        return self
 
 
 class QdrantConfig(BaseModel):
@@ -158,6 +183,29 @@ class MilvusConfig(BaseModel):
     alias:         str  = "default"
 
 
+class RedisConfig(BaseModel):
+    """Redis Stack — local, remote, or Redis Cloud."""
+    url:            Optional[str] = Field(
+        None,
+        description=(
+            "Full Redis URL (redis://... or rediss://...). "
+            "Takes precedence over host/port. Use for Redis Cloud."
+        ),
+    )
+    host:           str  = "localhost"
+    port:           int  = 6379
+    password_env:   Optional[str] = Field(
+        None, description="Env var NAME holding Redis password."
+    )
+    username:       Optional[str] = None
+    db:             int  = 0
+    ssl:            bool = False
+    ssl_ca_certs:   Optional[str] = Field(
+        None, description="Path to CA cert file for TLS verification."
+    )
+    prefix:         str  = "vec:"
+
+
 class VectorDBConfig(BaseModel):
     """
     Top-level VectorDB config.
@@ -174,6 +222,7 @@ class VectorDBConfig(BaseModel):
     weaviate: Optional[WeaviateConfig] = None
     pinecone: Optional[PineconeConfig] = None
     milvus:   Optional[MilvusConfig]   = None
+    redis:    Optional[RedisConfig]    = None
 
     @model_validator(mode="after")
     def validate_sub_config_present(self) -> "VectorDBConfig":
@@ -183,6 +232,7 @@ class VectorDBConfig(BaseModel):
             VectorDBType.WEAVIATE: "weaviate",
             VectorDBType.PINECONE: "pinecone",
             VectorDBType.MILVUS:   "milvus",
+            VectorDBType.REDIS:    "redis",
         }
         field = mapping[self.type]
         if getattr(self, field) is None:

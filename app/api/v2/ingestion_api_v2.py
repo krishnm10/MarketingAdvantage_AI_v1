@@ -173,29 +173,8 @@ async def update_llm_settings(
 
 
 # -----------------------------------------------------------
-# HEALTH CHECK ENDPOINT
+# HEALTH CHECK — handled by ingestion_health.py
 # -----------------------------------------------------------
-@router.get("/health")
-async def health_check():
-    """
-    Lightweight health check endpoint.
-    """
-    try:
-        return {
-            "status": "ok",
-            "message": "Ingestion API v2 running (production-grade).",
-            "LLM_MODE": ingestion_settings.LLM_MODE,
-            "LLM_NORMALIZATION": ingestion_settings.ENABLE_LLM_NORMALIZATION,
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Health check failed: {e}")
-        
-@router.get("/health")
-async def ingestion_health():
-    """
-    Basic health check endpoint for ingestion system.
-    """
-    return {"status": "ok", "message": "Ingestion API reachable"}
 
 @router.post("/media/upload")
 async def ingest_media(

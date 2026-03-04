@@ -22,7 +22,7 @@ from app.services.ingestion.deduplication_engine_v2 import create_normalized_has
 @lru_cache(maxsize=1)
 def get_embed_model():
     from sentence_transformers import SentenceTransformer
-    return SentenceTransformer("EMBEDDING_MODEL_NAME")
+    return SentenceTransformer(EMBEDDING_MODEL_NAME)
 
 # -------------------------------------------------------------------
 # TOKEN COUNTER

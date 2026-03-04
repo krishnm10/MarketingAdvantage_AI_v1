@@ -7,9 +7,9 @@ type MetricCardProps = {
 
 export default function MetricCard({ title, value }: MetricCardProps) {
   return (
-    <div className="rounded-lg border bg-white p-4 shadow-sm">
-      <div className="text-sm text-gray-500">{title}</div>
-      <div className="mt-2 text-2xl font-semibold">{value}</div>
+    <div className="rounded-xl border border-slate-200/60 bg-white p-5 shadow-card hover:shadow-card-hover transition-shadow duration-300">
+      <div className="text-xs font-medium uppercase tracking-wider text-slate-400">{title}</div>
+      <div className="mt-2 text-3xl font-bold text-slate-900">{value}</div>
     </div>
   );
 }

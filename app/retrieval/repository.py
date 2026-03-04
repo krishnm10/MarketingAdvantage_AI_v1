@@ -9,11 +9,12 @@ Responsibilities:
 - Candidate construction (zero data loss)
 """
 
+import os
 from typing import List, Tuple, Optional, Dict, Any
 from sqlalchemy import select
 from datetime import datetime, timezone
 
-from app.utils.logger import log_debug, log_warning
+from app.utils.logger import log_debug, log_info, log_warning
 
 from app.retrieval.types_retrieve import (
     RetrievalCandidate,
@@ -219,18 +220,76 @@ class RetrievalRepository:
     - Zero data loss
     """
     
-    def __init__(self, db_session):
+    def __init__(self, db_session, vectordb=None, collection: str = None):
         self.db = db_session
         
-        # Lazy-load ChromaDB search
-        self._chroma_search = None
+        # Pluggable vector DB (lazy-loaded from .env if not provided)
+        self._vectordb = vectordb
+        self._collection = collection or os.getenv("MAI_COLLECTION", "ingested_content")
     
-    def _get_chroma_search(self):
-        """Lazy-load ChromaDB search service"""
-        if self._chroma_search is None:
-            from app.services.retrieval.chroma_search import get_chroma_search
-            self._chroma_search = get_chroma_search()
-        return self._chroma_search
+    def _get_vectordb(self):
+        """Lazy-load vector DB from .env config (pluggable: qdrant, chroma, pinecone, milvus, weaviate, redis)"""
+        if self._vectordb is None:
+            db_type = os.getenv("MAI_VECTORDB", "qdrant").lower()
+            log_info(f"[REPO] Initializing pluggable vector DB: {db_type}")
+            
+            if db_type == "qdrant":
+                from app.core.vectordb.qdrant_v1 import QdrantVectorDB
+                self._vectordb = QdrantVectorDB(
+                    url=os.getenv("QDRANT_URL") or None,
+                    host=os.getenv("QDRANT_HOST", "localhost"),
+                    port=int(os.getenv("QDRANT_PORT", "6333")),
+                    api_key=os.getenv("QDRANT_API_KEY") or None,
+                )
+            elif db_type == "chroma":
+                from app.core.vectordb.chroma_v1 import ChromaVectorDB
+                self._vectordb = ChromaVectorDB(
+                    persist_directory=os.getenv("CHROMA_PATH", "./chroma_db"),
+                )
+            elif db_type == "pinecone":
+                from app.core.vectordb.pinecone_v1 import PineconeVectorDB
+                self._vectordb = PineconeVectorDB(
+                    api_key=os.getenv("PINECONE_API_KEY", ""),
+                    index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
+                    namespace=os.getenv("PINECONE_NAMESPACE", "default"),
+                    embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
+                    metric=os.getenv("PINECONE_METRIC", "cosine"),
+                    cloud=os.getenv("PINECONE_CLOUD", "aws"),
+                    region=os.getenv("PINECONE_REGION", "us-east-1"),
+                )
+            elif db_type == "milvus":
+                from app.core.vectordb.milvus_v1 import MilvusVectorDB
+                self._vectordb = MilvusVectorDB(
+                    uri=os.getenv("MILVUS_URI") or None,
+                    token=os.getenv("MILVUS_TOKEN") or None,
+                    host=os.getenv("MILVUS_HOST", "localhost"),
+                    port=int(os.getenv("MILVUS_PORT", "19530")),
+                )
+            elif db_type == "weaviate":
+                from app.core.vectordb.weaviate_v1 import WeaviateVectorDB
+                self._vectordb = WeaviateVectorDB(
+                    url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
+                    api_key=os.getenv("WEAVIATE_API_KEY") or None,
+                )
+            elif db_type == "redis":
+                from app.core.vectordb.redis_v1 import RedisVectorDB
+                self._vectordb = RedisVectorDB(
+                    url=os.getenv("REDIS_URL") or None,
+                    host=os.getenv("REDIS_HOST", "localhost"),
+                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    password=os.getenv("REDIS_PASSWORD") or None,
+                    username=os.getenv("REDIS_USERNAME") or None,
+                    db=int(os.getenv("REDIS_DB", "0")),
+                    ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported MAI_VECTORDB='{db_type}'. "
+                    f"Supported: qdrant, chroma, pinecone, milvus, weaviate, redis"
+                )
+            
+            log_info(f"[REPO] Vector DB ready: {self._vectordb.kind}")
+        return self._vectordb
     
     async def fetch_candidates(
         self,
@@ -263,48 +322,92 @@ class RetrievalRepository:
         )
         
         try:
-            chroma = self._get_chroma_search()
-            hits: List[Tuple[str, float]] = await chroma.search(
-                query_embedding=query_embedding,
-                limit=limit,
+            import asyncio
+            vectordb = self._get_vectordb()
+            
+            # Run sync vector DB search in thread pool
+            def _search():
+                return vectordb.search(
+                    collection=self._collection,
+                    query_embedding=query_embedding,
+                    top_k=limit,
+                )
+            
+            vector_hits = await asyncio.get_running_loop().run_in_executor(
+                None, _search
             )
         except Exception as e:
             log_warning(f"[REPO] Semantic search FAILED: {e}")
             return []
         
-        if not hits:
+        if not vector_hits:
             log_debug("[REPO] Semantic search returned 0 results")
             return []
         
-        log_debug(f"[REPO] Semantic search returned {len(hits)} candidates")
-        log_debug(f"[REPO] Top-3 scores: {[f'{s:.4f}' for _, s in hits[:3]]}")
+        # Build (semantic_hash, score) tuples.
+        # Qdrant stores semantic_hash in metadata; its point ID is a UUID5.
+        # ChromaDB uses semantic_hash directly as the ID.
+        # Some points may have global_content_id instead.
+        hits: List[Tuple[str, float]] = []
+        hits_by_content_id: Dict[str, float] = {}   # fallback for points without semantic_hash
+        
+        for h in vector_hits:
+            meta = h.metadata or {}
+            sem_hash = meta.get("semantic_hash", "")
+            if sem_hash:
+                hits.append((sem_hash, h.score))
+            elif meta.get("global_content_id"):
+                # Some repair/migrated points store content ID instead
+                hits_by_content_id[meta["global_content_id"]] = h.score
+            else:
+                # Last resort: use point ID as lookup (works for ChromaDB)
+                hits.append((h.id, h.score))
+        
+        log_debug(f"[REPO] Semantic search returned {len(hits)} hash-based + {len(hits_by_content_id)} id-based candidates")
+        if hits:
+            log_debug(f"[REPO] Top-3 scores: {[f'{s:.4f}' for _, s in hits[:3]]}")
         
         # -------------------------------------------------
         # 2. BATCH DATABASE HYDRATION (Fix N+1)
         # -------------------------------------------------
         semantic_hashes = [h for h, _ in hits]
+        content_ids = list(hits_by_content_id.keys())
         
-        log_debug(f"[REPO] Batch fetching {len(semantic_hashes)} records from DB")
+        log_debug(f"[REPO] Batch fetching {len(semantic_hashes)} by hash + {len(content_ids)} by content_id")
         
-        stmt = select(IngestedContentV2).where(
-            IngestedContentV2.semantic_hash.in_(semantic_hashes)
-        )
+        # Fetch by semantic_hash
+        contents_by_hash: Dict[str, IngestedContentV2] = {}
+        if semantic_hashes:
+            stmt = select(IngestedContentV2).where(
+                IngestedContentV2.semantic_hash.in_(semantic_hashes)
+            )
+            try:
+                result = await self.db.execute(stmt)
+                for c in result.scalars().all():
+                    contents_by_hash[c.semantic_hash] = c
+            except Exception as e:
+                log_warning(f"[REPO] Database fetch by hash FAILED: {e}")
+                return []
         
-        try:
-            result = await self.db.execute(stmt)
-            contents = result.scalars().all()
-        except Exception as e:
-            log_warning(f"[REPO] Database fetch FAILED: {e}")
-            return []
+        # Fetch by content_id (global_content_id fallback)
+        contents_by_id: Dict[str, IngestedContentV2] = {}
+        if content_ids:
+            from sqlalchemy import cast, String
+            stmt2 = select(IngestedContentV2).where(
+                cast(IngestedContentV2.id, String).in_(content_ids)
+            )
+            try:
+                result2 = await self.db.execute(stmt2)
+                for c in result2.scalars().all():
+                    contents_by_id[str(c.id)] = c
+            except Exception as e:
+                log_warning(f"[REPO] Database fetch by content_id FAILED: {e}")
         
-        # Build hash → content lookup
-        contents_by_hash: Dict[str, IngestedContentV2] = {
-            c.semantic_hash: c for c in contents
-        }
-        
+        total_found = len(contents_by_hash) + len(contents_by_id)
+        total_requested = len(semantic_hashes) + len(content_ids)
         log_debug(
-            f"[REPO] DB returned {len(contents_by_hash)} records "
-            f"({len(semantic_hashes) - len(contents_by_hash)} misses)"
+            f"[REPO] DB returned {total_found} records "
+            f"({total_requested - total_found} misses)"
         )
         
         # -------------------------------------------------
@@ -312,6 +415,7 @@ class RetrievalRepository:
         # -------------------------------------------------
         candidates: List[RetrievalCandidate] = []
         
+        # Process hash-based hits
         for semantic_hash, semantic_score in hits:
             content = contents_by_hash.get(semantic_hash)
             
@@ -334,6 +438,24 @@ class RetrievalRepository:
                 log_warning(
                     f"[REPO] Failed to build candidate for {content.id}: {e}"
                 )
+                continue
+        
+        # Process content_id-based hits (global_content_id fallback)
+        for cid, semantic_score in hits_by_content_id.items():
+            content = contents_by_id.get(cid)
+            if not content:
+                log_debug(f"[REPO] DB miss for content_id: {cid[:16]}...")
+                continue
+            if not content.text or not content.text.strip():
+                continue
+            try:
+                candidate = await self._build_candidate(
+                    content=content,
+                    semantic_score=semantic_score
+                )
+                candidates.append(candidate)
+            except Exception as e:
+                log_warning(f"[REPO] Failed to build candidate for {content.id}: {e}")
                 continue
         
         log_debug(f"[REPO] Successfully built {len(candidates)} candidates")

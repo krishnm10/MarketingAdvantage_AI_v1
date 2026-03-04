@@ -1,0 +1,489 @@
+"use client";
+
+import { useState, useRef, useEffect } from "react";
+import apiClient from "@/lib/apiClient";
+import {
+  Search,
+  Send,
+  Loader2,
+  AlertCircle,
+  FileText,
+  Shield,
+  Clock,
+  ChevronDown,
+  ChevronUp,
+  Sparkles,
+  Target,
+  Layers,
+  Hash,
+  BarChart3,
+  Zap,
+  Copy,
+  Check,
+  Trash2,
+  Info,
+} from "lucide-react";
+import { cn } from "@/lib/utils";
+
+/* ────────────────────────────────────────────────────────────
+   Types
+   ──────────────────────────────────────────────────────────── */
+
+interface SignalDetail {
+  semantic_score?: number | null;
+  tap_trust_score?: number | null;
+  agentic_validation_score?: number | null;
+  reasoning_quality_score?: number | null;
+  conflict_modifier?: number | null;
+  temporal_decay?: number | null;
+}
+
+interface ResultItem {
+  rank: number;
+  chunk_id: string;
+  text: string;
+  score: number;
+  trust_decision?: string | null;
+  explanation: Record<string, any>;
+  signals?: SignalDetail | null;
+}
+
+interface RetrieveResponse {
+  query: string;
+  intent: string;
+  total_results: number;
+  total_dropped: number;
+  latency_ms: number;
+  results: ResultItem[];
+}
+
+interface HistoryEntry {
+  query: string;
+  intent: string;
+  response: RetrieveResponse;
+  timestamp: number;
+}
+
+const INTENTS = [
+  { value: "answer", label: "Answer", description: "Strict, high-trust retrieval", icon: Target },
+  { value: "explore", label: "Explore", description: "Broader recall for exploration", icon: Sparkles },
+  { value: "audit", label: "Audit", description: "No filtering — full transparency", icon: Layers },
+] as const;
+
+/* ────────────────────────────────────────────────────────────
+   Helpers
+   ──────────────────────────────────────────────────────────── */
+
+function trustColor(decision?: string | null) {
+  if (!decision) return "text-slate-400";
+  const d = decision.toLowerCase();
+  if (d === "trusted") return "text-emerald-600";
+  if (d === "provisional") return "text-amber-600";
+  return "text-red-500";
+}
+
+function trustBg(decision?: string | null) {
+  if (!decision) return "bg-slate-100 text-slate-600";
+  const d = decision.toLowerCase();
+  if (d === "trusted") return "bg-emerald-50 text-emerald-700 border-emerald-200";
+  if (d === "provisional") return "bg-amber-50 text-amber-700 border-amber-200";
+  return "bg-red-50 text-red-700 border-red-200";
+}
+
+function scoreColor(score: number) {
+  if (score >= 0.7) return "text-emerald-600";
+  if (score >= 0.4) return "text-amber-600";
+  return "text-red-500";
+}
+
+function ScoreBar({ value, max = 1, color }: { value: number; max?: number; color: string }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div className="flex items-center gap-2 min-w-0">
+      <div className="flex-1 h-1.5 rounded-full bg-slate-100 overflow-hidden">
+        <div className={cn("h-full rounded-full transition-all", color)} style={{ width: `${pct}%` }} />
+      </div>
+      <span className="text-xs font-mono text-slate-500 w-10 text-right">{value.toFixed(3)}</span>
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   Result Card Component
+   ──────────────────────────────────────────────────────────── */
+
+function ResultCard({ result }: { result: ResultItem }) {
+  const [expanded, setExpanded] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const signals = result.signals;
+
+  const copyText = () => {
+    navigator.clipboard.writeText(result.text);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="rounded-xl border border-slate-200/60 bg-white shadow-card overflow-hidden transition-shadow hover:shadow-md">
+      {/* Header */}
+      <div className="flex items-center gap-3 px-5 py-3.5 border-b border-slate-100 bg-slate-50/50">
+        <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-primary-50 text-primary-600 text-xs font-bold">
+          #{result.rank}
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2">
+            <span className={cn("text-sm font-semibold", scoreColor(result.score))}>
+              {(result.score * 100).toFixed(1)}%
+            </span>
+            <span className="text-slate-300">·</span>
+            <span className={cn("text-xs font-medium px-2 py-0.5 rounded-full border", trustBg(result.trust_decision))}>
+              <Shield className="w-3 h-3 inline mr-1 -mt-0.5" />
+              {result.trust_decision || "unknown"}
+            </span>
+          </div>
+          <p className="text-[10px] text-slate-400 font-mono mt-0.5 truncate">{result.chunk_id}</p>
+        </div>
+        <div className="flex items-center gap-1">
+          <button onClick={copyText} className="p-1.5 rounded-md hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors" title="Copy text">
+            {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+          </button>
+          <button onClick={() => setExpanded(!expanded)} className="p-1.5 rounded-md hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors" title="Toggle details">
+            {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+          </button>
+        </div>
+      </div>
+
+      {/* Text content */}
+      <div className="px-5 py-4">
+        <p className={cn("text-sm text-slate-700 leading-relaxed whitespace-pre-wrap", !expanded && "line-clamp-4")}>
+          {result.text}
+        </p>
+        {!expanded && result.text.length > 300 && (
+          <button onClick={() => setExpanded(true)} className="text-xs text-primary-600 hover:text-primary-700 font-medium mt-2">
+            Show full text →
+          </button>
+        )}
+      </div>
+
+      {/* Expanded details: signals */}
+      {expanded && signals && (
+        <div className="px-5 pb-4 border-t border-slate-100 pt-4">
+          <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-3">
+            <BarChart3 className="w-3.5 h-3.5 inline mr-1 -mt-0.5" />
+            Signal Breakdown
+          </p>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2">
+            {signals.semantic_score != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">Semantic Score</p>
+                <ScoreBar value={signals.semantic_score} color="bg-blue-500" />
+              </div>
+            )}
+            {signals.tap_trust_score != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">TAP Trust Score</p>
+                <ScoreBar value={signals.tap_trust_score} color="bg-emerald-500" />
+              </div>
+            )}
+            {signals.agentic_validation_score != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">Agentic Validation</p>
+                <ScoreBar value={signals.agentic_validation_score} color="bg-violet-500" />
+              </div>
+            )}
+            {signals.reasoning_quality_score != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">Reasoning Quality</p>
+                <ScoreBar value={signals.reasoning_quality_score} color="bg-amber-500" />
+              </div>
+            )}
+            {signals.conflict_modifier != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">Conflict Modifier</p>
+                <ScoreBar value={signals.conflict_modifier} color="bg-rose-500" />
+              </div>
+            )}
+            {signals.temporal_decay != null && (
+              <div>
+                <p className="text-[10px] text-slate-400 mb-0.5">Temporal Decay</p>
+                <ScoreBar value={signals.temporal_decay} color="bg-orange-500" />
+              </div>
+            )}
+          </div>
+
+          {/* Raw explanation */}
+          {Object.keys(result.explanation).length > 0 && (
+            <details className="mt-4">
+              <summary className="text-[10px] font-semibold text-slate-400 cursor-pointer hover:text-slate-600 uppercase tracking-wider">
+                Raw Explanation JSON
+              </summary>
+              <pre className="mt-2 p-3 rounded-lg bg-slate-50 border border-slate-100 text-[11px] text-slate-600 font-mono overflow-auto max-h-48">
+                {JSON.stringify(result.explanation, null, 2)}
+              </pre>
+            </details>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   Main Page
+   ──────────────────────────────────────────────────────────── */
+
+export default function RetrievePage() {
+  const [query, setQuery] = useState("");
+  const [intent, setIntent] = useState<string>("answer");
+  const [topK, setTopK] = useState<string>("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [showSettings, setShowSettings] = useState(false);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  const resultsRef = useRef<HTMLDivElement>(null);
+
+  // Focus input on mount
+  useEffect(() => { inputRef.current?.focus(); }, []);
+
+  const handleSubmit = async () => {
+    const q = query.trim();
+    if (!q || loading) return;
+
+    setLoading(true);
+    setError("");
+
+    try {
+      const payload: Record<string, any> = { query: q, intent };
+      if (topK && parseInt(topK) > 0) payload.top_k = parseInt(topK);
+
+      const res = await apiClient.post<RetrieveResponse>("/api/v2/retrieve/query", payload);
+      const entry: HistoryEntry = {
+        query: q,
+        intent,
+        response: res.data,
+        timestamp: Date.now(),
+      };
+      setHistory((prev) => [entry, ...prev]);
+      setQuery("");
+
+      // Auto-scroll to results
+      setTimeout(() => resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      setError(typeof detail === "string" ? detail : "Retrieval failed. Check the backend.");
+      console.error("Retrieve error:", err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  const clearHistory = () => setHistory([]);
+
+  const selectedIntent = INTENTS.find((i) => i.value === intent)!;
+
+  return (
+    <div className="space-y-6">
+      {/* Header */}
+      <div>
+        <h1 className="text-2xl font-bold text-slate-900 flex items-center gap-2">
+          <Search className="w-6 h-6 text-primary-600" />
+          Enterprise Retrieval
+        </h1>
+        <p className="text-slate-500 text-sm mt-1">
+          Semantic search with governance scoring — mirrors the Retrieve CLI
+        </p>
+      </div>
+
+      {/* Query input card */}
+      <div className="rounded-xl border border-slate-200/60 bg-white shadow-card overflow-hidden">
+        <div className="p-5">
+          {/* Intent selector */}
+          <div className="flex items-center gap-2 mb-4">
+            <span className="text-xs font-semibold text-slate-400 uppercase tracking-wider mr-1">Intent:</span>
+            {INTENTS.map((i) => {
+              const Icon = i.icon;
+              const active = intent === i.value;
+              return (
+                <button
+                  key={i.value}
+                  onClick={() => setIntent(i.value)}
+                  className={cn(
+                    "flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all border",
+                    active
+                      ? "bg-primary-50 text-primary-700 border-primary-200 shadow-sm"
+                      : "text-slate-500 border-transparent hover:bg-slate-50 hover:text-slate-700"
+                  )}
+                  title={i.description}
+                >
+                  <Icon className="w-3.5 h-3.5" />
+                  {i.label}
+                </button>
+              );
+            })}
+
+            {/* Settings toggle */}
+            <button
+              onClick={() => setShowSettings(!showSettings)}
+              className={cn(
+                "ml-auto flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs transition-colors border",
+                showSettings
+                  ? "bg-slate-100 text-slate-700 border-slate-200"
+                  : "text-slate-400 border-transparent hover:bg-slate-50 hover:text-slate-600"
+              )}
+            >
+              <Zap className="w-3 h-3" /> Advanced
+            </button>
+          </div>
+
+          {/* Advanced settings */}
+          {showSettings && (
+            <div className="flex items-center gap-4 mb-4 p-3 rounded-lg bg-slate-50 border border-slate-100">
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-slate-500 font-medium">Top K:</label>
+                <input
+                  type="number"
+                  min={1}
+                  max={50}
+                  value={topK}
+                  onChange={(e) => setTopK(e.target.value)}
+                  placeholder="default"
+                  className="w-20 rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none"
+                />
+              </div>
+              <div className="flex items-center gap-1 text-[10px] text-slate-400">
+                <Info className="w-3 h-3" />
+                Override max results (leave empty for policy default)
+              </div>
+            </div>
+          )}
+
+          {/* Query textarea */}
+          <div className="relative">
+            <textarea
+              ref={inputRef}
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder="Ask a question… (Enter to send, Shift+Enter for new line)"
+              rows={3}
+              disabled={loading}
+              className="w-full resize-none rounded-lg border border-slate-200 bg-slate-50/50 px-4 py-3 pr-14 text-sm text-slate-800 placeholder:text-slate-400 focus:border-primary-300 focus:ring-2 focus:ring-primary-100 outline-none transition-all disabled:opacity-60"
+            />
+            <button
+              onClick={handleSubmit}
+              disabled={loading || !query.trim()}
+              className={cn(
+                "absolute right-3 bottom-3 flex items-center justify-center w-9 h-9 rounded-lg transition-all",
+                loading || !query.trim()
+                  ? "bg-slate-100 text-slate-300 cursor-not-allowed"
+                  : "bg-primary-600 text-white hover:bg-primary-700 shadow-sm"
+              )}
+            >
+              {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Error banner */}
+        {error && (
+          <div className="flex items-center gap-2 px-5 py-3 bg-red-50 border-t border-red-100 text-red-700 text-sm">
+            <AlertCircle className="w-4 h-4 flex-shrink-0" /> {error}
+          </div>
+        )}
+      </div>
+
+      {/* Loading overlay */}
+      {loading && (
+        <div className="flex items-center justify-center gap-3 py-8 text-slate-500">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          <span className="text-sm">Embedding query & running retrieval…</span>
+        </div>
+      )}
+
+      {/* Results */}
+      <div ref={resultsRef}>
+        {history.map((entry, hi) => (
+          <div key={entry.timestamp} className={cn("space-y-4", hi > 0 && "mt-8 pt-8 border-t border-slate-200/60")}>
+            {/* Query echo */}
+            <div className="flex items-start gap-3">
+              <div className="flex items-center justify-center w-8 h-8 rounded-lg bg-slate-800 text-white flex-shrink-0">
+                <Search className="w-4 h-4" />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-slate-900">{entry.query}</p>
+                <div className="flex items-center gap-3 mt-1 text-[11px] text-slate-400">
+                  <span className="flex items-center gap-1">
+                    <Target className="w-3 h-3" />
+                    {entry.intent}
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <FileText className="w-3 h-3" />
+                    {entry.response.total_results} result{entry.response.total_results !== 1 ? "s" : ""}
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Hash className="w-3 h-3" />
+                    {entry.response.total_dropped} dropped
+                  </span>
+                  <span className="flex items-center gap-1">
+                    <Clock className="w-3 h-3" />
+                    {entry.response.latency_ms.toFixed(0)}ms
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* No results */}
+            {entry.response.results.length === 0 && (
+              <div className="flex items-center gap-3 p-4 rounded-xl bg-amber-50 border border-amber-200 text-amber-800">
+                <AlertCircle className="w-5 h-5 flex-shrink-0" />
+                <div>
+                  <p className="text-sm font-semibold">No trusted results found</p>
+                  <p className="text-xs text-amber-600 mt-0.5">
+                    Try a different query, use the &ldquo;Explore&rdquo; intent for broader recall, or check that documents have been ingested.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* Result cards */}
+            <div className="space-y-3 ml-11">
+              {entry.response.results.map((r) => (
+                <ResultCard key={`${entry.timestamp}-${r.chunk_id}`} result={r} />
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Empty state */}
+      {history.length === 0 && !loading && (
+        <div className="text-center py-16">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-slate-100 mb-4">
+            <Search className="w-7 h-7 text-slate-400" />
+          </div>
+          <p className="text-sm font-semibold text-slate-600">No queries yet</p>
+          <p className="text-xs text-slate-400 mt-1 max-w-xs mx-auto">
+            Type a question above to search your ingested knowledge base using enterprise retrieval with governance scoring.
+          </p>
+        </div>
+      )}
+
+      {/* Clear history */}
+      {history.length > 0 && (
+        <div className="flex justify-center pt-4">
+          <button onClick={clearHistory} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs text-slate-400 hover:text-red-500 hover:bg-red-50 transition-colors border border-transparent hover:border-red-200">
+            <Trash2 className="w-3 h-3" /> Clear history
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}

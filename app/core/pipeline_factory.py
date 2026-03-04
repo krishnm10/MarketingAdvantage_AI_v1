@@ -333,10 +333,17 @@ class PipelineFactory:
 
         if t == VectorDBType.CHROMA:
             c = cfg.chroma
+            api_key = _env(c.api_key_env) if c.api_key_env else None
             return vectordb_registry.build(
                 "chroma",
                 persist_directory=c.persist_directory,
                 anonymized_telemetry=c.anonymized_telemetry,
+                host=c.host,
+                port=c.port,
+                ssl=c.ssl,
+                api_key=api_key,
+                tenant=c.tenant,
+                database=c.database,
             )
 
         if t == VectorDBType.QDRANT:
@@ -415,6 +422,21 @@ class PipelineFactory:
                 port=c.port,
                 db_name=c.db_name,
                 alias=c.alias,
+            )
+
+        if t == VectorDBType.REDIS:
+            c = cfg.redis
+            return vectordb_registry.build(
+                "redis",
+                url=c.url,
+                host=c.host,
+                port=c.port,
+                password=_env(c.password_env) if c.password_env else None,
+                username=c.username,
+                db=c.db,
+                ssl=c.ssl,
+                ssl_ca_certs=c.ssl_ca_certs,
+                prefix=c.prefix,
             )
 
         raise ValueError(

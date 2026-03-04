@@ -5,8 +5,11 @@
 # This is the ONLY file that imports chromadb.
 # All other files use BaseVectorDB only.
 #
-# Path is supplied via ClientConfig.vectordb.chroma.persist_directory
-# ZERO hardcoding. ZERO env var exports. ZERO module-level path constants.
+# Supports two connection modes:
+#   LOCAL  — PersistentClient (persist_directory)
+#   REMOTE — HttpClient       (host + port)
+#
+# Config comes via ClientConfig.vectordb.chroma — ZERO hardcoding.
 # ============================================================
 
 from __future__ import annotations
@@ -26,41 +29,71 @@ class ChromaVectorDB(BaseVectorDB):
     """
     ChromaDB connector implementing BaseVectorDB.
 
-    Supports:
-    - PersistentClient: data saved to disk (production)
-    - EphemeralClient:  in-memory only (testing, pass persist_directory=None)
+    Connection modes:
+    - HttpClient:       connect to a remote ChromaDB server (host + port)
+    - PersistentClient: data saved to local disk (persist_directory)
+    - EphemeralClient:  in-memory only (testing — neither host nor path)
 
     Constructor args:
-        persist_directory:    REQUIRED for production. Absolute path to ChromaDB
-                              storage. Comes from ClientConfig — never hardcoded.
-        anonymized_telemetry: Set False to disable ChromaDB telemetry (default: False)
+        host:                 Remote ChromaDB server host. If set, uses HttpClient.
+        port:                 Remote server port (default 8000).
+        ssl:                  Use HTTPS for remote connection (default False).
+        api_key:              API key for auth-enabled ChromaDB servers.
+        tenant:               ChromaDB tenant (default 'default_tenant').
+        database:             ChromaDB database (default 'default_database').
+        persist_directory:    Local disk path. Used when host is not set.
+        anonymized_telemetry: Set False to disable ChromaDB telemetry (default False).
     """
 
     def __init__(
         self,
         persist_directory: Optional[str] = None,
         anonymized_telemetry: bool = False,
+        *,
+        host: Optional[str] = None,
+        port: int = 8000,
+        ssl: bool = False,
+        api_key: Optional[str] = None,
+        tenant: str = "default_tenant",
+        database: str = "default_database",
     ):
-        # ── Enforce that path is always explicitly provided ───────────
-        if persist_directory is None:
-            raise ValueError(
-                "[ChromaVectorDB] persist_directory is REQUIRED. "
-                "Supply it via ClientConfig.vectordb.chroma.persist_directory. "
-                "Never use a hardcoded default — each client has its own path."
-            )
+        # ── Determine connection mode ──────────────────────────────
+        if host:
+            self._mode = "remote"
+        elif persist_directory:
+            self._mode = "local"
+        else:
+            self._mode = "ephemeral"
 
         self._path = persist_directory
+        self._host = host
+        self._port = port
         self._anonymized_telemetry = anonymized_telemetry
-        self._client = self._make_client(persist_directory, anonymized_telemetry)
+
+        self._client = self._make_client(
+            host=host,
+            port=port,
+            ssl=ssl,
+            api_key=api_key,
+            tenant=tenant,
+            database=database,
+            persist_directory=persist_directory,
+            anonymized_telemetry=anonymized_telemetry,
+        )
 
         # Cache open collections: {collection_name: chromadb.Collection}
         self._collections: Dict[str, chromadb.Collection] = {}
 
-        logger.info(
-            "[ChromaVectorDB] Initialized | path=%s | telemetry=%s",
-            persist_directory,
-            anonymized_telemetry,
-        )
+        if self._mode == "remote":
+            logger.info(
+                "[ChromaVectorDB] Initialized REMOTE | host=%s | port=%s | ssl=%s",
+                host, port, ssl,
+            )
+        else:
+            logger.info(
+                "[ChromaVectorDB] Initialized %s | path=%s | telemetry=%s",
+                self._mode.upper(), persist_directory, anonymized_telemetry,
+            )
 
     # ── Identity ──────────────────────────────────────────────────────
 
@@ -346,6 +379,29 @@ class ChromaVectorDB(BaseVectorDB):
             logger.warning("[ChromaVectorDB] count() failed: %s", exc)
             return 0
 
+    def get_all(
+        self,
+        *,
+        collection: str,
+        include: Optional[List[str]] = None,
+    ) -> dict:
+        """
+        Return ALL documents in a collection (used by admin integrity ops).
+
+        Delegates to chromadb's native Collection.get() which, when called
+        without an ids filter, returns every stored record.
+
+        Args:
+            collection: Collection name.
+            include:    Chroma include list, e.g. ["documents", "metadatas"].
+                        Empty list → IDs only (fastest).
+
+        Returns:
+            Dict with keys: ids, documents, metadatas, embeddings (per include).
+        """
+        col = self._get_collection(collection)
+        return col.get(include=include or [])
+
     # ── Delete ────────────────────────────────────────────────────────
 
     def delete(self, *, collection: str, doc_id: str) -> None:
@@ -389,15 +445,41 @@ class ChromaVectorDB(BaseVectorDB):
 
     @staticmethod
     def _make_client(
+        *,
+        host: Optional[str],
+        port: int,
+        ssl: bool,
+        api_key: Optional[str],
+        tenant: str,
+        database: str,
         persist_directory: Optional[str],
         anonymized_telemetry: bool,
     ) -> chromadb.ClientAPI:
-        settings = Settings(anonymized_telemetry=anonymized_telemetry)
+        settings = Settings(
+            anonymized_telemetry=anonymized_telemetry,
+            chroma_client_auth_provider="chromadb.auth.token_authn.TokenAuthClientProvider" if api_key else None,
+            chroma_client_auth_credentials=api_key or None,
+        ) if api_key else Settings(anonymized_telemetry=anonymized_telemetry)
+
+        # ── Remote mode: HttpClient ────────────────────────────────
+        if host:
+            return chromadb.HttpClient(
+                host=host,
+                port=port,
+                ssl=ssl,
+                tenant=tenant,
+                database=database,
+                settings=settings,
+            )
+
+        # ── Local mode: PersistentClient ───────────────────────────
         if persist_directory:
             return chromadb.PersistentClient(
                 path=persist_directory,
                 settings=settings,
             )
+
+        # ── Ephemeral mode: in-memory (testing) ───────────────────
         return chromadb.EphemeralClient(settings=settings)
 
 

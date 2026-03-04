@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { useFormatDate } from "@/lib/useHydrated";
 
 type IngestionLog = {
   timestamp: string;
@@ -12,6 +13,7 @@ type IngestionLog = {
 export default function IngestionFeed() {
   const [logs, setLogs] = useState<IngestionLog[]>([]);
   const [connected, setConnected] = useState(false);
+  const { formatTime } = useFormatDate();
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | undefined>(undefined);
@@ -112,35 +114,53 @@ export default function IngestionFeed() {
    * Render
    * ------------------------------------- */
   return (
-    <div className="bg-black text-green-400 rounded-lg p-4 font-mono h-[400px] overflow-y-auto shadow-inner border border-gray-800">
-      <div className="flex justify-between text-xs text-gray-400 mb-3">
-        <span>📡 Ingestion Live Feed Monitor</span>
-        <span>{connected ? "🟢 Connected" : "🔴 Disconnected"}</span>
+    <div className="rounded-xl border border-slate-200/60 bg-white shadow-card overflow-hidden">
+      {/* Header */}
+      <div className="flex items-center justify-between border-b border-slate-100 px-6 py-3">
+        <div className="flex items-center gap-2">
+          <span className="text-sm font-semibold text-slate-900">Live Ingestion Feed</span>
+          <span className="badge badge-neutral text-[10px]">WebSocket</span>
+        </div>
+        <span className={`flex items-center gap-1.5 text-xs font-medium ${connected ? "text-emerald-600" : "text-red-500"}`}>
+          <span className={`h-2 w-2 rounded-full ${connected ? "bg-emerald-400 animate-pulse" : "bg-red-400"}`} />
+          {connected ? "Connected" : "Disconnected"}
+        </span>
       </div>
 
-      <div ref={logContainerRef}>
+      {/* Log Area */}
+      <div className="bg-slate-900 p-4 font-mono h-[420px] overflow-y-auto" ref={logContainerRef}>
         {logs.length === 0 ? (
-          <p className="text-gray-500 italic">
-            Waiting for ingestion events...
-          </p>
+          <div className="flex items-center justify-center h-full">
+            <p className="text-slate-600 text-sm italic">
+              Waiting for ingestion events...
+            </p>
+          </div>
         ) : (
-          logs.map((log, idx) => (
-            <div
-              key={idx}
-              className={`border-b border-gray-800 py-1 ${getStatusColor(
-                log.status
-              )}`}
-            >
-              <span className="text-gray-500 text-xs">
-                [{new Date(log.timestamp).toLocaleTimeString()}]
-              </span>{" "}
-              <strong className="uppercase">{log.stage}</strong> —{" "}
-              <span className={getStatusColor(log.status)}>
-                {log.status}
-              </span>{" "}
-              <span className="text-gray-400 text-xs">{log.message}</span>
-            </div>
-          ))
+          <div className="space-y-0.5">
+            {logs.map((log, idx) => (
+              <div
+                key={idx}
+                className="flex items-baseline gap-2 py-1 border-b border-slate-800/50 text-xs"
+              >
+                <span className="text-slate-600 flex-shrink-0">
+                  {formatTime(log.timestamp)}
+                </span>
+                <span className={`font-bold uppercase flex-shrink-0 ${getStatusColor(log.status)}`}>
+                  {log.stage}
+                </span>
+                <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                  log.status?.toLowerCase() === "success" || log.status?.toLowerCase() === "alive"
+                    ? "bg-emerald-500/10 text-emerald-400"
+                    : log.status?.toLowerCase() === "failed" || log.status?.toLowerCase() === "error"
+                    ? "bg-red-500/10 text-red-400"
+                    : "bg-amber-500/10 text-amber-400"
+                }`}>
+                  {log.status}
+                </span>
+                <span className="text-slate-500 truncate">{log.message}</span>
+              </div>
+            ))}
+          </div>
         )}
       </div>
     </div>

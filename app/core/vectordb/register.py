@@ -119,3 +119,18 @@ _safe_register(
         "Best for on-premise enterprise and data-residency requirements."
     ),
 )
+
+
+# ── Redis ──────────────────────────────────────────────────────────────
+def _redis_factory(**kw):
+    from app.core.vectordb.redis_v1 import RedisVectorDB
+    return RedisVectorDB(**kw)
+
+_safe_register(
+    "redis",
+    _redis_factory,
+    description=(
+        "Redis Stack — in-memory vector DB with RediSearch. "
+        "Supports local, remote, and Redis Cloud deployments."
+    ),
+)

@@ -2,10 +2,11 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useFormatDate } from "@/lib/useHydrated";
 import apiClient from "@/lib/apiClient";
-import RequireRole from "@/components/RequireRole";
 import Table from "@/components/ui/Table";
 import Button from "@/components/ui/Button";
+import { FileText, Upload, Loader2, FolderOpen } from "lucide-react";
 
 interface IngestedFile {
   id: string;
@@ -19,12 +20,12 @@ interface IngestedFile {
 export default function IngestionListPage() {
   const [files, setFiles] = useState<IngestedFile[]>([]);
   const [loading, setLoading] = useState(true);
+  const { formatDateTime } = useFormatDate();
 
   useEffect(() => {
     const loadFiles = async () => {
       try {
-        // USER ingestion API (not admin)
-        const res = await apiClient.get("/api/v2/ingestion/files");
+        const res = await apiClient.get("/api/v2/ingestion-admin/files");
         setFiles(res.data ?? []);
       } catch (err) {
         console.error("Failed to fetch ingested files:", err);
@@ -33,45 +34,54 @@ export default function IngestionListPage() {
         setLoading(false);
       }
     };
-
     loadFiles();
   }, []);
 
+  const statusColor = (s: string) => {
+    if (s === "completed" || s === "success") return "badge-success";
+    if (s === "processing" || s === "pending") return "badge-warning";
+    if (s === "failed" || s === "error") return "badge-danger";
+    return "badge-neutral";
+  };
+
   const rows = files.map((f) => [
-    <Link
-      key={f.id}
-      href={`/ingestion/${f.id}`}
-      className="text-blue-600 hover:underline"
-    >
+    <Link key={f.id} href={`/ingestion/${f.id}`} className="text-primary-400 hover:text-primary-300 font-medium transition-colors flex items-center gap-2">
+      <FileText className="w-4 h-4" />
       {f.file_name}
     </Link>,
-    f.file_type,
-    f.status,
-    f.total_chunks,
-    new Date(f.created_at).toLocaleString(),
+    <span key={`type-${f.id}`} className="text-slate-400 font-mono text-xs">{f.file_type}</span>,
+    <span key={`status-${f.id}`} className={statusColor(f.status)}>{f.status}</span>,
+    <span key={`chunks-${f.id}`} className="text-slate-300 font-mono">{f.total_chunks}</span>,
+    <span key={`date-${f.id}`} className="text-slate-400 text-xs">{formatDateTime(f.created_at)}</span>,
   ]);
 
   return (
-    <RequireRole>
-      <div className="space-y-6">
-        <div className="flex justify-between items-center">
-          <h1 className="text-2xl font-semibold">Ingested Files</h1>
-          <Link href="/ingestion/upload">
-            <Button>Upload New</Button>
-          </Link>
+    <div className="space-y-6">
+      <div className="flex justify-between items-center">
+        <div>
+          <h1 className="text-2xl font-bold text-white">Ingested Files</h1>
+          <p className="text-slate-400 text-sm mt-1">{files.length} files in the ingestion pipeline</p>
         </div>
-
-        {loading ? (
-          <p className="text-gray-500">Loading files…</p>
-        ) : files.length === 0 ? (
-          <p className="text-gray-500">No files ingested yet.</p>
-        ) : (
-          <Table
-            headers={["File Name", "Type", "Status", "Chunks", "Created At"]}
-            rows={rows}
-          />
-        )}
+        <Link href="/ingestion/upload">
+          <Button className="flex items-center gap-2">
+            <Upload className="w-4 h-4" /> Upload New
+          </Button>
+        </Link>
       </div>
-    </RequireRole>
+      {loading ? (
+        <div className="flex items-center gap-3 text-slate-400 py-12 justify-center">
+          <Loader2 className="w-5 h-5 animate-spin" />
+          Loading files…
+        </div>
+      ) : files.length === 0 ? (
+        <div className="text-center py-16">
+          <FolderOpen className="w-12 h-12 text-slate-600 mx-auto mb-3" />
+          <p className="text-slate-400">No files ingested yet.</p>
+          <p className="text-slate-500 text-sm mt-1">Upload a file to get started</p>
+        </div>
+      ) : (
+        <Table headers={["File Name", "Type", "Status", "Chunks", "Created At"]} rows={rows} />
+      )}
+    </div>
   );
 }

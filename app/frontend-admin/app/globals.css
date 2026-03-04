@@ -2,27 +2,83 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Import Google Fonts ── */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap');
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --sidebar-bg: #0f172a;
+  --sidebar-text: #94a3b8;
+  --sidebar-active: #0f766e;
+  --card-bg: #ffffff;
+  --card-border: #e2e8f0;
+  --accent: #0f766e;
+  --accent-light: #14b8a6;
+  --danger: #ef4444;
+  --warning: #f59e0b;
+  --success: #10b981;
+  --info: #3b82f6;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+@layer base {
+  * {
+    @apply border-gray-200;
+  }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+  body {
+    @apply bg-slate-50 text-slate-900 font-sans antialiased;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    @apply w-1.5;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-slate-300 rounded-full;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-400;
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+@layer components {
+  /* Status badges */
+  .badge {
+    @apply inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+  .badge-success {
+    @apply badge bg-emerald-50 text-emerald-700 ring-1 ring-emerald-600/20;
+  }
+  .badge-danger {
+    @apply badge bg-red-50 text-red-700 ring-1 ring-red-600/20;
+  }
+  .badge-warning {
+    @apply badge bg-amber-50 text-amber-700 ring-1 ring-amber-600/20;
+  }
+  .badge-info {
+    @apply badge bg-blue-50 text-blue-700 ring-1 ring-blue-600/20;
+  }
+  .badge-neutral {
+    @apply badge bg-slate-100 text-slate-700 ring-1 ring-slate-600/10;
+  }
+
+  /* Config value pill */
+  .config-pill {
+    @apply inline-flex items-center gap-1.5 px-3 py-1 bg-slate-100 text-slate-700 rounded-lg text-sm font-mono;
+  }
+
+  /* Glass card effect */
+  .glass-card {
+    @apply bg-white/80 backdrop-blur-sm border border-white/20 shadow-card rounded-xl;
+  }
+
+  /* Gradient heading */
+  .gradient-text {
+    @apply bg-gradient-to-r from-primary-600 to-primary-400 bg-clip-text text-transparent;
+  }
 }

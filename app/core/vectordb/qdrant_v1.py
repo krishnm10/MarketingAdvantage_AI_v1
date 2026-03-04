@@ -193,20 +193,21 @@ class QdrantVectorDB(BaseVectorDB):
     ) -> List[VectorHit]:
         qdrant_filter = _build_qdrant_filter(filters) if filters else None
         try:
-            results = self._client.search(
+            response = self._client.query_points(
                 collection_name=collection,
-                query_vector=query_embedding,
+                query=query_embedding,
                 limit=top_k,
                 query_filter=qdrant_filter,
                 with_payload=True,
             )
+            results = response.points
         except Exception as exc:
             logger.error("[QdrantVectorDB] search failed: %s", exc)
             return []
 
         hits = []
         for r in results:
-            payload = r.payload or {}
+            payload = dict(r.payload) if r.payload else {}
             hits.append(VectorHit(
                 id=str(r.id),
                 text=payload.pop("text", ""),

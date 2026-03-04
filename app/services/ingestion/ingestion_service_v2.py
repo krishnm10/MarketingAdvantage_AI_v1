@@ -115,7 +115,7 @@ def _resolve_text(payload: dict) -> str:
 #   3. Hard default: chroma / ollama
 #
 # .env reference:
-#   MAI_VECTORDB           = chroma | qdrant        (default: chroma)
+#   MAI_VECTORDB           = chroma | qdrant | pinecone | milvus | weaviate | redis
 #   MAI_EMBEDDER           = ollama | openai | huggingface (default: ollama)
 #   CHROMA_PATH            = ./chroma_db
 #   MAI_COLLECTION         = ingested_content
@@ -171,11 +171,16 @@ def _build_config_from_env(
     # ── VectorDB ──────────────────────────────────────────────
     if vectordb_type == "chroma":
         from app.core.config.client_config_schema import ChromaConfig
+        chroma_host = os.getenv("CHROMA_HOST") or None
         vdb_cfg = VectorDBConfig(
             type=VectorDBType.CHROMA,
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             chroma=ChromaConfig(
-                persist_directory=os.getenv("CHROMA_PATH", "./chroma_db"),
+                persist_directory=os.getenv("CHROMA_PATH", "./chroma_db") if not chroma_host else None,
+                host=chroma_host,
+                port=int(os.getenv("CHROMA_PORT", "8000")),
+                ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
+                api_key_env="CHROMA_API_KEY" if os.getenv("CHROMA_API_KEY") else None,
             ),
         )
     elif vectordb_type == "qdrant":
@@ -188,10 +193,62 @@ def _build_config_from_env(
                 api_key_env="QDRANT_API_KEY",
             ),
         )
+    elif vectordb_type == "pinecone":
+        from app.core.config.client_config_schema import PineconeConfig
+        vdb_cfg = VectorDBConfig(
+            type=VectorDBType.PINECONE,
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
+            pinecone=PineconeConfig(
+                api_key_env="PINECONE_API_KEY",
+                index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
+                namespace=os.getenv("PINECONE_NAMESPACE", "default"),
+                embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
+                metric=os.getenv("PINECONE_METRIC", "cosine"),
+                cloud=os.getenv("PINECONE_CLOUD", "aws"),
+                region=os.getenv("PINECONE_REGION", "us-east-1"),
+            ),
+        )
+    elif vectordb_type == "milvus":
+        from app.core.config.client_config_schema import MilvusConfig
+        vdb_cfg = VectorDBConfig(
+            type=VectorDBType.MILVUS,
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
+            milvus=MilvusConfig(
+                uri=os.getenv("MILVUS_URI") or None,
+                token_env="MILVUS_TOKEN" if os.getenv("MILVUS_TOKEN") else None,
+                host=os.getenv("MILVUS_HOST", "localhost"),
+                port=int(os.getenv("MILVUS_PORT", "19530")),
+            ),
+        )
+    elif vectordb_type == "weaviate":
+        from app.core.config.client_config_schema import WeaviateConfig
+        vdb_cfg = VectorDBConfig(
+            type=VectorDBType.WEAVIATE,
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
+            weaviate=WeaviateConfig(
+                url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
+                api_key_env="WEAVIATE_API_KEY" if os.getenv("WEAVIATE_API_KEY") else None,
+            ),
+        )
+    elif vectordb_type == "redis":
+        from app.core.config.client_config_schema import RedisConfig
+        vdb_cfg = VectorDBConfig(
+            type=VectorDBType.REDIS,
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
+            redis=RedisConfig(
+                url=os.getenv("REDIS_URL") or None,
+                host=os.getenv("REDIS_HOST", "localhost"),
+                port=int(os.getenv("REDIS_PORT", "6379")),
+                password_env="REDIS_PASSWORD" if os.getenv("REDIS_PASSWORD") else None,
+                username=os.getenv("REDIS_USERNAME") or None,
+                db=int(os.getenv("REDIS_DB", "0")),
+                ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
+            ),
+        )
     else:
         raise ValueError(
             f"[Pipeline] Unknown MAI_VECTORDB='{vectordb_type}'. "
-            f"Supported: chroma, qdrant"
+            f"Supported: chroma, qdrant, pinecone, milvus, weaviate, redis"
         )
 
     # ── Embedder ──────────────────────────────────────────────
@@ -423,10 +480,10 @@ class _CollectionAdapter:
                     top_k=n_results,
                     filters=where,
                 )
-                out["ids"].append([h.get("id")            for h in hits])
-                out["distances"].append([h.get("score")         for h in hits])
-                out["documents"].append([h.get("text")          for h in hits])
-                out["metadatas"].append([h.get("metadata", {})  for h in hits])
+                out["ids"].append([h.id              for h in hits])
+                out["distances"].append([h.score           for h in hits])
+                out["documents"].append([h.text            for h in hits])
+                out["metadatas"].append([h.metadata         for h in hits])
             except Exception as e:
                 log_info(f"[CollectionAdapter] query() failed: {e}")
                 out["ids"].append([])

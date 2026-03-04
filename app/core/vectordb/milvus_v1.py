@@ -135,12 +135,13 @@ class MilvusVectorDB(BaseVectorDB):
     ) -> None:
         col = self._get_collection(collection)
         col.delete(expr=f'{_FIELD_ID} == "{doc_id}"')
-        col.insert(data={
-            _FIELD_ID:       [doc_id],
-            _FIELD_VECTOR:   [embedding],
-            _FIELD_TEXT:     [str(text)[:65_530] if text else ""],
-            _FIELD_METADATA: [json.dumps(metadata or {}, ensure_ascii=False)],
-        })
+        # pymilvus >=2.6 expects row-based format (list of dicts)
+        col.insert([{
+            _FIELD_ID:       doc_id,
+            _FIELD_VECTOR:   embedding,
+            _FIELD_TEXT:     str(text)[:65_530] if text else "",
+            _FIELD_METADATA: json.dumps(metadata or {}, ensure_ascii=False),
+        }])
         col.flush()
 
     def batch_upsert(
@@ -172,14 +173,17 @@ class MilvusVectorDB(BaseVectorDB):
                 ids_expr = ", ".join(f'"{i}"' for i in existing)
                 col.delete(expr=f'{_FIELD_ID} in [{ids_expr}]')
 
-            col.insert(data={
-                _FIELD_ID:       doc_ids,
-                _FIELD_VECTOR:   embeddings,
-                _FIELD_TEXT:     [str(t)[:65_530] if t else "" for t in texts],
-                _FIELD_METADATA: [
-                    json.dumps(m or {}, ensure_ascii=False) for m in metadatas
-                ],
-            })
+            # pymilvus >=2.6 expects row-based format (list of dicts)
+            rows = [
+                {
+                    _FIELD_ID:       doc_ids[i],
+                    _FIELD_VECTOR:   embeddings[i],
+                    _FIELD_TEXT:     str(texts[i])[:65_530] if texts[i] else "",
+                    _FIELD_METADATA: json.dumps(metadatas[i] or {}, ensure_ascii=False),
+                }
+                for i in range(len(doc_ids))
+            ]
+            col.insert(rows)
             col.flush()
             logger.info(
                 "[MilvusVectorDB] batch_upsert '%s': +%d new, ~%d updated",

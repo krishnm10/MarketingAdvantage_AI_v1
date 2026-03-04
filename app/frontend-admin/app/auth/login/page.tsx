@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import { Zap, Loader2, AlertCircle, Eye, EyeOff } from "lucide-react";
 import apiClient from "@/lib/apiClient";
 import { setAuthToken } from "@/lib/authToken";
 
@@ -12,6 +13,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,67 +21,102 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      // ✅ AUTHENTICATE VIA BACKEND (SOURCE OF TRUTH)
       const res = await apiClient.post("/api/v2/auth/login", {
         username,
         password,
       });
-
-      // ✅ STORE BACKEND JWT
       setAuthToken(res.data.access_token);
-
-      // Optional: role is only for UI awareness
-      const role = res.data.role;
-
-      // ✅ SINGLE DASHBOARD ENTRY POINT
       router.push("/dashboard");
     } catch (err: any) {
-      setError(
-        err?.response?.data?.detail || "Invalid username or password"
-      );
+      setError(err?.response?.data?.detail || "Invalid username or password");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="flex items-center justify-center min-h-screen bg-gray-100">
-      <form
-        onSubmit={handleSubmit}
-        className="bg-white p-8 rounded-2xl shadow-md w-96"
-      >
-        <h1 className="text-2xl font-bold mb-6 text-center">Login</h1>
+    <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 relative overflow-hidden">
+      {/* Background effects */}
+      <div className="absolute inset-0 bg-[linear-gradient(to_right,#1e293b_1px,transparent_1px),linear-gradient(to_bottom,#1e293b_1px,transparent_1px)] bg-[size:3rem_3rem] opacity-20" />
+      <div className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-primary-500/10 rounded-full blur-[120px]" />
 
-        {error && (
-          <p className="text-red-500 text-sm mb-4 text-center">{error}</p>
-        )}
+      <div className="relative z-10 w-full max-w-md px-6">
+        {/* Logo */}
+        <div className="text-center mb-8">
+          <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-primary-500 to-primary-700 shadow-2xl shadow-primary-600/30">
+            <Zap className="h-7 w-7 text-white" />
+          </div>
+          <h1 className="text-2xl font-bold text-white">Welcome Back</h1>
+          <p className="mt-1 text-sm text-slate-400">Sign in to Marketing Advantage AI Admin</p>
+        </div>
 
-        <input
-          type="text"
-          placeholder="Username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          className="w-full border rounded-md p-2 mb-4"
-          required
-        />
-
-        <input
-          type="password"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          className="w-full border rounded-md p-2 mb-6"
-          required
-        />
-
-        <button
-          type="submit"
-          disabled={loading}
-          className="w-full bg-blue-600 text-white py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+        {/* Login Card */}
+        <form
+          onSubmit={handleSubmit}
+          className="rounded-2xl border border-slate-700/50 bg-slate-900/80 backdrop-blur-xl p-8 shadow-2xl"
         >
-          {loading ? "Logging in..." : "Login"}
-        </button>
-      </form>
+          {/* Error */}
+          {error && (
+            <div className="mb-5 flex items-center gap-2 rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3">
+              <AlertCircle className="h-4 w-4 text-red-400 flex-shrink-0" />
+              <p className="text-sm text-red-400">{error}</p>
+            </div>
+          )}
+
+          {/* Username */}
+          <div className="mb-4">
+            <label className="block text-xs font-medium text-slate-400 mb-1.5">Username</label>
+            <input
+              type="text"
+              placeholder="Enter your username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full rounded-lg border border-slate-600/50 bg-slate-800/50 px-4 py-2.5 text-sm text-white placeholder-slate-500 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 focus:outline-none transition-all"
+              required
+            />
+          </div>
+
+          {/* Password */}
+          <div className="mb-6">
+            <label className="block text-xs font-medium text-slate-400 mb-1.5">Password</label>
+            <div className="relative">
+              <input
+                type={showPassword ? "text" : "password"}
+                placeholder="Enter your password"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full rounded-lg border border-slate-600/50 bg-slate-800/50 px-4 py-2.5 pr-10 text-sm text-white placeholder-slate-500 focus:border-primary-500 focus:ring-2 focus:ring-primary-500/20 focus:outline-none transition-all"
+                required
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword(!showPassword)}
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors"
+              >
+                {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+              </button>
+            </div>
+          </div>
+
+          {/* Submit */}
+          <button
+            type="submit"
+            disabled={loading}
+            className="w-full rounded-lg bg-gradient-to-r from-primary-600 to-primary-500 py-2.5 text-sm font-semibold text-white shadow-lg shadow-primary-600/25 hover:shadow-primary-600/40 disabled:opacity-50 transition-all duration-300 flex items-center justify-center gap-2"
+          >
+            {loading ? (
+              <><Loader2 className="h-4 w-4 animate-spin" /> Signing in...</>
+            ) : (
+              "Sign In"
+            )}
+          </button>
+        </form>
+
+        {/* Footer */}
+        <p className="mt-6 text-center text-xs text-slate-600">
+          Marketing Advantage AI — Enterprise Admin Console
+        </p>
+      </div>
     </div>
   );
 }
