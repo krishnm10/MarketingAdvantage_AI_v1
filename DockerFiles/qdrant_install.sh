@@ -19,5 +19,7 @@ docker run -d \
   --name qdrant \
   -p 6333:6333 -p 6334:6334 \
   -v "$HOME/qdrant_storage:/qdrant/storage" \
+  -e QDRANT__SERVICE__API_KEY='my-super-secret-admin-key' \
   qdrant/qdrant:latest
+
 curl http://localhost:6333/healthz
