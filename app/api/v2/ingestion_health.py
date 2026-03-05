@@ -107,24 +107,47 @@ async def _check_qdrant() -> dict:
 async def _check_chroma() -> dict:
     """ChromaDB — remote HttpClient OR local PersistentClient.
 
-    Remote mode: CHROMA_HOST is set → use httpx to hit /api/v1/collections.
+    Remote mode: CHROMA_HOST is set → use httpx to probe heartbeat and
+                 collections endpoints.  Tries v2 API first (ChromaDB
+                 ≥ 1.0 removed v1), then falls back to v1 for older
+                 servers.
     Local mode:  CHROMA_HOST is empty → use PersistentClient singleton.
     """
-    chroma_host = os.getenv("CHROMA_HOST")
+    chroma_host = os.getenv("CHROMA_HOST") or None
 
     if chroma_host:
         # ── Remote mode — httpx (no client libs, no gRPC) ─────────
-        port   = int(os.getenv("CHROMA_PORT", "8000"))
+        port    = int(os.getenv("CHROMA_PORT") or "8000")
         use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
-        scheme = "https" if use_ssl else "http"
-        url    = f"{scheme}://{chroma_host}:{port}"
+        scheme  = "https" if use_ssl else "http"
+        url     = f"{scheme}://{chroma_host}:{port}"
         api_key = os.getenv("CHROMA_API_KEY") or None
-        hdrs   = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        data   = await _http_get(f"{url}/api/v1/collections", headers=hdrs)
-        if data is not None:
-            n = len(data) if isinstance(data, list) else 0
+        hdrs    = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        tenant  = os.getenv("CHROMA_TENANT", "default_tenant")
+        database = os.getenv("CHROMA_DATABASE", "default_database")
+
+        # 1) heartbeat — try v2 first, fall back to v1
+        hb = await _http_get(f"{url}/api/v2/heartbeat", headers=hdrs)
+        if hb is None:
+            hb = await _http_get(f"{url}/api/v1/heartbeat", headers=hdrs)
+        if hb is None:
+            return _fail(f"Cannot reach {chroma_host}:{port}")
+
+        # 2) collection count — v2 path-based, then v1 query-param
+        coll_data = await _http_get(
+            f"{url}/api/v2/tenants/{tenant}/databases/{database}/collections",
+            headers=hdrs,
+        )
+        if coll_data is None:
+            coll_data = await _http_get(
+                f"{url}/api/v1/collections?tenant={tenant}&database={database}",
+                headers=hdrs,
+            )
+        if coll_data is not None:
+            n = len(coll_data) if isinstance(coll_data, list) else 0
             return _ok(f"{n} collection(s) | {chroma_host}:{port}")
-        return _fail(f"Cannot reach {chroma_host}:{port}")
+        # heartbeat OK but collections endpoint failed — still online
+        return _ok(f"Connected | {chroma_host}:{port}")
 
     # ── Local mode — PersistentClient singleton ───────────────────
     # MUST use identical Settings as chroma_v1.py (anonymized_telemetry=False)
@@ -133,13 +156,14 @@ async def _check_chroma() -> dict:
     try:
         import chromadb
         from chromadb.config import Settings
-        chroma_path = os.getenv("CHROMA_PATH", "./chroma_db")
+        chroma_path = os.getenv("CHROMA_PATH") or "./chroma_db"
         client = chromadb.PersistentClient(
             path=chroma_path,
             settings=Settings(anonymized_telemetry=False),
         )
         colls = client.list_collections()
-        return _ok(f"{len(colls)} collection(s) | {chroma_path}")
+        n = len(colls) if isinstance(colls, (list, tuple)) else 0
+        return _ok(f"{n} collection(s) | {chroma_path}")
     except Exception as e:
         return _fail(str(e))
 

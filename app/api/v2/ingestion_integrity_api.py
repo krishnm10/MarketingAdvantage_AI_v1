@@ -14,7 +14,7 @@
 #
 
 from collections import defaultdict
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from app.auth.guards import require_role
@@ -194,45 +194,50 @@ async def fix_content_db_to_chroma(
 
     ADMIN ONLY
     """
-
-    result = await db.execute(
-        select(
-            GlobalContentIndexV2.semantic_hash,
-            GlobalContentIndexV2.cleaned_text,
+    try:
+        result = await db.execute(
+            select(
+                GlobalContentIndexV2.semantic_hash,
+                GlobalContentIndexV2.cleaned_text,
+            )
         )
-    )
-    rows = result.all()
+        rows = result.all()
 
-    _, collection = get_chroma_collection()
-    embedder = get_embedder()
+        _, collection = get_chroma_collection()
+        embedder = get_embedder()
 
-    chroma_data = collection.get(include=[])
-    chroma_ids = set(chroma_data.get("ids", []))
+        chroma_data = collection.get(include=[])
+        chroma_ids = set(chroma_data.get("ids", []))
 
-    fixed = 0
+        fixed = 0
 
-    for semantic_hash, cleaned_text in rows:
-        if not semantic_hash or not cleaned_text:
-            continue
+        for semantic_hash, cleaned_text in rows:
+            if not semantic_hash or not cleaned_text:
+                continue
 
-        if semantic_hash not in chroma_ids:
-            continue
+            if semantic_hash not in chroma_ids:
+                continue
 
-        vector = embedder.encode(
-            cleaned_text,
-            normalize_embeddings=True,
-        ).tolist()
+            vector = embedder.encode(
+                cleaned_text,
+                normalize_embeddings=True,
+            ).tolist()
 
-        collection.upsert(
-            ids=[semantic_hash],
-            embeddings=[vector],
-            documents=[cleaned_text],
-            metadatas=[{"integrity_fix": "db_to_chroma"}],
+            collection.upsert(
+                ids=[semantic_hash],
+                embeddings=[vector],
+                documents=[cleaned_text],
+                metadatas=[{"integrity_fix": "db_to_chroma"}],
+            )
+
+            fixed += 1
+
+        return {
+            "status": "ok",
+            "fixed_vectors": fixed,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Fix DB → Chroma failed: {e}",
         )
-
-        fixed += 1
-
-    return {
-        "status": "ok",
-        "fixed_vectors": fixed,
-    }

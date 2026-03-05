@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
+from app.services.ingestion.ingestion_service_v2 import get_embedder
 
 logger = logging.getLogger(__name__)
 
@@ -66,33 +67,14 @@ class RetrieveResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Lazy-loaded singletons (heavy model loading deferred to first call)
+# Pluggable embedder (uses MAI_EMBEDDER from .env — ollama/openai/huggingface)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_embedder = None
-
-
-def _get_embedder():
-    """Lazy-load the SentenceTransformer model."""
-    global _embedder
-    if _embedder is None:
-        from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
-        from sentence_transformers import SentenceTransformer
-
-        logger.info(f"[RetrieveAPI] Loading embedding model: {EMBEDDING_MODEL_NAME}")
-        _embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
-        logger.info("[RetrieveAPI] Embedding model loaded ✅")
-    return _embedder
-
-
 def _embed_query(query: str) -> List[float]:
-    """Embed a query string → vector."""
-    embedder = _get_embedder()
-    embedding = embedder.encode([query], normalize_embeddings=True)
-    try:
-        return embedding[0].tolist()
-    except Exception:
-        return list(embedding[0])
+    """Embed a query string → vector using the pluggable embedder."""
+    embedder = get_embedder()
+    result = embedder.encode(query, normalize_embeddings=True)
+    return result.tolist()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

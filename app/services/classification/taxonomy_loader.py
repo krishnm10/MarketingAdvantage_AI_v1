@@ -8,7 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from sentence_transformers import SentenceTransformer
+import os
 import chromadb
+from chromadb.config import Settings
 
 from app.db.models.taxonomy import Taxonomy
 from app.db.models.taxonomy_alias import TaxonomyAlias
@@ -18,8 +20,24 @@ from app.utils.logger import log_info, log_warning
 # Global embedder for taxonomy entries
 EMBEDDER = SentenceTransformer("BAAI/bge-large-en")
 
-# ChromaDB client
-CHROMA = chromadb.PersistentClient(path="./chroma_db")
+# ChromaDB client — remote or local
+def _make_chroma_client():
+    host = os.getenv("CHROMA_HOST") or None
+    if host:
+        port = int(os.getenv("CHROMA_PORT") or "8000")
+        ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+        api_key = os.getenv("CHROMA_API_KEY") or None
+        return chromadb.HttpClient(
+            host=host, port=port, ssl=ssl,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return chromadb.PersistentClient(
+        path=os.getenv("CHROMA_PATH", "./chroma_db"),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+CHROMA = _make_chroma_client()
 TAXONOMY_COLLECTION = CHROMA.get_or_create_collection(
     name="taxonomy_collection",
     metadata={"hnsw:space": "cosine"}

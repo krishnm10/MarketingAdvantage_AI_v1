@@ -19,6 +19,8 @@ export const API = {
   SYNC: {
     ORPHANS: "/sync/orphans",
     FIX_ORPHANS: "/sync/fix/orphans",
+    FIX_DB_TO_VECTORDB: "/sync/fix/db-to-vectordb",
+    FIX_VECTORDB_TO_DB: "/sync/fix/vectordb-to-db",
   },
   INTEGRITY: {
     FIX_DB_TO_CHROMA: "/integrity/fix/db-to-chroma",

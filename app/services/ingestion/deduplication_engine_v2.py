@@ -3,6 +3,7 @@
 # deduplication_engine_v2.py — 3-Layer Deduplication System
 # =============================================
 import hashlib
+import os
 import re
 from typing import List, Dict, Any, Tuple, Optional
 from datetime import datetime
@@ -91,7 +92,7 @@ async def check_embedding_similarity(
     try:
         # Query ChromaDB for similar vectors
         hits = vectordb.search(
-            collection="ingested_content",
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             query_embedding=query_embedding,   # already List[float]
             top_k=top_k,
         )

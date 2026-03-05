@@ -230,7 +230,7 @@ class RetrievalRepository:
     def _get_vectordb(self):
         """Lazy-load vector DB from .env config (pluggable: qdrant, chroma, pinecone, milvus, weaviate, redis)"""
         if self._vectordb is None:
-            db_type = os.getenv("MAI_VECTORDB", "qdrant").lower()
+            db_type = os.getenv("MAI_VECTORDB", "chroma").lower()
             log_info(f"[REPO] Initializing pluggable vector DB: {db_type}")
             
             if db_type == "qdrant":
@@ -238,13 +238,21 @@ class RetrievalRepository:
                 self._vectordb = QdrantVectorDB(
                     url=os.getenv("QDRANT_URL") or None,
                     host=os.getenv("QDRANT_HOST", "localhost"),
-                    port=int(os.getenv("QDRANT_PORT", "6333")),
+                    port=int(os.getenv("QDRANT_PORT") or "6333"),
                     api_key=os.getenv("QDRANT_API_KEY") or None,
                 )
             elif db_type == "chroma":
                 from app.core.vectordb.chroma_v1 import ChromaVectorDB
+                chroma_host = os.getenv("CHROMA_HOST") or None
+                chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
+                use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+                api_key = os.getenv("CHROMA_API_KEY") or None
                 self._vectordb = ChromaVectorDB(
-                    persist_directory=os.getenv("CHROMA_PATH", "./chroma_db"),
+                    host=chroma_host,
+                    port=chroma_port,
+                    ssl=use_ssl,
+                    api_key=api_key,
+                    persist_directory=os.getenv("CHROMA_PATH", "./chroma_db") if not chroma_host else None,
                 )
             elif db_type == "pinecone":
                 from app.core.vectordb.pinecone_v1 import PineconeVectorDB
@@ -263,7 +271,7 @@ class RetrievalRepository:
                     uri=os.getenv("MILVUS_URI") or None,
                     token=os.getenv("MILVUS_TOKEN") or None,
                     host=os.getenv("MILVUS_HOST", "localhost"),
-                    port=int(os.getenv("MILVUS_PORT", "19530")),
+                    port=int(os.getenv("MILVUS_PORT") or "19530"),
                 )
             elif db_type == "weaviate":
                 from app.core.vectordb.weaviate_v1 import WeaviateVectorDB
@@ -276,10 +284,10 @@ class RetrievalRepository:
                 self._vectordb = RedisVectorDB(
                     url=os.getenv("REDIS_URL") or None,
                     host=os.getenv("REDIS_HOST", "localhost"),
-                    port=int(os.getenv("REDIS_PORT", "6379")),
+                    port=int(os.getenv("REDIS_PORT") or "6379"),
                     password=os.getenv("REDIS_PASSWORD") or None,
                     username=os.getenv("REDIS_USERNAME") or None,
-                    db=int(os.getenv("REDIS_DB", "0")),
+                    db=int(os.getenv("REDIS_DB") or "0"),
                     ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
                 )
             else:

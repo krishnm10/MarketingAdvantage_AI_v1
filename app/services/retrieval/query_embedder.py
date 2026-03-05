@@ -1,48 +1,34 @@
 """
 Query Embedding Service
-Matches ingestion embedding exactly (BAAI/bge-large-en)
+Pluggable — uses MAI_EMBEDDER from .env (ollama, openai, huggingface, etc.)
+Falls back to ingestion_service_v2.get_embedder() for consistency.
 """
 
-from sentence_transformers import SentenceTransformer
 from typing import List
 from app.utils.logger import log_debug, log_info
-from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
-
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-EMBED_MODEL_NAME = ""
-EMBEDDING_DIMENSION = 1024
-
-_EMBEDDER = None
 
 
 # =========================================================
-# EMBEDDER (SINGLETON)
+# PLUGGABLE EMBEDDER (matches ingestion exactly)
 # =========================================================
 
-def get_query_embedder() -> SentenceTransformer:
+def _get_pluggable_embedder():
+    """Get the pluggable embedder configured via MAI_EMBEDDER in .env."""
+    from app.services.ingestion.ingestion_service_v2 import get_embedder
+    return get_embedder()
+
+
+def get_query_embedder():
     """
-    Get sentence transformer model (singleton).
-    
-    Returns:
-        SentenceTransformer instance
+    Get embedder instance (pluggable — ollama/openai/huggingface).
+    Returns the _EmbedderAdapter from ingestion_service_v2.
     """
-    global _EMBEDDER
-    
-    if _EMBEDDER is None:
-        log_info(f"[QueryEmbedder] Loading model: {EMBED_MODEL_NAME}")
-        _EMBEDDER = SentenceTransformer(EMBED_MODEL_NAME)
-        log_info(f"[QueryEmbedder] ✅ Model loaded (dimension: {EMBEDDING_DIMENSION})")
-    
-    return _EMBEDDER
+    return _get_pluggable_embedder()
 
 
 def reset_embedder():
-    """Reset embedder (for testing)"""
-    global _EMBEDDER
-    _EMBEDDER = None
+    """Reset embedder (for testing) — no-op for pluggable embedder."""
+    pass
 
 
 # =========================================================
@@ -51,21 +37,16 @@ def reset_embedder():
 
 def embed_query(query: str) -> List[float]:
     """
-    Generate embedding for query text.
+    Generate embedding for query text using pluggable embedder.
     
     Args:
         query: Query text (must not be empty)
     
     Returns:
-        List of floats (1024-dimensional vector)
+        List of floats (embedding vector)
     
     Raises:
         ValueError: If query is empty
-    
-    Note:
-        - Uses BAAI/bge-large-en (matches ingestion)
-        - Normalizes embeddings for cosine similarity
-        - Returns 1024-dimensional vector
     """
     
     if not query or not query.strip():
@@ -75,17 +56,8 @@ def embed_query(query: str) -> List[float]:
     
     log_debug(f"[QueryEmbedder] Embedding query: '{query[:50]}...'")
     
-    # Generate embedding with normalization
-    embedding = embedder.encode(
-        [query],
-        normalize_embeddings=True
-    )
-    
-    # Convert to list
-    try:
-        embedding_list = embedding[0].tolist()
-    except Exception:
-        embedding_list = list(embedding[0])
+    result = embedder.encode(query, normalize_embeddings=True)
+    embedding_list = result.tolist()
     
     log_debug(f"[QueryEmbedder] Generated {len(embedding_list)}-dim embedding")
     
@@ -110,10 +82,5 @@ def embed_batch(queries: List[str]) -> List[List[float]]:
     
     log_debug(f"[QueryEmbedder] Embedding batch of {len(queries)} queries")
     
-    embeddings = embedder.encode(
-        queries,
-        normalize_embeddings=True
-    )
-    
-    # Convert to list of lists
-    return [emb.tolist() if hasattr(emb, 'tolist') else list(emb) for emb in embeddings]
+    results = [embedder.encode(q, normalize_embeddings=True).tolist() for q in queries]
+    return results

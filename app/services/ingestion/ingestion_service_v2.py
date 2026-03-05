@@ -172,13 +172,14 @@ def _build_config_from_env(
     if vectordb_type == "chroma":
         from app.core.config.client_config_schema import ChromaConfig
         chroma_host = os.getenv("CHROMA_HOST") or None
+        chroma_port = os.getenv("CHROMA_PORT") or "8000"
         vdb_cfg = VectorDBConfig(
             type=VectorDBType.CHROMA,
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             chroma=ChromaConfig(
                 persist_directory=os.getenv("CHROMA_PATH", "./chroma_db") if not chroma_host else None,
                 host=chroma_host,
-                port=int(os.getenv("CHROMA_PORT", "8000")),
+                port=int(chroma_port),
                 ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
                 api_key_env="CHROMA_API_KEY" if os.getenv("CHROMA_API_KEY") else None,
             ),
@@ -404,9 +405,9 @@ class _CollectionAdapter:
       4. Safe empty {}               — never crashes callers
     """
 
-    def __init__(self, vectordb, collection_name: str = "ingested_content"):
+    def __init__(self, vectordb, collection_name: str = None):
         self._vdb = vectordb
-        self._col = collection_name
+        self._col = collection_name or os.getenv("MAI_COLLECTION", "ingested_content")
 
     @property
     def name(self) -> str:

@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import apiClient from "@/lib/apiClient";
+import IntegrityActions from "@/components/IntegrityActions";
 import { RefreshCw, AlertCircle, Loader2, Puzzle, Database, HardDrive, AlertTriangle, CheckCircle2, Server } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -170,6 +171,19 @@ export default function SyncHealth() {
                     </span>
                   )}
                 </div>
+              </div>
+            </div>
+          )}
+
+          {/* Fix Actions */}
+          {totalOrphans > 0 && (
+            <div className="rounded-xl border border-slate-200/60 bg-white shadow-card overflow-hidden">
+              <div className="px-6 py-4 border-b border-slate-100">
+                <span className="text-sm font-semibold text-slate-900">Repair Actions</span>
+                <p className="text-xs text-slate-400 mt-0.5">Fix orphans between PostgreSQL and Vector DB</p>
+              </div>
+              <div className="p-4">
+                <IntegrityActions />
               </div>
             </div>
           )}

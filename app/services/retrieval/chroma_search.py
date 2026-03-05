@@ -1,10 +1,16 @@
 """
 ChromaDB Search Service
 Compatible with RetrievalRepository
+
+Supports BOTH remote (HttpClient) and local (PersistentClient) modes:
+  - Remote: set CHROMA_HOST / CHROMA_PORT in .env
+  - Local:  leave CHROMA_HOST empty → uses chroma_path (default ./chroma_db)
 """
 
+import os
 import asyncio
 import chromadb
+from chromadb.config import Settings
 from typing import List, Tuple
 from app.utils.logger import log_debug, log_info, log_warning
 
@@ -13,8 +19,8 @@ from app.utils.logger import log_debug, log_info, log_warning
 # CONFIGURATION
 # =========================================================
 
-CHROMA_PATH = "./chroma_db"
-COLLECTION_NAME = "ingested_content"
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
 
 
 # =========================================================
@@ -22,7 +28,7 @@ COLLECTION_NAME = "ingested_content"
 # =========================================================
 
 class ChromaSearch:
-    """ChromaDB search service"""
+    """ChromaDB search service — supports remote and local ChromaDB."""
     
     def __init__(self, chroma_path: str = CHROMA_PATH, collection_name: str = COLLECTION_NAME):
         self.chroma_path = chroma_path
@@ -32,10 +38,27 @@ class ChromaSearch:
         self._initialize()
     
     def _initialize(self):
-        """Initialize ChromaDB client and collection"""
+        """Initialize ChromaDB client and collection (remote or local)."""
         try:
-            log_info(f"[ChromaSearch] Initializing ChromaDB at {self.chroma_path}")
-            self._client = chromadb.PersistentClient(path=self.chroma_path)
+            chroma_host = os.getenv("CHROMA_HOST") or None
+            if chroma_host:
+                chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
+                use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+                api_key = os.getenv("CHROMA_API_KEY") or None
+                log_info(f"[ChromaSearch] Connecting to remote ChromaDB at {chroma_host}:{chroma_port}")
+                self._client = chromadb.HttpClient(
+                    host=chroma_host,
+                    port=chroma_port,
+                    ssl=use_ssl,
+                    headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+                    settings=Settings(anonymized_telemetry=False),
+                )
+            else:
+                log_info(f"[ChromaSearch] Initializing local ChromaDB at {self.chroma_path}")
+                self._client = chromadb.PersistentClient(
+                    path=self.chroma_path,
+                    settings=Settings(anonymized_telemetry=False),
+                )
             self._collection = self._client.get_collection(name=self.collection_name)
             log_info(f"[ChromaSearch] ✅ Connected to collection '{self.collection_name}'")
         except Exception as e:

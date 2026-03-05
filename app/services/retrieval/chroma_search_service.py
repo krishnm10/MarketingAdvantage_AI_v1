@@ -1,10 +1,16 @@
 """
 ChromaDB Search Service
 Extracted from retrieve_cli.py for reusability across CLI and API
+
+Supports BOTH remote (HttpClient) and local (PersistentClient) modes:
+  - Remote: set CHROMA_HOST / CHROMA_PORT in .env
+  - Local:  leave CHROMA_HOST empty → uses CHROMA_PATH (default ./chroma_db)
 """
 
+import os
 import asyncio
 import chromadb
+from chromadb.config import Settings
 from typing import List, Tuple
 from app.utils.logger import log_debug, log_info, log_warning
 
@@ -13,8 +19,8 @@ from app.utils.logger import log_debug, log_info, log_warning
 # CONFIGURATION
 # =========================================================
 
-CHROMA_PATH = "./chroma_db"
-COLLECTION_NAME = "ingested_content"
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
+COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
 
 _CHROMA_CLIENT = None
 _COLLECTION = None
@@ -27,6 +33,7 @@ _COLLECTION = None
 def get_chroma_collection():
     """
     Get ChromaDB collection (singleton pattern).
+    Remote mode when CHROMA_HOST is set, local mode otherwise.
     
     Returns:
         chromadb.Collection instance
@@ -34,8 +41,25 @@ def get_chroma_collection():
     global _CHROMA_CLIENT, _COLLECTION
     
     if _CHROMA_CLIENT is None:
-        log_info(f"[ChromaSearch] Initializing ChromaDB at {CHROMA_PATH}")
-        _CHROMA_CLIENT = chromadb.PersistentClient(path=CHROMA_PATH)
+        chroma_host = os.getenv("CHROMA_HOST") or None
+        if chroma_host:
+            chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
+            use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+            api_key = os.getenv("CHROMA_API_KEY") or None
+            log_info(f"[ChromaSearch] Connecting to remote ChromaDB at {chroma_host}:{chroma_port}")
+            _CHROMA_CLIENT = chromadb.HttpClient(
+                host=chroma_host,
+                port=chroma_port,
+                ssl=use_ssl,
+                headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+                settings=Settings(anonymized_telemetry=False),
+            )
+        else:
+            log_info(f"[ChromaSearch] Initializing local ChromaDB at {CHROMA_PATH}")
+            _CHROMA_CLIENT = chromadb.PersistentClient(
+                path=CHROMA_PATH,
+                settings=Settings(anonymized_telemetry=False),
+            )
         _COLLECTION = _CHROMA_CLIENT.get_collection(COLLECTION_NAME)
         log_info(f"[ChromaSearch] ✅ Connected to collection '{COLLECTION_NAME}'")
     

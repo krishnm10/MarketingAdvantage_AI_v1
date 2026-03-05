@@ -4,12 +4,14 @@ type ActionButtonProps = {
   label: string;
   onClick: () => Promise<void>;
   variant?: "primary" | "danger";
+  disabled?: boolean;
 };
 
 export default function ActionButton({
   label,
   onClick,
   variant = "primary",
+  disabled = false,
 }: ActionButtonProps) {
   const base =
     "rounded px-4 py-2 text-sm font-medium transition disabled:opacity-50";
@@ -23,6 +25,7 @@ export default function ActionButton({
       className={`${base} ${styles}`}
       onClick={onClick}
       type="button"
+      disabled={disabled}
     >
       {label}
     </button>

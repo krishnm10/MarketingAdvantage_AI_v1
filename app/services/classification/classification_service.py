@@ -16,13 +16,31 @@ from app.db.models.business_classification import BusinessClassification
 from app.db.models.classification_logs import ClassificationLogs
 
 from app.utils.logger import log_info, log_warning
+import os
 import chromadb
+from chromadb.config import Settings
 
 
-# Chroma client (update metadata for chunks)
-CHROMA = chromadb.PersistentClient(path="./chroma_db")
+# Chroma client (update metadata for chunks) — remote or local
+def _make_chroma_client():
+    host = os.getenv("CHROMA_HOST") or None
+    if host:
+        port = int(os.getenv("CHROMA_PORT") or "8000")
+        ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+        api_key = os.getenv("CHROMA_API_KEY") or None
+        return chromadb.HttpClient(
+            host=host, port=port, ssl=ssl,
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
+            settings=Settings(anonymized_telemetry=False),
+        )
+    return chromadb.PersistentClient(
+        path=os.getenv("CHROMA_PATH", "./chroma_db"),
+        settings=Settings(anonymized_telemetry=False),
+    )
+
+CHROMA = _make_chroma_client()
 CONTENT_COLLECTION = CHROMA.get_or_create_collection(
-    name="ingested_content",
+    name=os.getenv("MAI_COLLECTION", "ingested_content"),
     metadata={"hnsw:space": "cosine"}
 )
 

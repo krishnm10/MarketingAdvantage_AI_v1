@@ -2,6 +2,7 @@
 # app/api/v2/ingestion_admin_api.py
 # =============================================
 import asyncio
+import os
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -207,7 +208,7 @@ async def update_chunk(
     await loop.run_in_executor(
         None,
         lambda: vectordb.upsert(
-            collection="ingested_content",
+            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             doc_id=gci.semantic_hash,
             embedding=vector,
             text=final_text,
