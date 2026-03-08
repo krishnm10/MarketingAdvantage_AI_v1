@@ -35,9 +35,21 @@ async def ingest_file(
     try:
         log_info(f"[ingestion_api_v2] Received upload: {file.filename}")
         response = await route_file_ingestion(file=file, business_id=business_id)
+        details_status = response.get("status")
+        details_reason = response.get("reason")
+
+        if details_status == "skipped" and details_reason == "db_duplicate":
+            return {
+                "status": "duplicate_skipped",
+                "file_name": file.filename,
+                "message": f"Duplicate detected. '{file.filename}' was already ingested.",
+                "details": response,
+            }
+
         return {
             "status": "success",
             "file_name": file.filename,
+            "message": f"File '{file.filename}' uploaded successfully.",
             "details": response,
         }
     except HTTPException as e:

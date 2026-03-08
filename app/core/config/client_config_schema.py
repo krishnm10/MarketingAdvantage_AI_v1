@@ -35,7 +35,7 @@ import json
 import os
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -163,7 +163,8 @@ class WeaviateConfig(BaseModel):
 
 class PineconeConfig(BaseModel):
     """Pinecone — fully managed cloud VectorDB."""
-    api_key_env:    str  = Field(..., description="Env var NAME for Pinecone API key.")
+    mode:           Literal["cloud", "local"] = "cloud"
+    api_key_env:    Optional[str] = Field(None, description="Env var NAME for Pinecone API key.")
     index_name:     str  = Field(..., description="Pinecone index name — unique per client.")
     namespace:      str  = "default"
     embedding_dim:  int  = Field(..., description="Must match embedder output dimension exactly.")
@@ -171,6 +172,13 @@ class PineconeConfig(BaseModel):
     cloud:          str  = "aws"
     region:         str  = "us-east-1"
     pod_type: Optional[str] = None
+    local_path: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_mode(self) -> "PineconeConfig":
+        if self.mode == "cloud" and not self.api_key_env:
+            raise ValueError("PineconeConfig: 'api_key_env' is required when mode='cloud'.")
+        return self
 
 
 class MilvusConfig(BaseModel):

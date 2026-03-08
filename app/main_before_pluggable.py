@@ -54,20 +54,28 @@ async def lifespan(app: FastAPI):
     print("=" * 80)
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # STEP 1: Initialize ChromaDB Collection
+    active_vectordb = os.getenv("MAI_VECTORDB", "chroma").lower()
+
+    # STEP 1: Initialize active vector DB via compatibility adapter
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     try:
         from app.services.ingestion.ingestion_service_v2 import get_chroma_collection
-        print("\n[Startup] Initializing ChromaDB...")
-        
-        # ✅ skip_count=True for instant startup even with 100M+ vectors
+        print(f"\n[Startup] Initializing vector DB ({active_vectordb})...")
+
+        # Compatibility wrapper returns the active pluggable backend adapter.
         client, collection = get_chroma_collection(skip_count=True)
-        print(f"✅ ChromaDB Ready: Collection '{collection.name}' initialized")
-        print("💡 Vector count available at GET /health or GET /api/v2/stats/chromadb")
+        print(
+            f"✅ Vector DB Ready: backend='{active_vectordb}' "
+            f"collection='{collection.name}' initialized"
+        )
+        print("💡 Vector health available at GET /health")
     except Exception as e:
-        print(f"❌ ChromaDB Initialization Failed: {e}")
+        print(f"❌ Vector DB Initialization Failed ({active_vectordb}): {e}")
         print("⚠️  Vector search will be unavailable!")
-        print("💡 Run 'python init_chromadb.py' to fix")
+        if active_vectordb == "chroma":
+            print("💡 Run 'python init_chromadb.py' to fix")
+        elif active_vectordb == "redis":
+            print("💡 Redis vector backend requires Redis Stack / RediSearch support")
     
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # STEP 2: Start Background File Watcher

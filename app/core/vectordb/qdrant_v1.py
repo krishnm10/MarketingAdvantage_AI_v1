@@ -35,7 +35,7 @@ class QdrantVectorDB(BaseVectorDB):
 
     Constructor args:
         url:         Full Qdrant URL (e.g. "http://localhost:6333" or cloud URL)
-        api_key:     Qdrant API key (required for Qdrant Cloud, None for local)
+        api_key:     Optional Qdrant API key (required only for secured clusters)
         prefer_grpc: Use gRPC instead of HTTP for ~3x faster throughput
         timeout:     Request timeout in seconds
     """
@@ -71,14 +71,8 @@ class QdrantVectorDB(BaseVectorDB):
                 host, port, prefer_grpc,
             )
     
-        # ---- CLOUD MODE ----
+        # ---- URL MODE (cloud or self-hosted endpoint) ----
         else:
-            if not api_key:
-                raise ValueError(
-                    "Qdrant Cloud requires api_key. "
-                    "Provide api_key when using url."
-                )
-    
             self._client = QdrantClient(
                 url=url,
                 api_key=api_key,
@@ -87,8 +81,8 @@ class QdrantVectorDB(BaseVectorDB):
             )
     
             logger.info(
-                "[QdrantVectorDB] Initialized CLOUD | url=%s | grpc=%s",
-                url, prefer_grpc,
+                "[QdrantVectorDB] Initialized URL | url=%s | grpc=%s | api_key=%s",
+                url, prefer_grpc, bool(api_key),
             )
 
     @property
@@ -329,14 +323,85 @@ def _sanitize_qdrant_payload(metadata: Dict[str, Any]) -> Dict[str, Any]:
 
 def _build_qdrant_filter(filters: Dict[str, Any]) -> qdrant_models.Filter:
     """
-    Converts simple {key: value} dict to Qdrant Filter with MatchValue conditions.
-    For complex filtering, override this or extend with range/geo support.
+    Converts generic metadata filters into Qdrant Filter.
+
+    Supported forms:
+      - {"field": "value"}                    -> equality
+      - {"field": {"$eq": "value"}}          -> equality
+      - {"field": {"$ne": "value"}}          -> inequality
+      - {"field": {"$in": ["a", "b"]}}       -> any-of
+      - {"field": {"$nin": ["a", "b"]}}      -> not-in
+      - {"field": {"$gt": 1, "$lte": 10}}    -> numeric range
     """
-    conditions = [
-        qdrant_models.FieldCondition(
-            key=k,
-            match=qdrant_models.MatchValue(value=v),
-        )
-        for k, v in filters.items()
-    ]
-    return qdrant_models.Filter(must=conditions)
+    must: List[Any] = []
+    must_not: List[Any] = []
+
+    for key, raw in filters.items():
+        # Simple equality: {"field": value}
+        if not isinstance(raw, dict):
+            must.append(
+                qdrant_models.FieldCondition(
+                    key=key,
+                    match=qdrant_models.MatchValue(value=raw),
+                )
+            )
+            continue
+
+        # Operator form: {"field": {"$op": value}}
+        range_kwargs: Dict[str, Any] = {}
+
+        for op, val in raw.items():
+            if op == "$eq":
+                must.append(
+                    qdrant_models.FieldCondition(
+                        key=key,
+                        match=qdrant_models.MatchValue(value=val),
+                    )
+                )
+            elif op == "$ne":
+                must_not.append(
+                    qdrant_models.FieldCondition(
+                        key=key,
+                        match=qdrant_models.MatchValue(value=val),
+                    )
+                )
+            elif op == "$in":
+                values = list(val) if isinstance(val, (list, tuple, set)) else [val]
+                must.append(
+                    qdrant_models.FieldCondition(
+                        key=key,
+                        match=qdrant_models.MatchAny(any=values),
+                    )
+                )
+            elif op == "$nin":
+                values = list(val) if isinstance(val, (list, tuple, set)) else [val]
+                must_not.append(
+                    qdrant_models.FieldCondition(
+                        key=key,
+                        match=qdrant_models.MatchAny(any=values),
+                    )
+                )
+            elif op in {"$gt", "$gte", "$lt", "$lte"}:
+                if op == "$gt":
+                    range_kwargs["gt"] = val
+                elif op == "$gte":
+                    range_kwargs["gte"] = val
+                elif op == "$lt":
+                    range_kwargs["lt"] = val
+                elif op == "$lte":
+                    range_kwargs["lte"] = val
+            else:
+                logger.warning("[QdrantVectorDB] Unsupported filter operator: %s", op)
+
+        if range_kwargs:
+            must.append(
+                qdrant_models.FieldCondition(
+                    key=key,
+                    range=qdrant_models.Range(**range_kwargs),
+                )
+            )
+
+    return qdrant_models.Filter(
+        must=must or None,
+        must_not=must_not or None,
+    )

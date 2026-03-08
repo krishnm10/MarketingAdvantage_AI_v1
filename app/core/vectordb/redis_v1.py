@@ -1,7 +1,7 @@
 # ============================================================
 # app/core/vectordb/redis_v1.py
 #
-# Redis Vector DB Connector — Local, Remote, and Cloud
+# Redis Vector DB Connector - Local, Remote, and Cloud
 #
 # Supports:
 #   - Local:  localhost:6379 (default Docker/Redis Stack)
@@ -29,6 +29,10 @@ from typing import Any, Dict, List, Optional
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
 
 logger = logging.getLogger(__name__)
+
+
+class RedisVectorBackendUnavailable(RuntimeError):
+    """Raised when Redis is reachable but RediSearch/vector commands are unavailable."""
 
 
 def _float_list_to_bytes(vec: List[float]) -> bytes:
@@ -121,16 +125,12 @@ class RedisVectorDB(BaseVectorDB):
                 host, port, db, ssl,
             )
 
-        # Cache for created index names (avoid re-creating every call)
-        self._created_indices: set = set()
-
-    # ── Identity ──────────────────────────────────────────────────────────
+        self._created_indices: set[str] = set()
+        self._vector_capability_checked = False
 
     @property
     def kind(self) -> str:
         return "redis"
-
-    # ── Internal helpers ──────────────────────────────────────────────────
 
     def _key(self, collection: str, doc_id: str) -> str:
         """Redis key for a single vector document."""
@@ -140,16 +140,34 @@ class RedisVectorDB(BaseVectorDB):
         """RediSearch index name for a collection."""
         return f"idx:{self._prefix}{collection}"
 
+    def _raise_if_redisearch_missing(self, exc: Exception) -> None:
+        err_msg = str(exc).lower()
+        if "unknown command 'ft." in err_msg or 'unknown command "ft.' in err_msg:
+            raise RedisVectorBackendUnavailable(
+                "Redis endpoint is reachable but RediSearch/Redis Stack is not enabled. "
+                "This vector backend requires FT.CREATE and FT.SEARCH support. "
+                "Use Redis Stack or a Redis service with RediSearch enabled."
+            ) from exc
+
+    def _assert_vector_backend_ready(self) -> None:
+        if self._vector_capability_checked:
+            return
+        try:
+            self._client.execute_command("FT._LIST")
+        except Exception as exc:
+            self._raise_if_redisearch_missing(exc)
+            raise
+        self._vector_capability_checked = True
+
     def _index_exists(self, collection: str) -> bool:
         """Check if a RediSearch index already exists."""
         idx = self._index_name(collection)
         try:
             self._client.execute_command("FT.INFO", idx)
             return True
-        except Exception:
+        except Exception as exc:
+            self._raise_if_redisearch_missing(exc)
             return False
-
-    # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def health_check(self) -> bool:
         try:
@@ -165,6 +183,7 @@ class RedisVectorDB(BaseVectorDB):
         embedding_dim: int,
         distance_metric: str = "cosine",
     ) -> None:
+        self._assert_vector_backend_ready()
         idx = self._index_name(collection)
 
         if collection in self._created_indices:
@@ -173,7 +192,6 @@ class RedisVectorDB(BaseVectorDB):
             self._created_indices.add(collection)
             return
 
-        # Map distance metric to Redis vector similarity metric
         metric_map = {
             "cosine": "COSINE",
             "dotproduct": "IP",
@@ -182,13 +200,6 @@ class RedisVectorDB(BaseVectorDB):
             "l2": "L2",
         }
         redis_metric = metric_map.get(distance_metric.lower(), "COSINE")
-
-        # Build FT.CREATE command for HASH-based vector index
-        # Schema:
-        #   embedding  → VECTOR HNSW (searchable)
-        #   _text      → TEXT (stored, not indexed for FTS by default)
-        #   _metadata  → TEXT (stored as JSON string)
-        #   doc_id     → TAG (filterable)
         prefix = f"{self._prefix}{collection}:"
 
         try:
@@ -211,7 +222,7 @@ class RedisVectorDB(BaseVectorDB):
                 idx, embedding_dim, redis_metric,
             )
         except Exception as exc:
-            # Index might already exist (race condition with another worker)
+            self._raise_if_redisearch_missing(exc)
             err_msg = str(exc).lower()
             if "index already exists" in err_msg:
                 self._created_indices.add(collection)
@@ -220,20 +231,19 @@ class RedisVectorDB(BaseVectorDB):
                 raise
 
     def delete_collection(self, collection: str) -> None:
+        self._assert_vector_backend_ready()
         idx = self._index_name(collection)
         try:
-            # DD = Delete Documents (drop the underlying hashes too)
             self._client.execute_command("FT.DROPINDEX", idx, "DD")
             self._created_indices.discard(collection)
             logger.info("[RedisVectorDB] Dropped index '%s' with documents", idx)
         except Exception as exc:
+            self._raise_if_redisearch_missing(exc)
             err_msg = str(exc).lower()
             if "unknown index" in err_msg:
                 logger.debug("[RedisVectorDB] Index '%s' does not exist", idx)
             else:
                 raise
-
-    # ── Write ─────────────────────────────────────────────────────────────
 
     def upsert(
         self,
@@ -267,7 +277,7 @@ class RedisVectorDB(BaseVectorDB):
         failed = 0
 
         pipe = self._client.pipeline(transaction=False)
-        batch_size = 500  # Redis pipeline batch limit
+        batch_size = 500
 
         for i, (did, emb, txt, meta) in enumerate(
             zip(doc_ids, embeddings, texts, metadatas)
@@ -283,7 +293,6 @@ class RedisVectorDB(BaseVectorDB):
                 pipe.hset(key, mapping=mapping)
                 inserted += 1
 
-                # Flush pipeline every batch_size
                 if (i + 1) % batch_size == 0:
                     pipe.execute()
                     pipe = self._client.pipeline(transaction=False)
@@ -295,7 +304,6 @@ class RedisVectorDB(BaseVectorDB):
                 )
                 failed += 1
 
-        # Flush remaining
         try:
             pipe.execute()
         except Exception as exc:
@@ -305,8 +313,6 @@ class RedisVectorDB(BaseVectorDB):
 
         return BatchUpsertResult(inserted=inserted, updated=updated, failed=failed)
 
-    # ── Read ──────────────────────────────────────────────────────────────
-
     def search(
         self,
         *,
@@ -315,20 +321,13 @@ class RedisVectorDB(BaseVectorDB):
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        self._assert_vector_backend_ready()
         idx = self._index_name(collection)
         blob = _float_list_to_bytes(query_embedding)
 
-        # Build filter expression (Redis FT.SEARCH syntax)
-        filter_expr = "*"
-        if filters:
-            parts = []
-            for k, v in filters.items():
-                # TAG filter: @field:{value}
-                parts.append(f"@{k}:{{{v}}}")
-            filter_expr = " ".join(parts)
-
-        # KNN query: find nearest vectors to the blob parameter
-        query_str = f"({filter_expr})=>[KNN {top_k} @embedding $BLOB AS _score]"
+        server_filter_expr = _build_redis_server_filter(filters)
+        fetch_k = _redis_fetch_limit(top_k, filters)
+        query_str = f"({server_filter_expr})=>[KNN {fetch_k} @embedding $BLOB AS _score]"
 
         try:
             raw = self._client.execute_command(
@@ -336,29 +335,24 @@ class RedisVectorDB(BaseVectorDB):
                 query_str,
                 "PARAMS", "2", "BLOB", blob,
                 "SORTBY", "_score",
-                "LIMIT", "0", str(top_k),
+                "LIMIT", "0", str(fetch_k),
                 "DIALECT", "2",
             )
         except Exception as exc:
+            self._raise_if_redisearch_missing(exc)
             logger.warning("[RedisVectorDB] search failed: %s", exc)
             return []
 
-        return self._parse_search_results(raw, collection)
+        hits = self._parse_search_results(raw, collection)
+        if filters:
+            hits = [hit for hit in hits if _matches_redis_filters(hit, filters)]
+        return hits[:top_k]
 
-    def _parse_search_results(
-        self, raw: Any, collection: str
-    ) -> List[VectorHit]:
-        """
-        Parse FT.SEARCH response into VectorHit list.
-
-        FT.SEARCH returns:
-          [total_count, key1, [field, value, ...], key2, [field, value, ...], ...]
-        """
+    def _parse_search_results(self, raw: Any, collection: str) -> List[VectorHit]:
         if not raw or raw[0] == 0:
             return []
 
         results: List[VectorHit] = []
-        total = raw[0]
         i = 1
 
         while i < len(raw):
@@ -373,7 +367,6 @@ class RedisVectorDB(BaseVectorDB):
             fields = raw[i]
             i += 1
 
-            # Parse field-value pairs into a dict
             field_dict: Dict[str, Any] = {}
             if isinstance(fields, list):
                 for j in range(0, len(fields), 2):
@@ -383,33 +376,26 @@ class RedisVectorDB(BaseVectorDB):
                         fname = fname.decode("utf-8")
                     field_dict[fname] = fval
 
-            # Extract doc_id from key (strip prefix)
             doc_id = field_dict.get("doc_id", b"")
             if isinstance(doc_id, bytes):
                 doc_id = doc_id.decode("utf-8")
             if not doc_id:
-                # Parse from key: vec:collection:doc_id
                 prefix = f"{self._prefix}{collection}:"
                 doc_id = key[len(prefix):] if key.startswith(prefix) else key
 
-            # Extract text
             text = field_dict.get("_text", b"")
             if isinstance(text, bytes):
                 text = text.decode("utf-8")
 
-            # Extract score (lower = more similar for COSINE in Redis)
             score_raw = field_dict.get("_score", b"1.0")
             if isinstance(score_raw, bytes):
                 score_raw = score_raw.decode("utf-8")
             try:
                 raw_score = float(score_raw)
-                # Redis returns COSINE distance (0=identical, 2=opposite).
-                # Convert to similarity: 1 - distance
                 score = max(0.0, 1.0 - raw_score)
             except (ValueError, TypeError):
                 score = 0.0
 
-            # Extract metadata
             meta_raw = field_dict.get("_metadata", b"{}")
             if isinstance(meta_raw, bytes):
                 meta_raw = meta_raw.decode("utf-8")
@@ -425,7 +411,6 @@ class RedisVectorDB(BaseVectorDB):
                 metadata=metadata,
             ))
 
-        # Sort by score DESC (best first)
         results.sort(key=lambda h: h.score, reverse=True)
         return results
 
@@ -471,7 +456,6 @@ class RedisVectorDB(BaseVectorDB):
             if not data:
                 continue
 
-            # Decode fields
             text = data.get(b"_text", b"")
             if isinstance(text, bytes):
                 text = text.decode("utf-8")
@@ -494,11 +478,10 @@ class RedisVectorDB(BaseVectorDB):
         return hits
 
     def count(self, collection: str) -> int:
+        self._assert_vector_backend_ready()
         idx = self._index_name(collection)
         try:
             info = self._client.execute_command("FT.INFO", idx)
-            # FT.INFO returns a flat list of key-value pairs
-            # Find "num_docs" key
             for j in range(0, len(info), 2):
                 key = info[j]
                 if isinstance(key, bytes):
@@ -510,10 +493,9 @@ class RedisVectorDB(BaseVectorDB):
                     return int(val)
             return 0
         except Exception as exc:
+            self._raise_if_redisearch_missing(exc)
             logger.warning("[RedisVectorDB] count failed: %s", exc)
             return 0
-
-    # ── Delete ────────────────────────────────────────────────────────────
 
     def delete(self, *, collection: str, doc_id: str) -> None:
         key = self._key(collection, doc_id)
@@ -524,3 +506,75 @@ class RedisVectorDB(BaseVectorDB):
             return 0
         keys = [self._key(collection, did) for did in doc_ids]
         return self._client.delete(*keys)
+
+
+def _build_redis_server_filter(filters: Optional[Dict[str, Any]]) -> str:
+    if not filters:
+        return "*"
+
+    parts: List[str] = []
+    doc_id_filter = filters.get("doc_id")
+    if doc_id_filter is None:
+        return "*"
+
+    if isinstance(doc_id_filter, dict):
+        values = doc_id_filter.get("$in")
+        if values is not None:
+            vals = values if isinstance(values, (list, tuple, set)) else [values]
+            encoded = "|".join(_escape_redis_tag_value(str(v)) for v in vals)
+            parts.append(f"@doc_id:{{{encoded}}}")
+        elif "$eq" in doc_id_filter:
+            parts.append(f"@doc_id:{{{_escape_redis_tag_value(str(doc_id_filter['$eq']))}}}")
+    else:
+        parts.append(f"@doc_id:{{{_escape_redis_tag_value(str(doc_id_filter))}}}")
+
+    return " ".join(parts) if parts else "*"
+
+
+def _redis_fetch_limit(top_k: int, filters: Optional[Dict[str, Any]]) -> int:
+    if not filters:
+        return top_k
+    return min(max(top_k * 5, top_k + 10), 200)
+
+
+def _matches_redis_filters(hit: VectorHit, filters: Dict[str, Any]) -> bool:
+    for key, raw in filters.items():
+        candidate = hit.id if key == "doc_id" else hit.metadata.get(key)
+        if not _matches_redis_filter_value(candidate, raw):
+            return False
+    return True
+
+
+def _matches_redis_filter_value(candidate: Any, raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return candidate == raw
+
+    for op, value in raw.items():
+        if op == "$eq" and candidate != value:
+            return False
+        if op == "$ne" and candidate == value:
+            return False
+        if op == "$in":
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            if candidate not in values:
+                return False
+        if op == "$nin":
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            if candidate in values:
+                return False
+        if op == "$gt" and not (candidate is not None and candidate > value):
+            return False
+        if op == "$gte" and not (candidate is not None and candidate >= value):
+            return False
+        if op == "$lt" and not (candidate is not None and candidate < value):
+            return False
+        if op == "$lte" and not (candidate is not None and candidate <= value):
+            return False
+    return True
+
+
+def _escape_redis_tag_value(value: str) -> str:
+    escaped = value
+    for ch in ("-", "{", "}", "|", " ", ":", "@"):
+        escaped = escaped.replace(ch, f"\\{ch}")
+    return escaped

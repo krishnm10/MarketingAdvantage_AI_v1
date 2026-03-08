@@ -140,7 +140,7 @@ class MilvusVectorDB(BaseVectorDB):
             _FIELD_ID:       doc_id,
             _FIELD_VECTOR:   embedding,
             _FIELD_TEXT:     str(text)[:65_530] if text else "",
-            _FIELD_METADATA: json.dumps(metadata or {}, ensure_ascii=False),
+            _FIELD_METADATA: _sanitize_milvus_metadata(metadata),
         }])
         col.flush()
 
@@ -179,7 +179,7 @@ class MilvusVectorDB(BaseVectorDB):
                     _FIELD_ID:       doc_ids[i],
                     _FIELD_VECTOR:   embeddings[i],
                     _FIELD_TEXT:     str(texts[i])[:65_530] if texts[i] else "",
-                    _FIELD_METADATA: json.dumps(metadatas[i] or {}, ensure_ascii=False),
+                    _FIELD_METADATA: _sanitize_milvus_metadata(metadatas[i]),
                 }
                 for i in range(len(doc_ids))
             ]
@@ -206,13 +206,7 @@ class MilvusVectorDB(BaseVectorDB):
     ) -> List[VectorHit]:
         col = self._get_collection(collection)
 
-        expr = None
-        if filters:
-            clauses = []
-            for k, v in filters.items():
-                val_str = f'"{v}"' if isinstance(v, str) else str(v).lower()
-                clauses.append(f'{_FIELD_METADATA}["{k}"] == {val_str}')
-            expr = " && ".join(clauses)
+        expr = _build_milvus_filter_expr(filters)
 
         search_params = {
             "metric_type": _METRIC_TYPE,
@@ -229,8 +223,7 @@ class MilvusVectorDB(BaseVectorDB):
 
         hits: List[VectorHit] = []
         for result in res[0]:
-            raw_meta = result.entity.get(_FIELD_METADATA) or "{}"
-            meta = json.loads(raw_meta) if isinstance(raw_meta, str) else (raw_meta or {})
+            meta = _normalize_milvus_metadata(result.entity.get(_FIELD_METADATA))
             hits.append(VectorHit(
                 id=str(result.id),
                 text=str(result.entity.get(_FIELD_TEXT) or ""),
@@ -270,8 +263,7 @@ class MilvusVectorDB(BaseVectorDB):
             )
             hits = []
             for r in results:
-                raw_meta = r.get(_FIELD_METADATA) or "{}"
-                meta = json.loads(raw_meta) if isinstance(raw_meta, str) else {}
+                meta = _normalize_milvus_metadata(r.get(_FIELD_METADATA))
                 hits.append(VectorHit(
                     id=str(r[_FIELD_ID]),
                     text=str(r.get(_FIELD_TEXT) or ""),
@@ -355,3 +347,85 @@ class MilvusVectorDB(BaseVectorDB):
             connections.disconnect(self._alias)
         except Exception:
             pass
+
+
+def _build_milvus_filter_expr(filters: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not filters:
+        return None
+
+    clauses: List[str] = []
+    for key, raw in filters.items():
+        field = f'{_FIELD_METADATA}["{key}"]'
+
+        if not isinstance(raw, dict):
+            clauses.append(f"{field} == {_milvus_literal(raw)}")
+            continue
+
+        for op, value in raw.items():
+            if op == "$eq":
+                clauses.append(f"{field} == {_milvus_literal(value)}")
+            elif op == "$ne":
+                clauses.append(f"{field} != {_milvus_literal(value)}")
+            elif op == "$in":
+                clauses.append(f"{field} in {_milvus_list_literal(value)}")
+            elif op == "$nin":
+                clauses.append(f"{field} not in {_milvus_list_literal(value)}")
+            elif op == "$gt":
+                clauses.append(f"{field} > {_milvus_literal(value)}")
+            elif op == "$gte":
+                clauses.append(f"{field} >= {_milvus_literal(value)}")
+            elif op == "$lt":
+                clauses.append(f"{field} < {_milvus_literal(value)}")
+            elif op == "$lte":
+                clauses.append(f"{field} <= {_milvus_literal(value)}")
+            else:
+                logger.warning("[MilvusVectorDB] Unsupported filter operator: %s", op)
+
+    return " && ".join(clauses) if clauses else None
+
+
+def _milvus_literal(value: Any) -> str:
+    if isinstance(value, dict):
+        raise ValueError("Milvus metadata filters do not support dict values as direct literals.")
+    if isinstance(value, (list, tuple, set)):
+        raise ValueError("Milvus metadata filters require scalar values for direct comparison.")
+    if isinstance(value, str):
+        escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+        return f'"{escaped}"'
+    if value is None:
+        return '""'
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _milvus_list_literal(value: Any) -> str:
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return "[" + ", ".join(_milvus_literal(item) for item in values) + "]"
+
+
+def _sanitize_milvus_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    safe: Dict[str, Any] = {}
+    for key, value in (metadata or {}).items():
+        if value is None:
+            safe[key] = ""
+        elif isinstance(value, (str, int, float, bool, list, dict)):
+            safe[key] = value
+        else:
+            safe[key] = str(value)
+    return safe
+
+
+def _normalize_milvus_metadata(raw_meta: Any) -> Dict[str, Any]:
+    if isinstance(raw_meta, dict):
+        return raw_meta
+    if isinstance(raw_meta, str):
+        raw_meta = raw_meta.strip()
+        if not raw_meta:
+            return {}
+        try:
+            parsed = json.loads(raw_meta)
+        except Exception:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}

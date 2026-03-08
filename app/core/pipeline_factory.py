@@ -348,24 +348,17 @@ class PipelineFactory:
 
         if t == VectorDBType.QDRANT:
             c = cfg.qdrant
-            
-            # Determine if we are in CLOUD mode or LOCAL mode
-            # Cloud mode → URL is explicitly provided AND not localhost
-            is_cloud = bool(c.url and "localhost" not in c.url)
-            
-            if is_cloud:
-                if not c.api_key_env:
-                    raise EnvironmentError(
-                        "[PipelineFactory] Qdrant Cloud requires api_key_env in config."
-                    )
-            
-                api_key = _env(c.api_key_env)
-            
+
+            # If URL is provided, use URL mode (cloud or self-hosted endpoint).
+            if c.url:
+                api_key = _env(c.api_key_env) if c.api_key_env else None
+
                 logger.info(
-                    "[PipelineFactory] Qdrant CLOUD mode | url=%s",
+                    "[PipelineFactory] Qdrant URL mode | url=%s | api_key=%s",
                     c.url,
+                    bool(api_key),
                 )
-            
+
                 return vectordb_registry.build(
                     "qdrant",
                     url=c.url,
@@ -373,14 +366,14 @@ class PipelineFactory:
                     prefer_grpc=c.prefer_grpc,
                     timeout=c.timeout,
                 )
-            
+
             # ---- LOCAL MODE (default) ----
             logger.info(
                 "[PipelineFactory] Qdrant LOCAL mode | host=%s | port=%s",
                 c.host or "localhost",
                 c.port or 6333,
             )
-            
+
             return vectordb_registry.build(
                 "qdrant",
                 host=c.host or "localhost",
@@ -400,9 +393,11 @@ class PipelineFactory:
 
         if t == VectorDBType.PINECONE:
             c = cfg.pinecone
+            api_key = _env(c.api_key_env) if (c.mode == "cloud" and c.api_key_env) else None
             return vectordb_registry.build(
                 "pinecone",
-                api_key=_env(c.api_key_env),
+                mode=c.mode,
+                api_key=api_key,
                 index_name=c.index_name,
                 namespace=c.namespace,
                 embedding_dim=c.embedding_dim,
@@ -410,6 +405,7 @@ class PipelineFactory:
                 cloud=c.cloud,
                 region=c.region,
                 pod_type=c.pod_type,
+                local_path=c.local_path,
             )
 
         if t == VectorDBType.MILVUS:

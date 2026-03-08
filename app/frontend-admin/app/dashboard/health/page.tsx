@@ -37,6 +37,7 @@ interface ServiceEntry {
 
 interface HealthResponse {
   status: string;
+  scope?: "active" | "configured" | "all";
   timestamp: string;
   active: {
     vectordb: string;
@@ -210,15 +211,16 @@ function SectionHeader({
 /* ------------------------------------------------------------------ */
 
 export default function HealthStatus() {
+  const [healthScope, setHealthScope] = useState<"active" | "all">("active");
   const [backendReachable, setBackendReachable] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastCheckStr, setLastCheckStr] = useState<string>("");
 
-  const checkHealth = useCallback(() => {
+  const checkHealth = useCallback((scope: "active" | "all" = healthScope) => {
     setLoading(true);
     apiClient
-      .get("/api/v2/ingestion/health")
+      .get("/api/v2/ingestion/health", { params: { scope } })
       .then((res) => {
         setBackendReachable(true);
         setHealth(res.data);
@@ -231,12 +233,11 @@ export default function HealthStatus() {
         setLoading(false);
         setLastCheckStr(new Date().toLocaleTimeString());
       });
-  }, []);
+  }, [healthScope]);
 
   useEffect(() => {
-    checkHealth();
-    // No auto-refresh — user clicks "Check Now" manually
-  }, []);
+    checkHealth(healthScope);
+  }, [healthScope, checkHealth]);
 
   const countOnline = (dict?: Record<string, ServiceEntry>) => {
     if (!dict) return { online: 0, total: 0 };
@@ -255,19 +256,50 @@ export default function HealthStatus() {
     ? "ok"
     : "degraded";
 
-  /* Total across all categories */
+  const activeVectorEntries = health?.active?.vectordb
+    ? (Object.entries(health?.vectordbs || {}).filter(([key]) => key === health.active.vectordb) as Array<[string, ServiceEntry]>)
+    : [];
+  const activeEmbedderEntries = health?.active?.embedder
+    ? (Object.entries(health?.embedders || {}).filter(([key]) => key === health.active.embedder) as Array<[string, ServiceEntry]>)
+    : [];
+  const activeLlmEntries = health?.active?.llm
+    ? (Object.entries(health?.llms || {}).filter(([key]) => key === health.active.llm) as Array<[string, ServiceEntry]>)
+    : [];
+
+  const allVectorEntries = Object.entries(health?.vectordbs || {}) as Array<[string, ServiceEntry]>;
+  const allEmbedderEntries = Object.entries(health?.embedders || {}) as Array<[string, ServiceEntry]>;
+  const allLlmEntries = Object.entries(health?.llms || {}) as Array<[string, ServiceEntry]>;
+
+  const visibleVectorEntries = healthScope === "all" ? allVectorEntries : activeVectorEntries;
+  const visibleEmbedderEntries = healthScope === "all" ? allEmbedderEntries : activeEmbedderEntries;
+  const visibleLlmEntries = healthScope === "all" ? allLlmEntries : activeLlmEntries;
+
+  const visibleVectorCount = {
+    online: visibleVectorEntries.filter(([, entry]) => entry.status === "online").length,
+    total: visibleVectorEntries.length || (health ? 1 : 0),
+  };
+  const visibleEmbedderCount = {
+    online: visibleEmbedderEntries.filter(([, entry]) => entry.status === "online").length,
+    total: visibleEmbedderEntries.length || (health ? 1 : 0),
+  };
+  const visibleLlmCount = {
+    online: visibleLlmEntries.filter(([, entry]) => entry.status === "online").length,
+    total: visibleLlmEntries.length || (health ? 1 : 0),
+  };
+
+  /* Total for current scope */
   const totalOnline =
     countOnline(health?.databases).online +
-    countOnline(health?.vectordbs).online +
-    countOnline(health?.embedders).online +
-    countOnline(health?.llms).online +
+    visibleVectorCount.online +
+    visibleEmbedderCount.online +
+    visibleLlmCount.online +
     (backendReachable ? 1 : 0); /* FastAPI itself */
 
   const totalServices =
     countOnline(health?.databases).total +
-    countOnline(health?.vectordbs).total +
-    countOnline(health?.embedders).total +
-    countOnline(health?.llms).total +
+    visibleVectorCount.total +
+    visibleEmbedderCount.total +
+    visibleLlmCount.total +
     1; /* FastAPI itself */
 
   return (
@@ -277,15 +309,37 @@ export default function HealthStatus() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900">System Health</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Comprehensive platform monitoring — all databases, vector stores, embedders & LLMs
+            {healthScope === "all"
+              ? "Full platform monitoring - all databases, vector stores, embedders and LLMs"
+              : "Fast health mode - checks only services selected in Configuration"}
           </p>
         </div>
         <div className="flex items-center gap-3">
+          <div className="flex rounded-lg border border-slate-200 bg-white p-1">
+            <button
+              onClick={() => setHealthScope("active")}
+              className={cn(
+                "rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                healthScope === "active" ? "bg-primary-600 text-white" : "text-slate-600 hover:bg-slate-100"
+              )}
+            >
+              Configured
+            </button>
+            <button
+              onClick={() => setHealthScope("all")}
+              className={cn(
+                "rounded-md px-3 py-1 text-xs font-medium transition-colors",
+                healthScope === "all" ? "bg-primary-600 text-white" : "text-slate-600 hover:bg-slate-100"
+              )}
+            >
+              All Services
+            </button>
+          </div>
           <span className="flex items-center gap-1.5 text-xs text-slate-400">
-            <Clock className="h-3 w-3" /> {lastCheckStr || "—"}
+            <Clock className="h-3 w-3" /> {lastCheckStr || "-"}
           </span>
           <button
-            onClick={checkHealth}
+            onClick={() => checkHealth(healthScope)}
             disabled={loading}
             className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
           >
@@ -324,18 +378,18 @@ export default function HealthStatus() {
         <div>
           <h2 className="text-lg font-bold text-white">
             {overallStatus === "loading"
-              ? "Checking All Services…"
+              ? (healthScope === "all" ? "Checking All Services..." : "Checking Configured Services...")
               : overallStatus === "ok"
-              ? "All Active Systems Operational"
+              ? (healthScope === "all" ? "All Systems Operational" : "All Active Systems Operational")
               : overallStatus === "degraded"
-              ? `Degraded — ${totalOnline}/${totalServices} Services Online`
+              ? `Degraded - ${totalOnline}/${totalServices} Services Online`
               : "Backend Unreachable"}
           </h2>
           <p className="text-sm text-white/80">
             {overallStatus === "loading"
-              ? "Connecting to backend and running comprehensive health checks."
+              ? "Connecting to backend and running health checks."
               : overallStatus === "ok"
-              ? `${totalOnline} services checked — all active services are healthy.`
+              ? `${totalOnline} services checked - healthy.`
               : overallStatus === "degraded"
               ? "Some active services are down. Check individual statuses below."
               : "Unable to reach the backend. Check if the server is running on port 8000."}
@@ -387,12 +441,12 @@ export default function HealthStatus() {
         <SectionHeader
           icon={Layers}
           title="Vector Databases"
-          count={countOnline(health?.vectordbs)}
-          activeLabel={health?.active?.vectordb}
+          count={visibleVectorCount}
+          activeLabel={healthScope === "active" ? health?.active?.vectordb : undefined}
         />
         <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           {health
-            ? Object.entries(health.vectordbs).map(([key, entry]) => (
+            ? visibleVectorEntries.map(([key, entry]) => (
                 <ServiceCard
                   key={key}
                   name={key}
@@ -413,12 +467,12 @@ export default function HealthStatus() {
         <SectionHeader
           icon={Brain}
           title="Embedding Models"
-          count={countOnline(health?.embedders)}
-          activeLabel={health?.active?.embedder}
+          count={visibleEmbedderCount}
+          activeLabel={healthScope === "active" ? health?.active?.embedder : undefined}
         />
         <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
           {health
-            ? Object.entries(health.embedders).map(([key, entry]) => (
+            ? visibleEmbedderEntries.map(([key, entry]) => (
                 <ServiceCard
                   key={key}
                   name={key}
@@ -439,12 +493,12 @@ export default function HealthStatus() {
         <SectionHeader
           icon={Sparkles}
           title="Large Language Models"
-          count={countOnline(health?.llms)}
-          activeLabel={health?.active?.llm}
+          count={visibleLlmCount}
+          activeLabel={healthScope === "active" ? health?.active?.llm : undefined}
         />
         <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
           {health
-            ? Object.entries(health.llms).map(([key, entry]) => (
+            ? visibleLlmEntries.map(([key, entry]) => (
                 <ServiceCard
                   key={key}
                   name={key}

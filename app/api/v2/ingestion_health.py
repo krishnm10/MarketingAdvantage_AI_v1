@@ -8,7 +8,7 @@
 # ============================================================
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 import asyncio
 import datetime
 import os
@@ -200,6 +200,9 @@ async def _check_milvus() -> dict:
 
 
 async def _check_pinecone() -> dict:
+    if os.getenv("PINECONE_MODE", "cloud").strip().lower() == "local":
+        local_path = os.getenv("PINECONE_LOCAL_PATH") or "./pinecone_local_db"
+        return _ok(f"Local emulation | {local_path}")
     api_key = os.getenv("PINECONE_API_KEY", "")
     if not api_key:
         return _skip("PINECONE_API_KEY not set")
@@ -446,7 +449,7 @@ _VDB_CONFIGURED = {
     "qdrant":   lambda: True,
     "chroma":   lambda: True,
     "milvus":   lambda: bool(os.getenv("MILVUS_HOST") and os.getenv("MILVUS_HOST") != "localhost") or bool(os.getenv("MILVUS_URI")),
-    "pinecone": lambda: bool(os.getenv("PINECONE_API_KEY")),
+    "pinecone": lambda: os.getenv("PINECONE_MODE", "cloud").strip().lower() == "local" or bool(os.getenv("PINECONE_API_KEY")),
     "weaviate": lambda: bool(os.getenv("WEAVIATE_API_KEY")) or (os.getenv("WEAVIATE_URL", "").replace("http://localhost:8080", "") != ""),
     "redis":    lambda: bool(os.getenv("REDIS_URL")) or bool(os.getenv("REDIS_PASSWORD")),
 }
@@ -468,7 +471,12 @@ _LLM_CONFIGURED = {
 
 
 @router.get("/health")
-async def ingestion_health():
+async def ingestion_health(
+    scope: str = Query(
+        "configured",
+        description="Health scope: active | configured | all",
+    )
+):
     """
     Comprehensive health — pings active + configured services only.
     All checks are native-async (httpx / socket). No gRPC libs imported.
@@ -477,24 +485,34 @@ async def ingestion_health():
     active_vdb = os.getenv("MAI_VECTORDB", "qdrant").lower()
     active_emb = os.getenv("MAI_EMBEDDER", "huggingface").lower()
     active_llm = os.getenv("MAI_LLM", "ollama").lower()
+    mode = (scope or "configured").strip().lower()
+    if mode not in {"active", "configured", "all"}:
+        mode = "configured"
+
+    def _should_check(name: str, active_name: str, cfg_map: dict) -> bool:
+        if mode == "all":
+            return True
+        if mode == "active":
+            return name == active_name
+        return name == active_name or cfg_map.get(name, lambda: False)()
 
     # ── collect coroutines ───────────────────────────────────────────
     tasks: dict[str, any] = {}
     tasks["db__postgresql"] = _check_postgres()
 
     for name, fn in _VECTORDB_CHECKS.items():
-        if name == active_vdb or _VDB_CONFIGURED.get(name, lambda: False)():
+        if _should_check(name, active_vdb, _VDB_CONFIGURED):
             tasks[f"vdb__{name}"] = fn()
 
     for name, fn in _EMBEDDER_CHECKS.items():
-        if name == active_emb or _EMB_CONFIGURED.get(name, lambda: False)():
+        if _should_check(name, active_emb, _EMB_CONFIGURED):
             tasks[f"emb__{name}"] = fn()
 
     seen: set = set()
     for name, fn in _LLM_CHECKS.items():
         if fn in seen:
             continue
-        if name == active_llm or _LLM_CONFIGURED.get(name, lambda: False)():
+        if _should_check(name, active_llm, _LLM_CONFIGURED):
             tasks[f"llm__{name}"] = fn()
             seen.add(fn)
 
@@ -552,6 +570,7 @@ async def ingestion_health():
 
     return {
         "status": "ok" if all_ok else "degraded",
+        "scope": mode,
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "active": {"vectordb": active_vdb, "embedder": active_emb, "llm": active_llm},
         "databases": databases,

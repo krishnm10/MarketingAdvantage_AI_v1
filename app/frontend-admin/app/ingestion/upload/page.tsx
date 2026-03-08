@@ -3,12 +3,27 @@
 import { useState, useRef } from "react";
 import apiClient from "@/lib/apiClient";
 import { useAuth } from "@/lib/useAuth";
-import { Upload, FileUp, CheckCircle2, XCircle, Lock, Loader2 } from "lucide-react";
+import { Upload, FileUp, CheckCircle2, XCircle, Lock, Loader2, AlertTriangle } from "lucide-react";
+
+type UploadState = "idle" | "success" | "duplicate" | "error";
+
+type UploadResponse = {
+  status?: string;
+  file_name?: string;
+  message?: string;
+  details?: {
+    status?: string;
+    reason?: string;
+    file_name?: string;
+    file_id?: string;
+  };
+};
 
 export default function UploadPage() {
   const { role } = useAuth();
   const [file, setFile] = useState<File | null>(null);
-  const [status, setStatus] = useState("");
+  const [status, setStatus] = useState<UploadState>("idle");
+  const [statusMessage, setStatusMessage] = useState("");
   const [loading, setLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -18,20 +33,48 @@ export default function UploadPage() {
   const handleUpload = async () => {
     if (!file) return;
     setLoading(true);
-    setStatus("");
+    setStatus("idle");
+    setStatusMessage("");
 
     try {
       const formData = new FormData();
       formData.append("file", file);
 
-      const res = await apiClient.post("/api/v2/ingestion/upload", formData, {
+      const res = await apiClient.post<UploadResponse>("/api/v2/ingestion/upload", formData, {
         headers: { "Content-Type": "multipart/form-data" },
       });
 
-      setStatus(res.status === 200 ? "success" : "error");
+      const payload = res.data || {};
+      const details = payload.details || {};
+
+      if (
+        payload.status === "duplicate_skipped" ||
+        (details.status === "skipped" && details.reason === "db_duplicate")
+      ) {
+        setStatus("duplicate");
+        setStatusMessage(
+          payload.message ||
+            `Duplicate detected. '${details.file_name || payload.file_name || file.name}' was already ingested.`
+        );
+        return;
+      }
+
+      if (payload.status === "success") {
+        setStatus("success");
+        setStatusMessage(payload.message || `File '${payload.file_name || file.name}' uploaded successfully.`);
+        return;
+      }
+
+      setStatus("error");
+      setStatusMessage("Upload failed. Please try again.");
     } catch (err: any) {
       console.error("Upload error:", err);
+      const message =
+        err?.response?.data?.detail ||
+        err?.response?.data?.message ||
+        "Upload failed. Please try again.";
       setStatus("error");
+      setStatusMessage(message);
     } finally {
       setLoading(false);
     }
@@ -111,12 +154,17 @@ export default function UploadPage() {
         {/* Status */}
         {status === "success" && (
           <div className="flex items-center gap-2 p-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-sm">
-            <CheckCircle2 className="w-4 h-4" /> File uploaded successfully!
+            <CheckCircle2 className="w-4 h-4" /> {statusMessage}
+          </div>
+        )}
+        {status === "duplicate" && (
+          <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-300 text-sm">
+            <AlertTriangle className="w-4 h-4" /> {statusMessage}
           </div>
         )}
         {status === "error" && (
           <div className="flex items-center gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
-            <XCircle className="w-4 h-4" /> Upload failed. Please try again.
+            <XCircle className="w-4 h-4" /> {statusMessage}
           </div>
         )}
       </div>

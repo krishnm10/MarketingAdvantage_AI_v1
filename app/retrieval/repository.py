@@ -240,6 +240,8 @@ class RetrievalRepository:
                     host=os.getenv("QDRANT_HOST", "localhost"),
                     port=int(os.getenv("QDRANT_PORT") or "6333"),
                     api_key=os.getenv("QDRANT_API_KEY") or None,
+                    prefer_grpc=os.getenv("QDRANT_PREFER_GRPC", "").lower() in ("1", "true", "yes"),
+                    timeout=float(os.getenv("QDRANT_TIMEOUT") or "30"),
                 )
             elif db_type == "chroma":
                 from app.core.vectordb.chroma_v1 import ChromaVectorDB
@@ -256,14 +258,17 @@ class RetrievalRepository:
                 )
             elif db_type == "pinecone":
                 from app.core.vectordb.pinecone_v1 import PineconeVectorDB
+                pinecone_mode = os.getenv("PINECONE_MODE", "cloud").strip().lower()
                 self._vectordb = PineconeVectorDB(
-                    api_key=os.getenv("PINECONE_API_KEY", ""),
+                    mode="local" if pinecone_mode == "local" else "cloud",
+                    api_key=(os.getenv("PINECONE_API_KEY") or None),
                     index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
                     namespace=os.getenv("PINECONE_NAMESPACE", "default"),
                     embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
                     metric=os.getenv("PINECONE_METRIC", "cosine"),
                     cloud=os.getenv("PINECONE_CLOUD", "aws"),
                     region=os.getenv("PINECONE_REGION", "us-east-1"),
+                    local_path=os.getenv("PINECONE_LOCAL_PATH") or None,
                 )
             elif db_type == "milvus":
                 from app.core.vectordb.milvus_v1 import MilvusVectorDB

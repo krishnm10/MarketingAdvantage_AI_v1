@@ -38,10 +38,27 @@ interface SystemConfig {
   db_url: string;
   qdrant_host: string;
   qdrant_port: string;
+  qdrant_url: string;
   chroma_path: string;
   chroma_host: string;
   chroma_port: string;
   chroma_ssl: string;
+  milvus_host: string;
+  milvus_port: string;
+  weaviate_url: string;
+  pinecone_index: string;
+  pinecone_region: string;
+  pinecone_mode: string;
+  pinecone_local_path: string;
+  redis_url: string;
+  redis_host: string;
+  redis_port: string;
+  openai_embed_model: string;
+  cohere_embed_model: string;
+  openai_llm_model: string;
+  groq_llm_model: string;
+  anthropic_llm_model: string;
+  gemini_llm_model: string;
   validation_enabled: boolean;
   conflict_enabled: boolean;
   temporal_enabled: boolean;
@@ -195,15 +212,32 @@ export default function UnifiedDashboard() {
         llm: healthRes.data?.active?.llm || env.MAI_LLM || "ollama",
         collection: env.MAI_COLLECTION || "ingested_content",
         ollama_base: env.OLLAMA_BASE_URL || "http://localhost:11434",
-        ollama_model: env.OLLAMA_MODEL || "llama3.1:8b",
-        hf_model: env.HF_MODEL || "BAAI/bge-large-en-v1.5",
+        ollama_model: env.OLLAMA_LLM_MODEL || "llama3.1:8b",
+        hf_model: env.HF_EMBED_MODEL || "BAAI/bge-large-en-v1.5",
         db_url: env.DATABASE_URL || "postgresql://localhost/marketing_advantage",
         qdrant_host: env.QDRANT_HOST || "localhost",
         qdrant_port: env.QDRANT_PORT || "6333",
+        qdrant_url: env.QDRANT_URL || "",
         chroma_path: env.CHROMA_PATH || "./chroma_db",
         chroma_host: env.CHROMA_HOST || "",
         chroma_port: env.CHROMA_PORT || "8000",
         chroma_ssl: env.CHROMA_SSL || "false",
+        milvus_host: env.MILVUS_HOST || "localhost",
+        milvus_port: env.MILVUS_PORT || "19530",
+        weaviate_url: env.WEAVIATE_URL || "http://localhost:8080",
+        pinecone_index: env.PINECONE_INDEX_NAME || "ingested-content",
+        pinecone_region: env.PINECONE_REGION || "us-east-1",
+        pinecone_mode: env.PINECONE_MODE || "cloud",
+        pinecone_local_path: env.PINECONE_LOCAL_PATH || "./pinecone_local_db",
+        redis_url: env.REDIS_URL || "",
+        redis_host: env.REDIS_HOST || "localhost",
+        redis_port: env.REDIS_PORT || "6379",
+        openai_embed_model: env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
+        cohere_embed_model: env.COHERE_EMBED_MODEL || "embed-english-v3.0",
+        openai_llm_model: env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+        groq_llm_model: env.GROQ_LLM_MODEL || "llama-3.1-8b-instant",
+        anthropic_llm_model: env.ANTHROPIC_LLM_MODEL || "claude-3-5-sonnet-20241022",
+        gemini_llm_model: env.GEMINI_LLM_MODEL || "gemini-1.5-flash",
         validation_enabled: true,
         conflict_enabled: true,
         temporal_enabled: true,
@@ -230,18 +264,16 @@ export default function UnifiedDashboard() {
   const completedFiles = files.filter((f) => f.status === "completed" || f.status === "success").length;
   const failedFiles = files.filter((f) => f.status === "failed" || f.status === "error").length;
   const isOnline = health?.status === "ok" || health?.status === "online" || health?.status === "healthy" || health?.status === "degraded";
-  const servicesOnline = health
-    ? Object.values(health.databases ?? {}).filter((s: any) => s?.status === "online").length +
-      Object.values(health.vectordbs ?? {}).filter((s: any) => s?.status === "online").length +
-      Object.values(health.embedders ?? {}).filter((s: any) => s?.status === "online").length +
-      Object.values(health.llms ?? {}).filter((s: any) => s?.status === "online").length
-    : 0;
-  const servicesTotal = health
-    ? Object.keys(health.databases ?? {}).length +
-      Object.keys(health.vectordbs ?? {}).length +
-      Object.keys(health.embedders ?? {}).length +
-      Object.keys(health.llms ?? {}).length
-    : 4;
+  const activeVectorDb = (health?.active?.vectordb || config?.vectordb || "").toLowerCase();
+  const activeEmbedder = (health?.active?.embedder || config?.embedder || "").toLowerCase();
+  const activeLlm = (health?.active?.llm || config?.llm || "").toLowerCase();
+  const postgresInfo = health?.databases?.postgresql;
+  const activeVectorInfo = activeVectorDb ? health?.vectordbs?.[activeVectorDb] : undefined;
+  const activeEmbedderInfo = activeEmbedder ? health?.embedders?.[activeEmbedder] : undefined;
+  const activeLlmInfo = activeLlm ? health?.llms?.[activeLlm] : undefined;
+  const trackedServices = [postgresInfo, activeVectorInfo, activeEmbedderInfo, activeLlmInfo].filter(Boolean) as ServiceInfo[];
+  const servicesOnline = trackedServices.filter((s) => s.status === "online").length;
+  const servicesTotal = trackedServices.length || 4;
 
   return (
     <div className="space-y-6">
@@ -406,16 +438,15 @@ export default function UnifiedDashboard() {
                   {/* Per-service rows */}
                   {(
                     [
-                      { key: "postgresql", category: "databases", label: "PostgreSQL" },
-                      { key: "qdrant", category: "vectordbs", label: "Qdrant" },
-                      { key: "chroma", category: "vectordbs", label: "ChromaDB" },
-                      { key: "ollama", category: "llms", label: "Ollama LLM" },
+                      { label: "PostgreSQL", info: postgresInfo },
+                      { label: `VectorDB (${(activeVectorDb || "n/a").toUpperCase()})`, info: activeVectorInfo },
+                      { label: `Embedder (${activeEmbedder || "n/a"})`, info: activeEmbedderInfo },
+                      { label: `LLM (${activeLlm || "n/a"})`, info: activeLlmInfo },
                     ] as const
                   ).map((svc) => {
-                    const cat = health[svc.category] as Record<string, ServiceInfo> | undefined;
-                    const info = cat?.[svc.key];
+                    const info = svc.info;
                     return (
-                      <div key={svc.key} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
+                      <div key={svc.label} className="flex items-center justify-between py-2 border-b border-slate-100 last:border-0">
                         <span className="text-sm text-slate-600">{svc.label}</span>
                         <div className="flex items-center gap-2">
                           <span className="text-xs text-slate-400 max-w-[140px] truncate">{info?.message ?? "—"}</span>
@@ -563,15 +594,55 @@ export default function UnifiedDashboard() {
               </div>
             </div>
             <ConfigRow label="PostgreSQL" value={config.db_url} icon={Database} />
-            <ConfigRow label="Qdrant Host" value={`${config.qdrant_host}:${config.qdrant_port}`} icon={Server} />
-            {config.chroma_host ? (
+            {config.vectordb === "qdrant" && (
               <>
-                <ConfigRow label="ChromaDB Mode" value="Remote (HttpClient)" icon={Wifi} />
-                <ConfigRow label="ChromaDB Host" value={`${config.chroma_host}:${config.chroma_port}`} icon={Server} />
-                <ConfigRow label="ChromaDB SSL" value={config.chroma_ssl === "true" ? "Enabled" : "Disabled"} icon={HardDrive} />
+                <ConfigRow label="Active VectorDB" value="qdrant" icon={Database} />
+                <ConfigRow label="Qdrant Host" value={`${config.qdrant_host}:${config.qdrant_port}`} icon={Server} />
+                {config.qdrant_url && <ConfigRow label="Qdrant URL" value={config.qdrant_url} icon={Wifi} />}
               </>
-            ) : (
-              <ConfigRow label="ChromaDB Path" value={config.chroma_path} icon={HardDrive} />
+            )}
+            {config.vectordb === "chroma" && (
+              <>
+                <ConfigRow label="Active VectorDB" value="chroma" icon={Database} />
+                {config.chroma_host ? (
+                  <>
+                    <ConfigRow label="ChromaDB Mode" value="Remote (HttpClient)" icon={Wifi} />
+                    <ConfigRow label="ChromaDB Host" value={`${config.chroma_host}:${config.chroma_port}`} icon={Server} />
+                    <ConfigRow label="ChromaDB SSL" value={config.chroma_ssl === "true" ? "Enabled" : "Disabled"} icon={HardDrive} />
+                  </>
+                ) : (
+                  <ConfigRow label="ChromaDB Path" value={config.chroma_path} icon={HardDrive} />
+                )}
+              </>
+            )}
+            {config.vectordb === "milvus" && (
+              <>
+                <ConfigRow label="Active VectorDB" value="milvus" icon={Database} />
+                <ConfigRow label="Milvus Host" value={`${config.milvus_host}:${config.milvus_port}`} icon={Server} />
+              </>
+            )}
+            {config.vectordb === "weaviate" && (
+              <>
+                <ConfigRow label="Active VectorDB" value="weaviate" icon={Database} />
+                <ConfigRow label="Weaviate URL" value={config.weaviate_url} icon={Wifi} />
+              </>
+            )}
+            {config.vectordb === "pinecone" && (
+              <>
+                <ConfigRow label="Active VectorDB" value="pinecone" icon={Database} />
+                <ConfigRow label="Pinecone Mode" value={config.pinecone_mode} icon={Server} />
+                <ConfigRow label="Pinecone Index" value={config.pinecone_index} icon={HardDrive} />
+                <ConfigRow label="Pinecone Region" value={config.pinecone_region} icon={Server} />
+                {config.pinecone_mode === "local" && (
+                  <ConfigRow label="Pinecone Local Path" value={config.pinecone_local_path} icon={HardDrive} />
+                )}
+              </>
+            )}
+            {config.vectordb === "redis" && (
+              <>
+                <ConfigRow label="Active VectorDB" value="redis" icon={Database} />
+                <ConfigRow label="Redis Endpoint" value={config.redis_url || `${config.redis_host}:${config.redis_port}`} icon={Server} />
+              </>
             )}
           </div>
 
@@ -586,9 +657,21 @@ export default function UnifiedDashboard() {
                 <p className="text-xs text-slate-400">Embedding & LLM configuration</p>
               </div>
             </div>
-            <ConfigRow label="HuggingFace Embed" value={config.hf_model} icon={Brain} />
-            <ConfigRow label="Ollama Base URL" value={config.ollama_base} icon={Server} />
-            <ConfigRow label="Ollama LLM Model" value={config.ollama_model} icon={Zap} />
+            {config.embedder === "huggingface" && <ConfigRow label="HuggingFace Embed" value={config.hf_model} icon={Brain} />}
+            {config.embedder === "ollama" && <ConfigRow label="Ollama Embed Server" value={config.ollama_base} icon={Server} />}
+            {config.embedder === "openai" && <ConfigRow label="OpenAI Embed Model" value={config.openai_embed_model} icon={Brain} />}
+            {config.embedder === "cohere" && <ConfigRow label="Cohere Embed Model" value={config.cohere_embed_model} icon={Brain} />}
+
+            {config.llm === "ollama" && (
+              <>
+                <ConfigRow label="Ollama LLM URL" value={config.ollama_base} icon={Server} />
+                <ConfigRow label="Ollama LLM Model" value={config.ollama_model} icon={Zap} />
+              </>
+            )}
+            {config.llm === "openai" && <ConfigRow label="OpenAI LLM Model" value={config.openai_llm_model} icon={Zap} />}
+            {(config.llm === "grok" || config.llm === "groq") && <ConfigRow label="Groq LLM Model" value={config.groq_llm_model} icon={Zap} />}
+            {config.llm === "anthropic" && <ConfigRow label="Anthropic Model" value={config.anthropic_llm_model} icon={Zap} />}
+            {config.llm === "gemini" && <ConfigRow label="Gemini Model" value={config.gemini_llm_model} icon={Zap} />}
           </div>
 
           {/* Scheduler Section */}

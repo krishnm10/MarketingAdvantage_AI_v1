@@ -21,7 +21,8 @@ class PineconeVectorDB(BaseVectorDB):
     def __init__(
         self,
         *,
-        api_key: str,
+        mode: str = "cloud",
+        api_key: Optional[str] = None,
         index_name: str,
         namespace: str = "default",
         embedding_dim: int,
@@ -29,13 +30,16 @@ class PineconeVectorDB(BaseVectorDB):
         cloud: str = "aws",
         region: str = "us-east-1",
         pod_type: Optional[str] = None,
+        local_path: Optional[str] = None,
     ):
+        self._mode = (mode or "cloud").strip().lower()
         try:
             from pinecone import Pinecone
         except ImportError:
-            raise ImportError(
-                "Pinecone client not installed. Run: pip install pinecone-client>=3.0.0"
-            )
+            if self._mode != "local":
+                raise ImportError(
+                    "Pinecone client not installed. Run: pip install pinecone-client>=3.0.0"
+                )
 
         self._index_name   = index_name
         self._namespace    = namespace
@@ -44,13 +48,31 @@ class PineconeVectorDB(BaseVectorDB):
         self._cloud        = cloud
         self._region       = region
         self._pod_type     = pod_type
-        self._pc           = Pinecone(api_key=api_key)
+        self._local_path   = local_path or "./pinecone_local_db"
+        self._local_vdb    = None
+        self._pc           = None
         self._index        = None
 
-        logger.info(
-            "[PineconeVectorDB] Initialized | index=%s | namespace=%s | dim=%d",
-            index_name, namespace, embedding_dim,
-        )
+        if self._mode == "local":
+            from app.core.vectordb.chroma_v1 import ChromaVectorDB
+            self._local_vdb = ChromaVectorDB(
+                persist_directory=self._local_path,
+                anonymized_telemetry=False,
+            )
+            logger.info(
+                "[PineconeVectorDB] Initialized LOCAL-EMULATION | path=%s | namespace=%s | dim=%d",
+                self._local_path, namespace, embedding_dim,
+            )
+        else:
+            if not api_key:
+                raise ValueError(
+                    "Pinecone cloud mode requires PINECONE_API_KEY."
+                )
+            self._pc = Pinecone(api_key=api_key)
+            logger.info(
+                "[PineconeVectorDB] Initialized CLOUD | index=%s | namespace=%s | dim=%d",
+                index_name, namespace, embedding_dim,
+            )
 
     # ── Identity ──────────────────────────────────────────────────────
 
@@ -61,6 +83,8 @@ class PineconeVectorDB(BaseVectorDB):
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     def health_check(self) -> bool:
+        if self._local_vdb is not None:
+            return self._local_vdb.health_check()
         try:
             self._get_index().describe_index_stats()
             return True
@@ -80,6 +104,14 @@ class PineconeVectorDB(BaseVectorDB):
         Creates the index if it doesn't exist.
         Serverless creation takes ~30-60s — we poll until ready.
         """
+        if self._local_vdb is not None:
+            self._local_vdb.ensure_collection(
+                collection=collection,
+                embedding_dim=embedding_dim,
+                distance_metric=distance_metric,
+            )
+            return
+
         existing = {idx.name for idx in self._pc.list_indexes()}
         if self._index_name in existing:
             logger.debug(
@@ -125,6 +157,9 @@ class PineconeVectorDB(BaseVectorDB):
         )
 
     def delete_collection(self, collection: str) -> None:
+        if self._local_vdb is not None:
+            self._local_vdb.delete_collection(collection)
+            return
         try:
             self._pc.delete_index(self._index_name)
             self._index = None
@@ -143,6 +178,15 @@ class PineconeVectorDB(BaseVectorDB):
         text: str,
         metadata: Dict[str, Any],
     ) -> None:
+        if self._local_vdb is not None:
+            self._local_vdb.upsert(
+                collection=collection,
+                doc_id=doc_id,
+                embedding=embedding,
+                text=text,
+                metadata=metadata,
+            )
+            return
         payload = dict(metadata or {})
         payload["_text"] = text
         self._get_index().upsert(
@@ -165,6 +209,14 @@ class PineconeVectorDB(BaseVectorDB):
         """
         if not doc_ids:
             return BatchUpsertResult()
+        if self._local_vdb is not None:
+            return self._local_vdb.batch_upsert(
+                collection=collection,
+                doc_ids=doc_ids,
+                embeddings=embeddings,
+                texts=texts,
+                metadatas=metadatas,
+            )
 
         PINECONE_BATCH = 100
         total_upserted = 0
@@ -207,6 +259,13 @@ class PineconeVectorDB(BaseVectorDB):
         top_k: int = 10,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        if self._local_vdb is not None:
+            return self._local_vdb.search(
+                collection=collection,
+                query_embedding=query_embedding,
+                top_k=top_k,
+                filters=filters,
+            )
         pinecone_filter = None
         if filters:
             pinecone_filter = {
@@ -239,6 +298,8 @@ class PineconeVectorDB(BaseVectorDB):
         """
         if not ids:
             return []
+        if self._local_vdb is not None:
+            return self._local_vdb.exists(collection=collection, ids=ids)
         try:
             # Pinecone fetch is limited to 1000 IDs per call
             FETCH_BATCH = 1000
@@ -258,6 +319,8 @@ class PineconeVectorDB(BaseVectorDB):
     def get_by_ids(self, *, collection: str, ids: List[str]) -> List[VectorHit]:
         if not ids:
             return []
+        if self._local_vdb is not None:
+            return self._local_vdb.get_by_ids(collection=collection, ids=ids)
         try:
             res = self._get_index().fetch(
                 ids=ids,
@@ -279,6 +342,8 @@ class PineconeVectorDB(BaseVectorDB):
             return []
 
     def count(self, collection: str) -> int:
+        if self._local_vdb is not None:
+            return self._local_vdb.count(collection)
         try:
             stats = self._get_index().describe_index_stats()
             ns_stats = stats.get("namespaces", {}).get(self._namespace, {})
@@ -290,11 +355,16 @@ class PineconeVectorDB(BaseVectorDB):
     # ── Delete ────────────────────────────────────────────────────────
 
     def delete(self, *, collection: str, doc_id: str) -> None:
+        if self._local_vdb is not None:
+            self._local_vdb.delete(collection=collection, doc_id=doc_id)
+            return
         self._get_index().delete(ids=[doc_id], namespace=self._namespace)
 
     def delete_many(self, *, collection: str, doc_ids: List[str]) -> int:
         if not doc_ids:
             return 0
+        if self._local_vdb is not None:
+            return self._local_vdb.delete_many(collection=collection, doc_ids=doc_ids)
         try:
             self._get_index().delete(ids=doc_ids, namespace=self._namespace)
             return len(doc_ids)
@@ -305,6 +375,8 @@ class PineconeVectorDB(BaseVectorDB):
     # ── Internal helpers ──────────────────────────────────────────────
 
     def _get_index(self):
+        if self._pc is None:
+            raise RuntimeError("[PineconeVectorDB] Pinecone client is not initialized.")
         if self._index is None:
             self._index = self._pc.Index(self._index_name)
         return self._index

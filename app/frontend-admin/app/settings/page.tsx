@@ -113,10 +113,12 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-teal-500 to-teal-700 shadow-teal-600/20",
     keys: [
+      { key: "PINECONE_MODE", label: "Mode", type: "select", options: ["cloud", "local"] },
       { key: "PINECONE_API_KEY", label: "API Key", sensitive: true },
       { key: "PINECONE_INDEX_NAME", label: "Index Name" },
       { key: "PINECONE_CLOUD", label: "Cloud", type: "select", options: ["aws", "gcp", "azure"] },
       { key: "PINECONE_REGION", label: "Region" },
+      { key: "PINECONE_LOCAL_PATH", label: "Local Path", placeholder: "./pinecone_local_db" },
     ],
   },
   {

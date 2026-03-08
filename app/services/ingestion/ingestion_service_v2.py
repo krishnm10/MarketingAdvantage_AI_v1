@@ -186,27 +186,40 @@ def _build_config_from_env(
         )
     elif vectordb_type == "qdrant":
         from app.core.config.client_config_schema import QdrantConfig
+        qdrant_api_key_env = "QDRANT_API_KEY" if os.getenv("QDRANT_API_KEY") else None
         vdb_cfg = VectorDBConfig(
             type=VectorDBType.QDRANT,
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             qdrant=QdrantConfig(
-                url=os.getenv("QDRANT_URL", "http://localhost:6333"),
-                api_key_env="QDRANT_API_KEY",
+                url=os.getenv("QDRANT_URL") or None,
+                api_key_env=qdrant_api_key_env,
+                host=os.getenv("QDRANT_HOST", "localhost"),
+                port=int(os.getenv("QDRANT_PORT", "6333")),
+                prefer_grpc=os.getenv("QDRANT_PREFER_GRPC", "false").lower() in ("1", "true", "yes"),
+                timeout=float(os.getenv("QDRANT_TIMEOUT", "30")),
             ),
         )
     elif vectordb_type == "pinecone":
         from app.core.config.client_config_schema import PineconeConfig
+        pinecone_mode = os.getenv("PINECONE_MODE", "cloud").strip().lower()
+        pinecone_api_key_env = (
+            "PINECONE_API_KEY"
+            if pinecone_mode != "local" and os.getenv("PINECONE_API_KEY")
+            else None
+        )
         vdb_cfg = VectorDBConfig(
             type=VectorDBType.PINECONE,
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             pinecone=PineconeConfig(
-                api_key_env="PINECONE_API_KEY",
+                mode="local" if pinecone_mode == "local" else "cloud",
+                api_key_env=pinecone_api_key_env,
                 index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
                 namespace=os.getenv("PINECONE_NAMESPACE", "default"),
                 embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
                 metric=os.getenv("PINECONE_METRIC", "cosine"),
                 cloud=os.getenv("PINECONE_CLOUD", "aws"),
                 region=os.getenv("PINECONE_REGION", "us-east-1"),
+                local_path=os.getenv("PINECONE_LOCAL_PATH") or None,
             ),
         )
     elif vectordb_type == "milvus":
