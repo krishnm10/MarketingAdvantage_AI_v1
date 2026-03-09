@@ -19,9 +19,6 @@
 #   ✅ /health now includes pipeline registry status
 #   ✅ Syntax fix: SchedulerConfig closing parenthesis
 #   ✅ allow_credentials=True added to CORS
-#   ✅ PHANTOM Protocol Phase 0 — hardware profiler + config bridge (Step 5)
-#   ✅ /health now includes phantom hardware section
-#   ✅ GET /phantom/stats endpoint (PHANTOM runtime diagnostics)
 # =============================================================================
 
 import asyncio
@@ -33,6 +30,10 @@ from typing import List
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+# ─────────────────────────────────────────────────────────────────────────────
+# PHANTOM Protocol — Phase 0 (NEW)
+# ─────────────────────────────────────────────────────────────────────────────
+from app.services.ingestion.phantom_config_bridge import phantom_startup   # NEW
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging — replace all print() with structured logger
@@ -62,7 +63,7 @@ from app.api.v2.retrieve_api            import router as retrieve_router
 # ─────────────────────────────────────────────────────────────────────────────
 # New Pluggable RAG Router (NEW — additive only)
 # ─────────────────────────────────────────────────────────────────────────────
-from app.api.v2.rag_api import router as rag_router
+from app.api.v2.rag_api import router as rag_router          # NEW
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Existing Services (ALL PRESERVED)
@@ -79,22 +80,12 @@ from app.services.validation.scheduler import (
 # ─────────────────────────────────────────────────────────────────────────────
 # New Pluggable Pipeline Factory (NEW — auto-registers all plugins on import)
 # ─────────────────────────────────────────────────────────────────────────────
-from app.core.pipeline_factory import pipeline_factory
-from app.core.plugin_registry import (
+from app.core.pipeline_factory import pipeline_factory       # NEW
+from app.core.plugin_registry import (                       # NEW
     vectordb_registry,
     embedder_registry,
     llm_registry,
     reranker_registry,
-)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PHANTOM Protocol — Phase 0 (NEW)
-# Detects AMD ROCm / CUDA / CPU at startup and computes all PHANTOM tuning
-# parameters. Non-fatal — if this import fails, the app still starts normally.
-# ─────────────────────────────────────────────────────────────────────────────
-from app.services.ingestion.phantom_config_bridge import (
-    phantom_startup,
-    phantom_cfg,
 )
 
 
@@ -112,12 +103,11 @@ async def lifespan(app: FastAPI):
       Step 1: ChromaDB initialization        (existing — preserved)
       Step 2: File watcher                   (existing — preserved)
       Step 3: Validation scheduler           (existing — preserved)
-      Step 4: Pluggable pipeline registry    (existing — preserved)
-      Step 5: PHANTOM hardware profiler      (NEW — Phase 0)
+      Step 4: Pluggable pipeline registry    (NEW — additive)
 
     Shutdown:
       - Stop validation scheduler gracefully (existing — preserved)
-      - Clear all pipeline caches            (existing — preserved)
+      - Clear all pipeline caches            (NEW)
     """
     logger.info("=" * 70)
     logger.info("🚀 Marketing Advantage AI v2 — Starting Up...")
@@ -200,7 +190,8 @@ async def lifespan(app: FastAPI):
         logger.info("💡 Retrieval works, but trust scores won't auto-update")
 
     # ─────────────────────────────────────────────────────────────────
-    # STEP 4: Initialize Pluggable Pipeline Registry (EXISTING — preserved)
+    # STEP 4: Initialize Pluggable Pipeline Registry (NEW — additive)
+    # ─────────────────────────────────────────────────────────────────
     # pipeline_factory import above already triggered all register.py
     # auto-registrations (vectordb, embedders, llms, rerankers).
     # This step just logs what's available so ops can verify on startup.
@@ -225,40 +216,6 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  Pluggable RAG unavailable — existing Chroma RAG still works")
 
     # ─────────────────────────────────────────────────────────────────
-    # STEP 5: PHANTOM Hardware Profiler (NEW — Phase 0)
-    #
-    # Probes the host hardware (AMD ROCm → CUDA → CPU fallback) and
-    # computes all PHANTOM tuning parameters:
-    #   - embed_batch_size  (replaces hardcoded BATCH_SIZE=256)
-    #   - upsert_batch_size (replaces hardcoded VectorDB loop)
-    #   - ingest_workers    (parallel file ingestion)
-    #   - io_thread_pool    (run_in_executor pool size)
-    #   - bloom_capacity    (Phase 2 Bloom gate)
-    #   - gravity params    (Phase 3 clustering)
-    #   - stage_collapse    (Phase 5 kernel concurrency)
-    #
-    # Non-fatal — if detection fails, PHANTOM uses conservative CPU
-    # defaults and the rest of the app continues normally.
-    # ─────────────────────────────────────────────────────────────────
-    logger.info("\n[Startup] STEP 5: PHANTOM Hardware Profiler...")
-    try:
-        phantom_startup(verbose=True)
-        logger.info("✅ PHANTOM config bridge ready:")
-        logger.info("   • Tier          : %s", phantom_cfg.tier)
-        logger.info("   • GPU           : %s (%.1f GB VRAM)", phantom_cfg.gpu_name, phantom_cfg.gpu_vram_gb)
-        logger.info("   • RAM           : %.1f GB", phantom_cfg.system_ram_gb)
-        logger.info("   • embed_batch   : %d", phantom_cfg.embed_batch_size)
-        logger.info("   • upsert_batch  : %d", phantom_cfg.upsert_batch_size)
-        logger.info("   • ingest_workers: %d", phantom_cfg.ingest_workers)
-        logger.info("   • io_thread_pool: %d", phantom_cfg.io_thread_pool)
-        logger.info("   • bloom_capacity: %s", f"{phantom_cfg.bloom_capacity:,}")
-        logger.info("   • Stats         : GET /phantom/stats")
-
-    except Exception as e:
-        logger.error("❌ PHANTOM Profiler Failed: %s", e)
-        logger.warning("⚠️  PHANTOM will use safe CPU defaults — ingestion still works")
-
-    # ─────────────────────────────────────────────────────────────────
     # STARTUP COMPLETE
     # ─────────────────────────────────────────────────────────────────
     logger.info("\n" + "=" * 70)
@@ -271,18 +228,15 @@ async def lifespan(app: FastAPI):
     logger.info("   GET /health                       → Full system health")
     logger.info("   GET /health/scheduler             → Scheduler status")
     logger.info("   GET /health/scheduler/metrics     → Worker metrics")
-    logger.info("   GET /health/plugins               → Plugin registry status")
+    logger.info("   GET /health/plugins               → Plugin registry status (NEW)")
     logger.info("")
     logger.info("📦 Data endpoints:")
     logger.info("   GET /api/v2/stats/chromadb        → Vector DB stats")
     logger.info("")
-    logger.info("🔍 RAG endpoints (pluggable):")
+    logger.info("🔍 RAG endpoints (NEW — pluggable):")
     logger.info("   POST /api/v2/rag/query            → Dynamic RAG query")
     logger.info("   POST /api/v2/rag/pipeline/build   → Build client pipeline")
     logger.info("   GET  /api/v2/rag/pipeline/health  → Per-client health")
-    logger.info("")
-    logger.info("⚡ PHANTOM endpoints (Phase 0):")
-    logger.info("   GET  /phantom/stats               → Hardware profile + tuning params")
     logger.info("=" * 70 + "\n")
 
     yield  # ═══════════════════ App runs here ═══════════════════════
@@ -302,7 +256,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("❌ Error stopping scheduler: %s", e)
 
-    # Clear pipeline caches (EXISTING — preserved)
+    # Clear pipeline caches (NEW)
     try:
         logger.info("[Shutdown] Clearing pipeline caches...")
         pipeline_factory.invalidate_all()
@@ -348,7 +302,7 @@ _cors_origins: List[str] = (
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_credentials=True,        # ← FIX: was missing in original
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -359,7 +313,10 @@ app.add_middleware(
 # =============================================================================
 
 # ── Existing routers (ALL PRESERVED — prefixes/tags unchanged) ──────────────
-app.include_router(ingestion_router,           tags=["Ingestion v2"])
+app.include_router(
+    ingestion_router,
+    tags=["Ingestion v2"],
+)
 app.include_router(ingestion_admin_router,     tags=["Admin"])
 app.include_router(ingestion_sync_router,      tags=["Sync"])
 app.include_router(ingestion_integrity_router, tags=["Integrity"])
@@ -370,7 +327,7 @@ app.include_router(ingestion_ws_router,        tags=["WebSocket"])
 app.include_router(config_router,              tags=["Configuration"])
 app.include_router(retrieve_router,            tags=["Retrieval"])
 
-# ── New pluggable RAG router (EXISTING — preserved) ─────────────────────────
+# ── New pluggable RAG router (NEW — additive, own prefix) ───────────────────
 app.include_router(
     rag_router,
     prefix="/api/v2/rag",
@@ -392,24 +349,22 @@ async def index():
         "message": "All systems operational ✅",
         "endpoints": {
             # Existing
-            "health":               "/health",
-            "scheduler_health":     "/health/scheduler",
-            "scheduler_metrics":    "/health/scheduler/metrics",
-            "chromadb_stats":       "/api/v2/stats/chromadb",
-            "docs":                 "/docs",
-            # Existing (pluggable)
-            "plugin_registry":      "/health/plugins",
-            "rag_query":            "/api/v2/rag/query",
-            "rag_pipeline_build":   "/api/v2/rag/pipeline/build",
-            "rag_pipeline_health":  "/api/v2/rag/pipeline/health",
-            # PHANTOM Phase 0
-            "phantom_stats":        "/phantom/stats",
+            "health":             "/health",
+            "scheduler_health":   "/health/scheduler",
+            "scheduler_metrics":  "/health/scheduler/metrics",
+            "chromadb_stats":     "/api/v2/stats/chromadb",
+            "docs":               "/docs",
+            # New
+            "plugin_registry":    "/health/plugins",
+            "rag_query":          "/api/v2/rag/query",
+            "rag_pipeline_build": "/api/v2/rag/pipeline/build",
+            "rag_pipeline_health":"/api/v2/rag/pipeline/health",
         },
     }
 
 
 # =============================================================================
-# HEALTH ENDPOINT (enhanced — adds plugin registry + PHANTOM sections)
+# HEALTH ENDPOINT (enhanced — adds plugin registry section)
 # =============================================================================
 
 @app.get("/health", tags=["System"])
@@ -421,9 +376,8 @@ async def health_check():
     - Server status
     - ChromaDB status (cached vector count)      [EXISTING]
     - Validation scheduler status                [EXISTING]
-    - Plugin registry status                     [EXISTING]
+    - Plugin registry status                     [NEW]
     - File watcher status                        [EXISTING]
-    - PHANTOM hardware profile summary           [NEW — Phase 0]
     """
     health_status = {
         "status":    "operational",
@@ -443,18 +397,14 @@ async def health_check():
             "workers_active": 0,
         },
         "file_watcher": "active",
+
+        # ── New section ───────────────────────────────────────────────
         "plugin_registry": {
             "status":    "unknown",
             "vectordbs": [],
             "embedders": [],
             "llms":      [],
             "rerankers": [],
-        },
-
-        # ── PHANTOM section (NEW — Phase 0) ──────────────────────────
-        "phantom": {
-            "status": "unknown",
-            "tier":   None,
         },
     }
 
@@ -506,46 +456,24 @@ async def health_check():
     except Exception as e:
         health_status["validation_scheduler"]["status"] = f"error: {str(e)[:100]}"
 
-    # ── Plugin registry check (EXISTING — preserved) ─────────────────
+    # ── Plugin registry check (NEW — additive) ───────────────────────
     try:
         health_status["plugin_registry"] = {
-            "status":           "operational",
-            "vectordbs":        list(vectordb_registry.list().keys()),
-            "embedders":        list(embedder_registry.list().keys()),
-            "llms":             list(llm_registry.list().keys()),
-            "rerankers":        list(reranker_registry.list().keys()),
+            "status":    "operational",
+            "vectordbs": list(vectordb_registry.list().keys()),
+            "embedders": list(embedder_registry.list().keys()),
+            "llms":      list(llm_registry.list().keys()),
+            "rerankers": list(reranker_registry.list().keys()),
             "cached_pipelines": pipeline_factory.list_cached(),
         }
     except Exception as e:
         health_status["plugin_registry"]["status"] = f"error: {str(e)[:100]}"
 
-    # ── PHANTOM check (NEW — Phase 0) ────────────────────────────────
-    try:
-        if phantom_cfg._initialized:
-            health_status["phantom"] = {
-                "status":        "operational",
-                "tier":          phantom_cfg.tier,
-                "gpu":           phantom_cfg.gpu_name,
-                "gpu_vram_gb":   phantom_cfg.gpu_vram_gb,
-                "ram_gb":        phantom_cfg.system_ram_gb,
-                "embed_batch":   phantom_cfg.embed_batch_size,
-                "upsert_batch":  phantom_cfg.upsert_batch_size,
-                "workers":       phantom_cfg.ingest_workers,
-                "is_rocm":       phantom_cfg.is_rocm,
-            }
-        else:
-            health_status["phantom"] = {
-                "status": "not_initialized",
-                "note":   "phantom_startup() did not run — check STEP 5 startup logs",
-            }
-    except Exception as e:
-        health_status["phantom"]["status"] = f"error: {str(e)[:100]}"
-
     return health_status
 
 
 # =============================================================================
-# PLUGIN REGISTRY HEALTH ENDPOINT (EXISTING — preserved exactly)
+# NEW: Plugin registry health endpoint
 # =============================================================================
 
 @app.get("/health/plugins", tags=["System"])
@@ -623,7 +551,7 @@ async def scheduler_metrics():
             "success_rate_percent": round(success_rate, 2),
         },
         "health": {
-            "all_healthy":       len(unhealthy) == 0,
+            "all_healthy":      len(unhealthy) == 0,
             "unhealthy_workers": unhealthy,
         },
         "uptime_seconds": status["scheduler"]["uptime_seconds"],
@@ -694,75 +622,3 @@ async def chromadb_stats(refresh: bool = False):
             "error":   str(e),
             "message": "Failed to retrieve ChromaDB statistics",
         }
-
-
-# =============================================================================
-# PHANTOM STATS ENDPOINT (NEW — Phase 0)
-# =============================================================================
-
-@app.get("/phantom/stats", tags=["PHANTOM"])
-async def phantom_stats():
-    """
-    PHANTOM Protocol runtime diagnostics.
-
-    Returns the full hardware profile and all computed tuning parameters.
-    Use this to verify that:
-      - AMD ROCm was detected correctly (tier = "amd_rocm")
-      - embed_batch_size and upsert_batch_size match your VRAM
-      - All Phase 0–5 parameters are populated
-
-    If tier shows "cpu_mid" instead of "amd_rocm", ROCm is not visible
-    to Python — check your torch/ROCm installation.
-    """
-    if not phantom_cfg._initialized:
-        return {
-            "status": "not_initialized",
-            "note":   (
-                "phantom_startup() did not run at startup. "
-                "Check STEP 5 in your startup logs for the error. "
-                "Add phantom_startup() to your FastAPI lifespan if missing."
-            ),
-        }
-
-    return {
-        "status":    "operational",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "hardware": {
-            "tier":         phantom_cfg.tier,
-            "gpu_name":     phantom_cfg.gpu_name,
-            "gpu_vram_gb":  phantom_cfg.gpu_vram_gb,
-            "system_ram_gb": phantom_cfg.system_ram_gb,
-            "cpu_cores":    phantom_cfg.cpu_cores,
-            "is_rocm":      phantom_cfg.is_rocm,
-            "is_gpu":       phantom_cfg.is_gpu,
-        },
-        "tuning": {
-            "phase_1": {
-                "embed_batch_size":   phantom_cfg.embed_batch_size,
-                "embed_prefetch":     phantom_cfg.embed_prefetch,
-                "upsert_batch_size":  phantom_cfg.upsert_batch_size,
-                "upsert_concurrency": phantom_cfg.upsert_concurrency,
-                "ingest_workers":     phantom_cfg.ingest_workers,
-                "parse_workers":      phantom_cfg.parse_workers,
-                "io_thread_pool":     phantom_cfg.io_thread_pool,
-            },
-            "phase_2": {
-                "bloom_capacity":   phantom_cfg.bloom_capacity,
-                "bloom_error_rate": phantom_cfg.bloom_error_rate,
-                "l2_dedup_batch":   phantom_cfg.l2_dedup_batch,
-            },
-            "phase_3": {
-                "gravity_clusters":  phantom_cfg.gravity_clusters,
-                "gravity_batch_size": phantom_cfg.gravity_batch_size,
-            },
-            "phase_5": {
-                "stage_collapse_concurrency": phantom_cfg.stage_collapse_concurrency,
-            },
-        },
-        "env_overrides": {
-            "PHANTOM_EMBED_BATCH_SIZE":  os.getenv("PHANTOM_EMBED_BATCH_SIZE", "not set"),
-            "PHANTOM_UPSERT_BATCH_SIZE": os.getenv("PHANTOM_UPSERT_BATCH_SIZE", "not set"),
-            "PHANTOM_INGEST_WORKERS":    os.getenv("PHANTOM_INGEST_WORKERS", "not set"),
-            "PHANTOM_BLOOM_CAPACITY":    os.getenv("PHANTOM_BLOOM_CAPACITY", "not set"),
-        },
-    }

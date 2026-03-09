@@ -2,7 +2,7 @@ import chromadb
 
 CHROMA_PATH = "./chroma_db"
 client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection = client.get_collection("ingested_content")
+collection = client.get_collection("ingested_content_local")
 
 print("Total records:", collection.count())
 

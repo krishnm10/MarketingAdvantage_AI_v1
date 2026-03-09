@@ -5,7 +5,7 @@ from chromadb.config import Settings
 
 DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:Mahadeva%40123@localhost/marketing_advantage")
 CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "ingested_content")
+COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "ingested_content_local")
 
 LIMIT = 200   # how many recent GCI rows to inspect
 BATCH = 32

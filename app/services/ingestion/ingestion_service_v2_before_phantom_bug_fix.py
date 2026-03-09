@@ -28,7 +28,6 @@ from app.services.ingestion.segmenter_v2 import recursive_semantic_chunk
 from app.services.ingestion.deduplication_engine_v2 import (
     deduplicate_chunks,
     create_normalized_hash,
-    register_unique_chunks_in_gci,   # ← NEW: post-dedup GCI commit
 )
 from app.utils.logger import log_info
 
@@ -830,11 +829,8 @@ class IngestionServiceV2:
         file_record: IngestedFileV2,
         parsed_payload: Dict[str, Any],
     ):
-        # ── PHANTOM BUG-3 FIX ──────────────────────────────────────────────────
-        # _ensure_file_entry() was called here AND in every caller of _run_pipeline()
-        # (both process_file() and ingest_parsed_output() call it before this).
-        # Removed the duplicate call — saves 1 SELECT + conditional INSERT per file.
-        # ────────────────────────────────────────────────────────────────────────
+        await IngestionServiceV2._ensure_file_entry(db, file_record)
+
         file_id     = file_record.id
         business_id = file_record.business_id
         file_type   = file_record.file_type
@@ -863,37 +859,8 @@ class IngestionServiceV2:
             return
 
         unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
-            db, chunks, file_id, business_id,
-            collection_name=pipeline.config.vectordb.collection,  # ── PHANTOM BUG-2: per-client name
+            db, chunks, file_id, business_id
         )
-
-        # ═══════════════════════════════════════════════════════════
-        # ENTERPRISE DEDUP COMMIT — Register unique chunks in GCI
-        # ═══════════════════════════════════════════════════════════
-        # Called AFTER 3-layer dedup confirms uniqueness.
-        # This is the ONLY place GlobalContentIndexV2 is written to.
-        #
-        # WHY HERE (not in segmenter):
-        #   Segmenter (recursive_semantic_chunk) can be called multiple
-        #   times per file — once per page group, once per image, etc.
-        #   Writing to GCI during segmentation caused boundary chunks to
-        #   get occurrence_count=2 before dedup ran, producing 50% false
-        #   duplicate rates on first ingestion of any multi-page document.
-        #
-        #   Now: GCI is only written once per unique chunk, only after
-        #   full 3-layer dedup, only for confirmed-unique content.
-        #   batch_check_gci() in the dedup engine reads GCI in a single
-        #   IN query — any hit is definitively from a prior ingestion.
-        # ═══════════════════════════════════════════════════════════
-        if unique_chunks:
-            await register_unique_chunks_in_gci(
-                db=db,
-                unique_chunks=unique_chunks,
-                file_id=str(file_id),
-                business_id=business_id,
-                source_type=file_type,
-                embedding_model=embedding_model,
-            )
 
         # ═══════════════════════════════════════════════════════════
         # Store ALL chunks in ingested_content (unique + duplicates)
@@ -910,33 +877,9 @@ class IngestionServiceV2:
         for chunk in chunks:
             semantic_hash = chunk.get("semantic_hash")
             if semantic_hash not in unique_hashes:
-                chunk["is_duplicate"] = True
-
-                # ── duplicate_of: ONLY store a valid GCI UUID ─────────────────────
-                # The duplicate_of column is UUID type in PostgreSQL.
-                # NEVER store a SHA-256 hash (64-char hex) there — that would
-                # violate the UUID column type constraint.
-                #
-                # Layer-by-layer source of a valid UUID:
-                #   L2 GCI dups  → gci_id (GCI entry UUID, set by batch_check_gci)
-                #                  or global_content_id (same UUID, set on chunk)
-                #   L3 vector    → NO UUID available; leave as None.
-                #                  similarity_score satisfies the OR constraint.
-                #   L1 intra-batch → NO UUID; leave as None.
-                #                  _insert_chunks will set similarity_score=1.0
-                #                  as the fallback to satisfy the constraint.
-                # ─────────────────────────────────────────────────────────────────
-                gci_uuid = chunk.get("global_content_id") or chunk.get("gci_id")
-                chunk["duplicate_of"] = gci_uuid  # UUID or None — never a hash
-
-                # ── similarity_score: use what the dedup engine set ────────────────
-                # L3 vector dups: dedup engine sets "similarity_score" = float (e.g. 1.0)
-                # L2 GCI dups:    similarity_score stays None (duplicate_of is set)
-                # L1 intra-batch: similarity_score stays None → _insert_chunks
-                #                 fallback sets it to 1.0 to satisfy constraint
-                # ─────────────────────────────────────────────────────────────────
-                chunk["similarity_score"] = chunk.get("similarity_score")
-
+                chunk["is_duplicate"]    = True
+                chunk["duplicate_of"]    = chunk.get("global_content_id")
+                chunk["similarity_score"] = chunk.get("similarity", None)
                 all_chunks_for_storage.append(chunk)
 
         if all_chunks_for_storage:
@@ -949,28 +892,19 @@ class IngestionServiceV2:
                 f"{len(all_chunks_for_storage) - len(unique_chunks)} duplicates"
             )
 
-        # ── PHANTOM BUG-5 FIX ──────────────────────────────────────────────────
-        # Was: chunks_with_hash = [c for c in chunks if c.get("semantic_hash")]
-        # chunks = the FULL list before dedup, including L1/L2/L3 duplicates.
-        # Every duplicate forced a GCI lookup + VectorDB exists() check in
-        # _embed_and_store — wasted N network calls for already-known duplicates.
-        #
-        # Fix: pass unique_chunks only. Duplicates are already stored in
-        # ingested_content above with is_duplicate=True — they never need embedding.
-        # ────────────────────────────────────────────────────────────────────────
-        chunks_to_embed = [c for c in unique_chunks if c.get("semantic_hash")]
-        if chunks_to_embed:
+        # Only embed unique hashes (skip already-stored duplicates)
+        chunks_with_hash = [c for c in chunks if c.get("semantic_hash")]
+        if chunks_with_hash:
             log_info(
                 f"[IngestionV2] Calling _embed_and_store for {file_id} "
-                f"with {len(chunks_to_embed)} unique chunks "
-                f"(skipped {len(chunks) - len(chunks_to_embed)} duplicates)"
+                f"with {len(chunks_with_hash)} chunks"
             )
             await IngestionServiceV2._embed_and_store(
-                file_id, business_id, file_type, chunks_to_embed
+                file_id, business_id, file_type, chunks_with_hash
             )
         else:
             log_info(
-                f"[IngestionV2] No unique chunks with semantic_hash — "
+                f"[IngestionV2] No chunks with semantic_hash — "
                 f"skipping VectorDB embed for {file_id}"
             )
 
@@ -1178,7 +1112,6 @@ class IngestionServiceV2:
         chunks: List[Dict[str, Any]],
         file_id: str,
         business_id: Optional[str] = None,
-        collection_name: str = None,   # ── PHANTOM BUG-2 FIX: per-client collection name
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """3-layer deduplication with cross-file duplicate detection."""
         if not chunks:
@@ -1191,13 +1124,12 @@ class IngestionServiceV2:
         unique_chunks, stats = await deduplicate_chunks(
             db=db,
             chunks=chunks,
-            vectordb=pipeline.vectordb,
-            embedder=pipeline.embedder,
+            vectordb=pipeline.vectordb,       # BaseVectorDB ← pluggable
+            embedder=pipeline.embedder,        # BaseEmbedder ← pluggable
             file_id=file_id,
             business_id=business_id,
             enable_embedding_dedup=True,
             similarity_threshold=0.95,
-            collection_name=collection_name or pipeline.config.vectordb.collection,  # ── BUG-2
         )
 
         log_info(
@@ -1217,108 +1149,39 @@ class IngestionServiceV2:
     async def _insert_chunks(
         db: AsyncSession, file_id, business_id, chunks
     ):
-        """
-        Insert chunks into ingested_content using explicit text() SQL.
-
-        ROOT CAUSE OF PREVIOUS BUG:
-          insert(IngestedContentV2) uses the ORM mapper's column set.
-          Four columns were added to the physical DB via ALTER TABLE AFTER
-          the ORM model was written: business_id, global_content_id,
-          duplicate_of, similarity_score.
-          The ORM mapper does NOT know about them → SQLAlchemy silently
-          drops those dict keys → they default to NULL in the DB →
-          check_duplicate_consistency fires (is_duplicate=True but both
-          duplicate_of=NULL and similarity_score=NULL).
-
-        FIX:
-          Use sqlalchemy.text() with hardcoded column names.
-          text() bypasses ORM mapper column filtering entirely.
-          All 18 columns are explicitly named — no silent drops possible.
-          JSON fields serialized with json.dumps() + CAST(:x AS jsonb).
-          CONSTRAINT GUARANTEE: pre-insert check ensures is_duplicate=True
-          always has at least one of duplicate_of or similarity_score set.
-        """
-        import json as _json
-
         result = await db.execute(
             select(func.max(IngestedContentV2.chunk_index))
             .where(IngestedContentV2.file_id == file_id)
         )
         start_index = (result.scalar() or -1) + 1
 
-        # ── Explicit text() SQL — all 18 columns, no ORM mapper filtering ──
-        from sqlalchemy import text as sa_text
-        stmt = sa_text("""
-            INSERT INTO ingested_content (
-                id, file_id, business_id, chunk_index,
-                text, cleaned_text, tokens, source_type,
-                meta_data, confidence, semantic_hash, global_content_id,
-                reasoning_ingestion, is_duplicate, duplicate_of,
-                similarity_score, created_at, updated_at
-            ) VALUES (
-                :id, :file_id, :business_id, :chunk_index,
-                :text, :cleaned_text, :tokens, :source_type,
-                CAST(:meta_data AS jsonb), :confidence, :semantic_hash,
-                :global_content_id,
-                CAST(:reasoning_ingestion AS jsonb), :is_duplicate,
-                :duplicate_of, :similarity_score, :created_at, :updated_at
-            )
-        """)
-
-        now = datetime.utcnow()
-
-        for i, c in enumerate(chunks):
-            is_dup   = bool(c.get("is_duplicate", False))
-            dup_of   = c.get("duplicate_of")    # GCI UUID for L2 matches
-            sim_scr  = c.get("similarity_score") # float for L3 vector matches
-
-            # ── CONSTRAINT GUARANTEE (belt-and-suspenders) ─────────────────
-            # check_duplicate_consistency:
-            #   is_duplicate=TRUE → duplicate_of IS NOT NULL
-            #                        OR similarity_score IS NOT NULL
-            #
-            # Layer mapping:
-            #   L1 intra-batch dups: duplicate_of=None, similarity_score=1.0
-            #   L2 GCI dups:         duplicate_of=gci_uuid, similarity_score=None
-            #   L3 vector sim dups:  duplicate_of=None, similarity_score=score
-            #
-            # NOTE: duplicate_of is a UUID column — NEVER store a SHA-256 hash
-            # there. For L3 vector dups, similarity_score alone satisfies the
-            # constraint. duplicate_of stays None (NULL).
-            # ─────────────────────────────────────────────────────────────────
-            if is_dup and dup_of is None and sim_scr is None:
-                # Final safety net — should not happen if dedup engine is correct
-                log_info(
-                    f"[IngestionV2] WARN: is_duplicate=True with no reference "
-                    f"for chunk {i} — setting similarity_score=1.0 as fallback"
-                )
-                sim_scr = 1.0
-
-            reasoning = c.get("reasoning_ingestion")
-            row = {
-                "id":                str(uuid.uuid4()),
-                "file_id":           str(file_id),
-                "business_id":       str(business_id) if business_id else None,
-                "chunk_index":       start_index + i,
-                "text":              c.get("text"),
-                "cleaned_text":      c.get("cleaned_text") or c.get("cleaned"),
-                "tokens":            c.get("tokens"),
-                "source_type":       c.get("source_type"),
-                "meta_data":         _json.dumps(c.get("metadata") or {}),
-                "confidence":        float(c.get("confidence") or 1.0),
-                "semantic_hash":     c.get("semantic_hash"),
-                "global_content_id": c.get("global_content_id"),  # UUID or None
-                "reasoning_ingestion": _json.dumps(reasoning) if reasoning else _json.dumps({}),
-                "is_duplicate":      is_dup,
-                "duplicate_of":      str(dup_of) if dup_of else None,  # UUID string or None
-                "similarity_score":  float(sim_scr) if sim_scr is not None else None,
-                "created_at":        now,
-                "updated_at":        now,
+        db_rows = [
+            {
+                "id":                  uuid.uuid4(),
+                "file_id":             file_id,
+                "business_id":         business_id,
+                "chunk_index":         start_index + i,
+                "text":                c.get("text"),
+                "cleaned_text":        c.get("cleaned_text", c.get("cleaned")),
+                "tokens":              c.get("tokens"),
+                "source_type":         c.get("source_type"),
+                "meta_data":           c.get("metadata", {}),
+                "confidence":          c.get("confidence", 1.0),
+                "semantic_hash":       c.get("semantic_hash"),
+                "global_content_id":   c.get("global_content_id"),
+                "reasoning_ingestion": c.get("reasoning_ingestion"),
+                "is_duplicate":        c.get("is_duplicate", False),
+                "duplicate_of":        c.get("duplicate_of"),
+                "similarity_score":    c.get("similarity_score"),
+                "created_at":          datetime.utcnow(),
+                "updated_at":          datetime.utcnow(),
             }
-            await db.execute(stmt, row)
+            for i, c in enumerate(chunks)
+        ]
 
+        await db.execute(insert(IngestedContentV2), db_rows)
         await db.commit()
-        log_info(f"[IngestionV2] Inserted {len(chunks)} chunks into DB")
+        log_info(f"[IngestionV2] Inserted {len(db_rows)} chunks into DB")
     # ----------------------------------------------------------
     # Embedding + Vector Store (executor-offloaded, DB-dedup-safe)
     # ----------------------------------------------------------

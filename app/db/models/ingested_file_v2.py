@@ -69,7 +69,7 @@ class IngestedFileV2(Base):
         String(50),
         default="pending",
         nullable=False,
-        doc="Ingestion state: pending, processing, processed, error, archived",
+        doc="Ingestion state: pending | processing | uploaded | processed | duplicate | failed | error | archived",
     )
 
     error_message = Column(String(512), nullable=True)
@@ -82,7 +82,23 @@ class IngestedFileV2(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'processing', 'processed', 'error', 'archived')",
+            # ── PHANTOM BUG-1 FIX ────────────────────────────────────────────────────
+            # Previous constraint ONLY had: pending, processing, processed, error, archived
+            # ingestion_service_v2.py actually writes: 'uploaded', 'duplicate', 'failed'
+            # → every file ingestion caused a PostgreSQL CheckConstraint violation.
+            #
+            # Run this migration on existing DB before deploying:
+            #   ALTER TABLE ingested_file DROP CONSTRAINT check_ingested_file_v2_status;
+            #   ALTER TABLE ingested_file ADD CONSTRAINT check_ingested_file_v2_status
+            #     CHECK (status IN (
+            #       'pending','processing','uploaded','processed',
+            #       'duplicate','failed','error','archived'
+            #     ));
+            # ─────────────────────────────────────────────────────────────────────────
+            "status IN ("
+            "'pending', 'processing', 'uploaded', 'processed', "
+            "'duplicate', 'failed', 'error', 'archived'"
+            ")",
             name="check_ingested_file_v2_status",
         ),
         UniqueConstraint(
