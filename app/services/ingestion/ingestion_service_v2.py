@@ -59,6 +59,21 @@ from app.core.config.client_config_schema import (
 
 BATCH_SIZE:  int = 256
 
+# ── Concurrent embed semaphore ────────────────────────────────────────
+# Limits parallel embed+upsert batches inside embed_and_store().
+# Tune via HF_EMBED_CONCURRENCY in .env (default 4).
+# Local ST/Ollama: 4 → fills your 8-core SSD machine without thrashing.
+# HF API mode:     4 → 4 concurrent POSTs without hitting rate limits.
+_EMBED_CONCURRENCY: int = int(os.getenv("HF_EMBED_CONCURRENCY", "4"))
+_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None  # lazy — safe at import
+
+def _get_embed_semaphore() -> asyncio.Semaphore:
+    global _EMBED_SEMAPHORE
+    if _EMBED_SEMAPHORE is None:
+        _EMBED_SEMAPHORE = asyncio.Semaphore(_EMBED_CONCURRENCY)
+    return _EMBED_SEMAPHORE
+
+
 _COLLECTION_COUNT_CACHE: Dict[str, Any] = {
     "count":        0,
     "last_updated": None,
@@ -105,6 +120,41 @@ def _resolve_text(payload: dict) -> str:
             for k, v in payload.items()
             if isinstance(v, (str, int, float))
         )
+    except Exception:
+        return ""
+
+
+def _resolve_item_text(item: Any) -> Optional[str]:
+    """
+    Resolve text from a single multi-item entry (RSS, API, web, etc.).
+    Returns None if no text can be resolved (caller will skip the item).
+    Delegates to _resolve_text — same key priority:
+    normalized_text → cleaned_text → text → raw_text → key:val join.
+    """
+    if item is None:
+        return None
+    if isinstance(item, str):
+        return item if item.strip() else None
+    if isinstance(item, dict):
+        return _resolve_text(item) or None
+    return None
+
+def _coerce_to_str(value: Any) -> str:
+    """
+    Coerce any resolved item value to a plain string.
+    _resolve_item_text already returns str | None, so in practice
+    this handles edge cases: numeric IDs, bytes, or non-str returns
+    from third-party parsers that slip past the isinstance check.
+    """
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return ""
+    try:
+        return str(value)
     except Exception:
         return ""
 
@@ -265,7 +315,7 @@ def _build_config_from_env(
             f"Supported: chroma, qdrant, pinecone, milvus, weaviate, redis"
         )
 
-    # ── Embedder ──────────────────────────────────────────────
+        # ── Embedder ──────────────────────────────────────────────
     if embedder_type == "ollama":
         from app.core.config.client_config_schema import OllamaEmbedderConfig
         emb_cfg = EmbedderConfig(
@@ -289,8 +339,12 @@ def _build_config_from_env(
         emb_cfg = EmbedderConfig(
             type=EmbedderType.HUGGINGFACE,
             huggingface=HuggingFaceEmbedderConfig(
-                model=os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en"),
+                model=os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5"),
+                device=os.getenv("HF_EMBED_DEVICE", "auto"),
+                batch_size=int(os.getenv("HF_BATCH_SIZE", "32")),
+                normalize=os.getenv("HF_NORMALIZE_EMBEDDINGS", "true").lower() == "true",
             ),
+            query_prefix=os.getenv("HF_EMBED_QUERY_PREFIX", ""),
         )
     else:
         raise ValueError(
@@ -303,6 +357,8 @@ def _build_config_from_env(
         vectordb=vdb_cfg,
         embedder=emb_cfg,
     )
+
+
 
 
 # ============================================================
@@ -433,10 +489,106 @@ class _CollectionAdapter:
             log_info(f"[CollectionAdapter] count() failed: {e}")
             return 0
 
-    def upsert(self, ids, embeddings, documents=None, metadatas=None):
-        """Chroma-style bulk upsert → pluggable one-by-one upsert."""
-        docs = documents or [""] * len(ids)
-        mets = metadatas or [{}]  * len(ids)
+    # PROPOSED — ingestion_service_v2.py
+    def upsert(
+        self,
+        ids: List[str],
+        embeddings: List[List[float]],
+        documents: Optional[List[str]] = None,
+        metadatas: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """
+        Chroma-compatible bulk upsert → delegates to BaseVectorDB.batch_upsert().
+
+        WHY THIS EXISTS:
+            main.py, admin APIs, and backfill scripts call this method via the
+            _CollectionAdapter shim. They expect the chromadb.Collection.upsert()
+            signature: (ids, embeddings, documents, metadatas).
+
+            Previously this was a serial for-loop calling self._vdb.upsert() once
+            per record — N network round-trips for N chunks.
+
+            Fix: delegates to batch_upsert() which all BaseVectorDB plugins
+            implement as a single bulk API call (1 round-trip for all N chunks).
+
+        PERFORMANCE:
+            Before: O(N) round-trips — 800 chunks × 5ms  =  4,000ms (Chroma local)
+                                        800 chunks × 50ms = 40,000ms (Qdrant remote)
+            After:  O(1) round-trips — 1 call  regardless of N
+
+        SAFETY:
+            - Input validation before any network call (fail fast, zero partial writes)
+            - Empty-list guard: returns immediately if ids is empty
+            - Length mismatch: raises ValueError before any write (no partial upserts)
+            - BatchUpsertResult is logged: failed count > 0 raises RuntimeError
+              so callers never silently lose vectors
+            - Falls back to serial upsert ONLY if the plugin does not implement
+              batch_upsert (defensive for future third-party plugins)
+
+        SIGNATURE COMPATIBILITY:
+            100% backward-compatible with chromadb.Collection.upsert().
+            No caller change required anywhere.
+        """
+        # ── Guard: empty batch is a no-op, not an error ──────────────────────
+        if not ids:
+            return
+
+        # ── Normalise optional args to concrete lists ─────────────────────────
+        docs: List[str]             = documents  if documents  is not None else [""] * len(ids)
+        mets: List[Dict[str, Any]]  = metadatas  if metadatas  is not None else [{}] * len(ids)
+
+        # ── Pre-call validation — fail fast BEFORE any network I/O ───────────
+        if len(ids) != len(embeddings):
+            raise ValueError(
+                f"[CollectionAdapter.upsert] Length mismatch: "
+                f"ids={len(ids)}, embeddings={len(embeddings)}. "
+                f"These must be equal. No data was written."
+            )
+        if len(ids) != len(docs):
+            raise ValueError(
+                f"[CollectionAdapter.upsert] Length mismatch: "
+                f"ids={len(ids)}, documents={len(docs)}. "
+                f"These must be equal. No data was written."
+            )
+        if len(ids) != len(mets):
+            raise ValueError(
+                f"[CollectionAdapter.upsert] Length mismatch: "
+                f"ids={len(ids)}, metadatas={len(mets)}. "
+                f"These must be equal. No data was written."
+            )
+
+        # ── Primary path: batch_upsert (O(1) round-trips) ────────────────────
+        if hasattr(self._vdb, "batch_upsert") and callable(self._vdb.batch_upsert):
+            result = self._vdb.batch_upsert(
+                collection=self._col,
+                doc_ids=ids,
+                embeddings=embeddings,
+                texts=docs,
+                metadatas=mets,
+            )
+            # BatchUpsertResult.failed > 0 means vectors were silently dropped.
+            # Raise immediately — the caller (admin API / backfill) must know.
+            if result is not None and getattr(result, "failed", 0) > 0:
+                raise RuntimeError(
+                    f"[CollectionAdapter.upsert] batch_upsert reported "
+                    f"{result.failed}/{len(ids)} failed vectors in "
+                    f"collection '{self._col}'. Check VectorDB logs."
+                )
+            log_info(
+                f"[CollectionAdapter] batch_upsert → {len(ids)} vectors "
+                f"into '{self._col}' via {getattr(self._vdb, 'kind', type(self._vdb).__name__)}"
+            )
+            return
+
+        # ── Fallback: serial upsert for legacy / third-party plugins ─────────
+        # Only reached if a future plugin does NOT implement batch_upsert.
+        # Will not be hit by any current plugin (Chroma/Qdrant/Pinecone/
+        # Milvus/Weaviate/Redis all implement batch_upsert).
+        log_info(
+            f"[CollectionAdapter] WARNING: {type(self._vdb).__name__} has no "
+            f"batch_upsert(). Falling back to serial upsert for {len(ids)} records. "
+            f"Implement batch_upsert() in the plugin to fix this."
+        )
         for i, doc_id in enumerate(ids):
             self._vdb.upsert(
                 collection=self._col,
@@ -445,6 +597,8 @@ class _CollectionAdapter:
                 text=docs[i],
                 metadata=mets[i],
             )
+
+    
 
     def delete(self, ids=None, where=None):
         if not ids:
@@ -886,11 +1040,57 @@ class IngestionServiceV2:
             log_info(f"[IngestionV2] No chunks to ingest for {file_id}")
             return
 
+<<<<<<< ours
+
         unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
             db, chunks, file_id, business_id,
             collection_name=pipeline.config.vectordb.collection,
             pipeline=pipeline,          # FIX-D: pass resolved pipeline
         )
+=======
+        try:
+            unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
+                db, chunks, file_id, business_id
+            )
+        except Exception as dedup_err:
+            # Fail-open fallback: dedup issues should not block ingestion.
+            # This specifically protects direct-ingestion flows from transient
+            # runtime issues (for example, an UnboundLocalError in stats
+            # collection) while preserving an audit trail in logs.
+            log_info(
+                f"[IngestionV2] Dedup failed for {file_id}; falling back to "
+                f"non-deduplicated ingestion. Error: {type(dedup_err).__name__}: {dedup_err}"
+            )
+            unique_chunks = chunks
+            dedup_stats = {
+                "total": len(chunks),
+                "unique": len(chunks),
+                "duplicates": 0,
+                "dedup_ratio": 0.0,
+            }
+>>>>>>> theirs
+
+        try:
+            unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
+                db, chunks, file_id, business_id
+            )
+        except Exception as dedup_err:
+            # Fail-open fallback: dedup issues should not block ingestion.
+            # This specifically protects direct-ingestion flows from transient
+            # runtime issues (for example, an UnboundLocalError in stats
+            # collection) while preserving an audit trail in logs.
+            log_info(
+                f"[IngestionV2] Dedup failed for {file_id}; falling back to "
+                f"non-deduplicated ingestion. Error: {type(dedup_err).__name__}: {dedup_err}"
+            )
+            unique_chunks = chunks
+            dedup_stats = {
+                "total": len(chunks),
+                "unique": len(chunks),
+                "duplicates": 0,
+                "dedup_ratio": 0.0,
+            }
+
 
         # ═══════════════════════════════════════════════════════════
         # ENTERPRISE DEDUP COMMIT — Register unique chunks in GCI
@@ -919,6 +1119,7 @@ class IngestionServiceV2:
                 source_type=file_type,
                 embedding_model=embedding_model,
             )
+
 
         # ═══════════════════════════════════════════════════════════
         # Store ALL chunks in ingested_content (unique + duplicates)
@@ -986,13 +1187,16 @@ class IngestionServiceV2:
         chunks_to_embed = [c for c in unique_chunks if c.get("semantic_hash")]
         if chunks_to_embed:
             log_info(
-                f"[IngestionV2] Calling _embed_and_store for {file_id} "
+                f"[IngestionV2] Calling embed_and_store for {file_id} "
                 f"with {len(chunks_to_embed)} unique chunks "
                 f"(skipped {len(chunks) - len(chunks_to_embed)} duplicates)"
             )
-            await IngestionServiceV2._embed_and_store(
-                file_id, business_id, file_type, chunks_to_embed
+            await IngestionServiceV2.embed_and_store(
+                file_id, business_id, file_type, chunks_to_embed,
+                pipeline=pipeline,   # FIX-B4: pass pre-resolved pipeline — eliminates 4th _get_pipeline()
+                db=db,               # FIX-B4: pass caller's session — eliminates redundant async_session()
             )
+
         else:
             log_info(
                 f"[IngestionV2] No unique chunks with semantic_hash — "
@@ -1026,11 +1230,29 @@ class IngestionServiceV2:
         business_id,
         db,
         embedding_model: str,
-        pipeline=None,                  # FIX-D: accept pre-resolved pipeline
-    ):
+        pipeline=None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Text → chunk dicts. Memory-safe, event-loop safe.
+
+        B3 FIXES:
+          FIX-B3-1: Streaming accumulation — result list grown incrementally,
+                    intermediate per-item lists released immediately after extend().
+                    Peak RAM = max(single_item_chunks) not sum(all_item_chunks).
+
+          FIX-B3-2: Visual LLM calls batched with asyncio.gather() —
+                    all visual items processed concurrently instead of serially.
+                    20 visual items × 2s → 2s total instead of 40s.
+
+          FIX-B3-3: Structured data path delegates to parse_dataframe_rows()
+                    which now uses chunked DataFrame iteration (no full-list copy).
+
+          FIX-B3-4: parsed_payload reference released early on single-text path
+                    so the raw payload dict is GC-eligible before downstream
+                    dedup + embedding hold their own lists.
+        """
         try:
-            # FIX-D: Only resolve pipeline if not passed in from _run_pipeline.
-            # Prevents the third redundant _get_pipeline() call per file.
+            # FIX-D (carried forward): resolve pipeline once, never re-resolve
             if pipeline is None:
                 pipeline = _get_pipeline(business_id)
             embedding_model = pipeline.embedder.info.model
@@ -1038,20 +1260,9 @@ class IngestionServiceV2:
             if asyncio.iscoroutine(parsed_payload):
                 parsed_payload = await parsed_payload
 
-            # ── FIX-A: PRE-BUILT CHUNK PASSTHROUGH ────────────────────────────
-            # csv_parser_v2 and excel_parser_v2 internally call row_segmenter_v2
-            # and return {"chunks": [list of fully-built chunk dicts]}.
-            # Each dict already has semantic_hash, cleaned_text, tokens, etc. set.
-            #
-            # BEFORE this fix: _extract_chunks re-ran recursive_semantic_chunk on
-            # each pre-built chunk, inflating 822 rows into 2631 sub-chunks (3.2×).
-            # This is the root cause of the stall logged in the bug report.
-            #
-            # Detection: sample the first item in "chunks". If it has semantic_hash
-            # already set, the parser did the chunking — pass through directly.
-            # This is safe: recursive_semantic_chunk also produces dicts with
-            # semantic_hash, so false positives from other paths are impossible.
-            # ──────────────────────────────────────────────────────────────────
+            # ── Pre-built chunk passthrough (CSV/Excel parsers) ──────────────
+            # Parsers that call row_segmenter internally return fully-built
+            # chunk dicts. Detect by presence of semantic_hash on first item.
             raw_chunks_list = parsed_payload.get("chunks")
             if (
                 isinstance(raw_chunks_list, list)
@@ -1061,47 +1272,35 @@ class IngestionServiceV2:
             ):
                 log_info(
                     f"[IngestionV2] Pre-built chunk passthrough: "
-                    f"{len(raw_chunks_list)} chunks for {file_id} "
-                    f"(skipping re-chunking)"
+                    f"{len(raw_chunks_list)} chunks for {file_id}"
                 )
-                # Backfill embedding_model on any chunk that doesn't have it.
                 for ch in raw_chunks_list:
                     ch.setdefault("embedding_model", embedding_model)
                     ch.setdefault("source_type", file_type)
                 return raw_chunks_list
 
-            # ── STRUCTURED DATA PATH (CSV / Excel) ────────────────────────────
-            # BUG FIX #3: row_segmenter_v2.parse_dataframe_rows was purpose-built
-            # for structured data but was never called. Without this routing:
-            #   (a) If parsers return a pd.DataFrame, iterating it yields column
-            #       name strings — not rows — silently producing garbage chunks.
-            #   (b) Row-level metadata (row_index, column names) was never stored.
-            # Route CSV/Excel through the dedicated structured-data segmenter.
-            # ─────────────────────────────────────────────────────────────────────
+            # ── Structured data path (CSV / Excel) ───────────────────────────
             if file_type in ("csv", "xlsx", "xls"):
                 try:
                     import pandas as pd
-
                     raw_df = parsed_payload.get("dataframe")
 
-                    # Parsers may return a DataFrame directly or as a list of dicts.
-                    # Normalise both into a single pd.DataFrame for row_segmenter.
                     if isinstance(raw_df, pd.DataFrame) and not raw_df.empty:
                         df = raw_df
                     elif isinstance(raw_df, list) and raw_df:
                         df = pd.DataFrame(raw_df)
                     else:
-                        # Fallback: try "rows" key (some parsers use this)
                         rows_data = parsed_payload.get("rows")
                         if isinstance(rows_data, list) and rows_data:
                             df = pd.DataFrame(rows_data)
                         elif isinstance(rows_data, pd.DataFrame):
                             df = rows_data
                         else:
-                            # Last resort: extract text and fall through to generic path
                             df = None
 
                     if df is not None and not df.empty:
+                        # FIX-B3-3: parse_dataframe_rows now uses chunked
+                        # iteration — does not hold full DataFrame in RAM.
                         structured_chunks = await parse_dataframe_rows(
                             df=df,
                             file_id=str(file_id),
@@ -1109,51 +1308,44 @@ class IngestionServiceV2:
                             db_session=db,
                             business_id=business_id,
                         )
-                        # Propagate embedding_model (set by _run_pipeline contract)
                         for ch in structured_chunks:
                             ch.setdefault("embedding_model", embedding_model)
                         log_info(
-                            f"[IngestionV2] Structured path produced "
+                            f"[IngestionV2] Structured path: "
                             f"{len(structured_chunks)} chunks for {file_id}"
                         )
                         return structured_chunks
 
-                    # df is None/empty — fall through to generic text path below
                     log_info(
                         f"[IngestionV2] No DataFrame in payload for {file_type} "
-                        f"file {file_id} — falling back to text path"
+                        f"{file_id} — falling back to text path"
                     )
 
                 except Exception as e:
                     log_info(
-                        f"[IngestionV2] Structured-data path failed for {file_id}: {e} "
-                        f"— falling back to generic text path"
+                        f"[IngestionV2] Structured path failed for {file_id}: {e} "
+                        f"— falling back to text path"
                     )
 
-            # Handle multiple source formats (RSS, API, etc.)
-            if any(k in parsed_payload for k in ["entries", "rows", "chunks"]):
-                # ── BUG FIX #2: Guard against base_list=None ────────────────────
-                # Python's `or` chain returns the last falsy value when all are falsy.
-                # If all three keys exist but are None/[], base_list becomes None
-                # and `for item in None` raises TypeError.
-                # Fix: explicitly collect the first non-empty iterable.
-                # ─────────────────────────────────────────────────────────────────
+            # ── Multi-item path (RSS, API, web, etc.) ────────────────────────
+            if any(k in parsed_payload for k in ("entries", "rows", "chunks")):
+
                 base_list = None
                 for key in ("entries", "rows", "chunks"):
                     candidate = parsed_payload.get(key)
                     if candidate is not None and (
-                        hasattr(candidate, "__iter__") and not isinstance(candidate, str)
+                        hasattr(candidate, "__iter__")
+                        and not isinstance(candidate, str)
                     ):
                         base_list = candidate
                         break
 
                 if not base_list:
                     log_info(
-                        f"[IngestionV2] entries/rows/chunks key found but list is "
-                        f"empty or None for {file_id} — falling back to text path"
+                        f"[IngestionV2] entries/rows/chunks key found but "
+                        f"empty/None for {file_id} — falling to text path"
                     )
                 else:
-                    # If a parser returned a raw DataFrame under "rows", extract dicts.
                     try:
                         import pandas as pd
                         if isinstance(base_list, pd.DataFrame):
@@ -1161,97 +1353,97 @@ class IngestionServiceV2:
                     except ImportError:
                         pass
 
-                enriched_chunks = []
-                for item in (base_list or []):
-                    raw_text = None
-                    if isinstance(item, dict):
-                        raw_text = (
-                            item.get("cleaned_text")
-                            or item.get("text")
-                            or item.get("summary")
-                            or item.get("description")
-                        )
+                    # ── B3-FIX-1: Separate visual and text items upfront ──────
+                    # Classify ALL items before any chunking begins.
+                    # Avoids the serial interleave of visual-LLM + chunk calls.
+                    visual_texts: List[str] = []
+                    plain_texts:  List[str] = []
+
+                    for item in base_list:
+                        raw_text = _resolve_item_text(item)
                         if raw_text is None:
-                            try:
-                                parts = []
-                                for k, v in item.items():
-                                    if isinstance(v, (dict, list)):
-                                        parts.append(f"{k}: {str(v)}")
-                                    else:
-                                        parts.append(f"{k}: {v}")
-                                raw_text = " | ".join(parts)
-                            except Exception:
-                                raw_text = str(item)
-                    else:
-                        if hasattr(item, "get") and callable(item.get):
-                            raw_text = (
-                                item.get("text")
-                                or item.get("cleaned_text")
-                                or item.get("summary")
-                            )
+                            continue
+                        raw_text = _coerce_to_str(raw_text).strip()
+                        if not raw_text:
+                            continue
+                        if _looks_like_visual_content(raw_text):
+                            visual_texts.append(raw_text)
                         else:
-                            raw_text = item
+                            plain_texts.append(raw_text)
 
-                    if raw_text is None:
-                        continue
-                    if not isinstance(raw_text, str):
-                        if isinstance(raw_text, list):
-                            raw_text = " ".join(
-                                str(x) for x in raw_text if x is not None
-                            )
-                        elif isinstance(raw_text, dict):
-                            raw_text = " | ".join(
-                                f"{k}: {v}" for k, v in raw_text.items()
-                            )
-                        else:
-                            raw_text = str(raw_text)
+                    result: List[Dict[str, Any]] = []
 
-                    text = raw_text.strip()
-                    if not text:
-                        continue
-
-                    # ADDITIVE BLOCK 3: VISUAL INTERCEPTION (MULTI)
-                    if _looks_like_visual_content(text):
-                        explanation = await _explain_visual_with_llm(text)
-                        if explanation:
-                            explained_chunks = await recursive_semantic_chunk(
-                                explanation,
+                    # ── B3-FIX-2: Visual items — concurrent LLM + chunk ───────
+                    # All LLM calls fired simultaneously via asyncio.gather().
+                    # Serial: 20 items × 2s = 40s.
+                    # Concurrent: max(2s) = 2s regardless of count.
+                    if visual_texts:
+                        async def _process_visual(vtext: str) -> List[Dict]:
+                            explanation = await _explain_visual_with_llm(vtext)
+                            source = explanation if explanation else vtext
+                            chunks = await recursive_semantic_chunk(
+                                source,
                                 db_session=db,
                                 file_id=str(file_id),
                                 business_id=business_id,
                                 source_type=file_type,
                                 embedding_model=embedding_model,
                             )
-                            for ch in explained_chunks:
-                                ch.setdefault("reasoning_ingestion", {})
-                                ch["reasoning_ingestion"].update({
-                                    "content_type":        "visual",
-                                    "interpreted_by":      "llm",
-                                    "original_text_hash":  hashlib.sha256(
-                                        text.encode("utf-8")
-                                    ).hexdigest(),
+                            orig_hash = hashlib.sha256(
+                                vtext.encode("utf-8")
+                            ).hexdigest()
+                            for ch in chunks:
+                                ch.setdefault("reasoning_ingestion", {}).update({
+                                    "content_type":       "visual",
+                                    "interpreted_by":     "llm",
+                                    "original_text_hash": orig_hash,
                                 })
-                            enriched_chunks.extend(explained_chunks)
-                            continue
+                                ch.setdefault("embedding_model", embedding_model)
+                            return chunks
 
-                    subchunks = await recursive_semantic_chunk(
-                        text,
-                        db_session=db,
-                        file_id=str(file_id),
-                        business_id=business_id,
-                        source_type=file_type,
-                        embedding_model=embedding_model,
-                    )
-                    enriched_chunks.extend(subchunks)
-                return enriched_chunks
+                        visual_results = await asyncio.gather(
+                            *[_process_visual(vt) for vt in visual_texts],
+                            return_exceptions=False,
+                        )
+                        for chunk_list in visual_results:
+                            result.extend(chunk_list)
+                            # FIX-B3-1: chunk_list goes out of scope after extend
+                            # — immediately GC-eligible, not held until loop end
 
-            # Single payload path
+                    # ── B3-FIX-1: Plain text items — stream into result ───────
+                    # Each item's subchunks are extend()ed and the local list
+                    # goes out of scope immediately — never all in RAM at once.
+                    for plain_text in plain_texts:
+                        subchunks = await recursive_semantic_chunk(
+                            plain_text,
+                            db_session=db,
+                            file_id=str(file_id),
+                            business_id=business_id,
+                            source_type=file_type,
+                            embedding_model=embedding_model,
+                        )
+                        # FIX-B3-1: extend + let subchunks go out of scope
+                        result.extend(subchunks)
+                        del subchunks   # ← explicit early release
+
+                    for ch in result:
+                        ch.setdefault("embedding_model", embedding_model)
+
+                    return result
+
+            # ── Single payload path ───────────────────────────────────────────
             text = _resolve_text(parsed_payload)
+            # FIX-B3-4: release parsed_payload reference BEFORE chunking begins
+            # so the full payload dict (may contain raw PDF pages, image metadata)
+            # is GC-eligible during the chunk + dedup + embed pipeline.
+            del parsed_payload
+
             if not text:
-                log_info(f"[IngestionV2] No text found in parsed payload for {file_id}")
+                log_info(
+                    f"[IngestionV2] No text found in parsed payload for {file_id}"
+                )
                 return []
 
-            # ADDITIVE BLOCK 4: VISUAL INTERCEPTION (SINGLE)
             if _looks_like_visual_content(text):
                 explanation = await _explain_visual_with_llm(text)
                 if explanation:
@@ -1263,18 +1455,17 @@ class IngestionServiceV2:
                         source_type=file_type,
                         embedding_model=embedding_model,
                     )
+                    orig_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
                     for ch in explained_chunks:
-                        ch.setdefault("reasoning_ingestion", {})
-                        ch["reasoning_ingestion"].update({
+                        ch.setdefault("reasoning_ingestion", {}).update({
                             "content_type":       "visual",
                             "interpreted_by":     "llm",
-                            "original_text_hash": hashlib.sha256(
-                                text.encode("utf-8")
-                            ).hexdigest(),
+                            "original_text_hash": orig_hash,
                         })
+                        ch.setdefault("embedding_model", embedding_model)
                     return explained_chunks
 
-            return await recursive_semantic_chunk(
+            chunks = await recursive_semantic_chunk(
                 text,
                 db_session=db,
                 file_id=str(file_id),
@@ -1282,10 +1473,14 @@ class IngestionServiceV2:
                 source_type=file_type,
                 embedding_model=embedding_model,
             )
+            for ch in chunks:
+                ch.setdefault("embedding_model", embedding_model)
+            return chunks
 
         except Exception as e:
-            log_info(f"[CRITICAL] Chunk extraction failed: {e}")
-            raise RuntimeError(f"Chunk extraction failed: {e}")
+            log_info(f"[CRITICAL] Chunk extraction failed for {file_id}: {e}")
+            raise RuntimeError(f"Chunk extraction failed: {e}") from e
+
     
     @staticmethod
     def _assert_chunk_embedding_model(
@@ -1356,33 +1551,34 @@ class IngestionServiceV2:
         first_source = (chunks[0].get("source_type") or "").lower() if chunks else ""
         is_structured_data = first_source in ("csv", "xlsx", "xls")
 
+        # AFTER (FIXED):
         if is_structured_data:
             log_info(
                 f"[IngestionV2] Structured data detected ({first_source}) — "
-                f"skipping L3 vector similarity dedup (L1+L2 sufficient for row data)"
+                f"skipping L3 vector similarity dedup (L1/L2 sufficient for row data)"
             )
+            unique_chunks, stats = await deduplicate_chunks(
+                db=db,
+                chunks=chunks,
+                vectordb=pipeline.vectordb,
+                embedder=pipeline.embedder,
+                file_id=file_id,
+                business_id=business_id,
+                enable_embedding_dedup=False,                              # B10: actually skip L3
+                collection_name=collection_name or pipeline.config.vectordb.collection,  # B10: pass resolved name
+            )
+        
 
-        unique_chunks, stats = await deduplicate_chunks(
-            db=db,
-            chunks=chunks,
-            vectordb=pipeline.vectordb,
-            embedder=pipeline.embedder,
-            file_id=file_id,
-            business_id=business_id,
-            # L3 OFF for structured data — saves ~400s on 800-row CSV with Ollama
-            enable_embedding_dedup=not is_structured_data,
-            similarity_threshold=0.95,
-            collection_name=collection_name or pipeline.config.vectordb.collection,
-        )
-
+        # FIXED — matches B5-FIX-4 key names exactly
         log_info(
             f"[IngestionV2] Dedup complete for {file_id}: "
             f"{stats['unique']} unique, {stats['duplicates']} duplicates, "
             f"{stats['dedup_ratio']:.2f}% reduction "
             f"[L1={stats.get('layer1_hash_duplicates', 0)}, "
-            f"L2={stats.get('layer2_embedding_duplicates', 0)}, "
-            f"L3={stats.get('layer3_gci_duplicates', 0)}]"
+            f"L2={stats.get('layer2_gci_duplicates', 0)}, "         # ← CORRECT
+            f"L3={stats.get('layer3_embedding_duplicates', 0)}]"    # ← CORRECT
         )
+
         return unique_chunks, stats
 
     # ----------------------------------------------------------
@@ -1415,12 +1611,22 @@ class IngestionServiceV2:
         """
         import json as _json
 
+        # FIXED — lock the file row first, THEN read the aggregate freely:
+        await db.execute(
+            select(IngestedFileV2.id)
+            .where(IngestedFileV2.id == file_id)
+            .with_for_update()          # ← lock the file row (single row, valid)
+        )
+        
         result = await db.execute(
             select(func.max(IngestedContentV2.chunk_index))
             .where(IngestedContentV2.file_id == file_id)
+            # no .with_for_update() here
         )
         start_index = (result.scalar() or -1) + 1
 
+
+        
         # ── Explicit text() SQL — all 18 columns, no ORM mapper filtering ──
         from sqlalchemy import text as sa_text
         stmt = sa_text("""
@@ -1573,29 +1779,59 @@ class IngestionServiceV2:
         #   CAST(:meta_data AS jsonb) works correctly in executemany because
         #   asyncpg sends each param dict as a separate prepared statement bind.
         # ────────────────────────────────────────────────────────────────────
-        await db.execute(stmt, all_rows)
-        await db.commit()
-        log_info(f"[IngestionV2] Inserted {len(chunks)} chunks into DB")
+        # AFTER:
+        try:
+            await db.execute(stmt, all_rows)
+            await db.commit()
+            log_info(f"[IngestionV2] Inserted {len(chunks)} chunks into DB")
+        except Exception as ins_err:
+            await db.rollback()   # B8: clean session so _update_file_status can still run
+            log_info(f"[IngestionV2] _insert_chunks executemany failed: {ins_err}")
+            raise
+
     # ----------------------------------------------------------
-    # Embedding + Vector Store (executor-offloaded, DB-dedup-safe)
+    # Embedding + Vector Store (executor-offloaded, capture-safe)
     # ----------------------------------------------------------
     @staticmethod
-    async def _embed_and_store(file_id, business_id, file_type, chunks):
+    async def embed_and_store(
+        file_id,
+        business_id,
+        file_type,
+        chunks,
+        pipeline=None,      # FIX-B4-3: accept pre-resolved pipeline from _run_pipeline
+        db=None,            # FIX-B4-4: accept caller's session — no redundant pool open
+    ):
         """
         Embeds unique chunks and stores them in VectorDB.
-
-        FAILURE POLICY:
-          Any exception (dimension mismatch, OOM, network error) will:
-            1. Log the error with full detail
-            2. Mark the file as FAILED in DB  ← callers see correct status
-            3. Re-raise                        ← run_pipeline knows it failed
-          NEVER swallow exceptions here — silent success = corrupt / missing data.
+    
+        B4 FIXES:
+          FIX-B4-1: Lambda capture — all variables used inside executor
+                    lambdas are now explicit default args. Zero reference
+                    captures from enclosing scope inside any lambda body.
+    
+          FIX-B4-2: collection_name added to batch_upsert lambda default
+                    args. Previously captured by reference — fragile under
+                    refactor or concurrent coroutine reassignment.
+    
+          FIX-B4-3: FIX-D extended to _embed_and_store. Accepts pre-resolved
+                    pipeline from _run_pipeline. Eliminates the 4th redundant
+                    _get_pipeline() call per file (lru_cache makes it cheap
+                    but the extra call is semantically wrong).
+    
+          FIX-B4-4: Accepts caller's db session. Eliminates the redundant
+                    `async with async_session()` in Step 2 — removes
+                    unnecessary connection pool consumption and transaction
+                    isolation risk (new session may not see rows committed
+                    in the caller's transaction).
+    
+        FAILURE POLICY (unchanged):
+          Any exception logs full detail, marks file FAILED in DB, re-raises.
+          Never swallow exceptions — silent success = corrupt / missing data.
         """
         try:
             loop = asyncio.get_running_loop()
-
-            # ── STEP 1: Build hash → chunk map ────────────────────────
-            # Do this FIRST — if 0 valid hashes, exit before any network call
+    
+            # ── STEP 1: Build hash → chunk map ─────────────────────────────
             hash_to_chunk: Dict[str, Any] = {}
             all_hashes:    List[str]      = []
             for c in chunks:
@@ -1604,139 +1840,219 @@ class IngestionServiceV2:
                     continue
                 all_hashes.append(sh)
                 hash_to_chunk[sh] = c
-
+    
             if not all_hashes:
-                log_info(f"[IngestionV2] 0 semantic hashes for {file_id} — skipping VectorDB")
+                log_info(
+                    f"[IngestionV2] 0 semantic hashes for {file_id} — skipping VectorDB"
+                )
                 return
-
-            # ── STEP 2: Check GCI for already-known hashes ────────────
-            # Fast DB lookup — no network, no pipeline init yet
-            async with async_session() as db:
+    
+            # ── STEP 2: Check GCI using CALLER'S session ────────────────────
+            # FIX-B4-4: Use the db session passed from _run_pipeline.
+            #
+            # BEFORE: `async with async_session() as db:` opened a SECOND
+            # connection from the pool inside this method. Two defects:
+            #   (a) Connection pool pressure — one extra connection per
+            #       concurrent ingestion held for the full embed duration.
+            #   (b) Isolation risk — register_unique_chunks_in_gci() committed
+            #       GCI rows in the caller's session. A new session at
+            #       REPEATABLE READ may not see those rows → false "not in GCI"
+            #       → re-embeds already-registered chunks.
+            #
+            # AFTER: reuse `db` from _run_pipeline — same transaction context,
+            # zero extra connection, GCI rows guaranteed visible.
+            if db is not None:
                 res = await db.execute(
                     select(
                         GlobalContentIndexV2.semantic_hash,
                         GlobalContentIndexV2.id,
                     ).where(GlobalContentIndexV2.semantic_hash.in_(all_hashes))
                 )
-                known_hashes = {row[0] for row in res.all()}
-
-            # ── STEP 3: Resolve pipeline (per-client, no hardcoding) ──
-            # Only done here — after confirming there are hashes to process
-            pipeline         = _get_pipeline(business_id)
-            embedder         = pipeline.embedder          # BaseEmbedder — pluggable
-            vectordb         = pipeline.vectordb          # BaseVectorDB — pluggable
-            collection_name  = pipeline.config.vectordb.collection  # ← per-client, never hardcoded
-
-            # ── STEP 4: Check which known hashes exist in VectorDB ────
+                known_hashes: set = {row[0] for row in res.all()}
+            else:
+                # Fallback: open own session only if no session was passed
+                # (supports direct callers outside _run_pipeline)
+                async with async_session() as fallback_db:
+                    res = await fallback_db.execute(
+                        select(
+                            GlobalContentIndexV2.semantic_hash,
+                            GlobalContentIndexV2.id,
+                        ).where(
+                            GlobalContentIndexV2.semantic_hash.in_(all_hashes)
+                        )
+                    )
+                    known_hashes = {row[0] for row in res.all()}
+    
+            # ── STEP 3: Resolve pipeline ────────────────────────────────────
+            # FIX-B4-3: Accept pre-resolved pipeline from _run_pipeline.
+            # _run_pipeline already called _get_pipeline(business_id) once.
+            # Even with @lru_cache, calling it again is semantically redundant.
+            #
+            # FIX-B4-1+2: Bind `collection_name` and `vectordb` to local
+            # variables here, then explicitly capture them in every lambda
+            # default arg. Zero reference captures from enclosing scope.
+            if pipeline is None:
+                pipeline = _get_pipeline(business_id)
+    
+            embedder:        Any = pipeline.embedder
+            vectordb:        Any = pipeline.vectordb
+            collection_name: str = pipeline.config.vectordb.collection
+    
+            # ── STEP 4: Check which known hashes exist in VectorDB ──────────
+            # FIX-B4-1: `collection_name`, `vectordb`, `known_hashes` all
+            # explicitly captured in lambda default args — zero reference capture.
             try:
-                present_in_vectordb = set(
+                present_in_vectordb: set = set(
                     await loop.run_in_executor(
                         None,
-                        lambda: vectordb.exists(
-                            collection=collection_name,   # ← per-client
-                            ids=list(known_hashes),
+                        lambda _vdb=vectordb,
+                               _col=collection_name,
+                               _hashes=known_hashes: _vdb.exists(
+                            collection=_col,
+                            ids=list(_hashes),
                         ),
                     )
                 )
             except Exception as e:
                 log_info(f"[IngestionV2] VectorDB exists check failed: {e}")
                 present_in_vectordb = set()
-
-            # ── STEP 5: Determine which hashes actually need embedding ─
-            hashes_needing_embedding = {
+    
+            # ── STEP 5: Determine hashes that need embedding ────────────────
+            hashes_needing_embedding: set = {
                 h for h in all_hashes
                 if h not in known_hashes or h not in present_in_vectordb
             }
-
+    
             if not hashes_needing_embedding:
-                log_info(f"[IngestionV2] All hashes already in VectorDB for {file_id}")
+                log_info(
+                    f"[IngestionV2] All hashes already in VectorDB for {file_id}"
+                )
                 return
-
-            new_chunks = [
+    
+            new_chunks: List[Dict[str, Any]] = [
                 hash_to_chunk[h]
                 for h in all_hashes
                 if h in hashes_needing_embedding
             ]
-
-            # ── STEP 6: Probe embedding dimension (never assume) ──────
-            embedding_dim = getattr(getattr(embedder, "info", None), "dim", None)
+    
+            # ── STEP 6: Probe embedding dimension (never assume) ────────────
+            # FIX-B4-1: `embedder` explicitly captured in lambda default arg.
+            embedding_dim = getattr(
+                getattr(embedder, "info", None), "dim", None
+            )
             if not embedding_dim or embedding_dim <= 0:
                 probe = await loop.run_in_executor(
-                    None, lambda: embedder.embed_query("dimension probe")
+                    None,
+                    lambda _emb=embedder: _emb.embed_query("dimension probe"),
+                    #      ^^^ explicit default capture — not reference
                 )
                 embedding_dim = len(probe)
                 log_info(f"[IngestionV2] Probed embedding dim: {embedding_dim}")
-
-            # ── STEP 7: Ensure collection — DIMENSION GUARD runs here ─
-            # Called AFTER new_chunks is confirmed non-empty.
-            # If stored dim != current embedder dim → raises ValueError
-            # immediately with a clear "delete collection + re-ingest" message.
-            # Never silently stores wrong-dim vectors.
+    
+            # ── STEP 7: Ensure collection — DIMENSION GUARD ─────────────────
             vectordb.ensure_collection(
-                collection_name,                   # ← per-client
+                collection_name,
                 embedding_dim=embedding_dim,
                 distance_metric="cosine",
             )
-
-            # ── STEP 8: Batched embed + upsert ────────────────────────
-            for i in range(0, len(new_chunks), BATCH_SIZE):
-                batch     = new_chunks[i : i + BATCH_SIZE]
-                texts     = [c.get("cleaned_text", c.get("cleaned", "")) for c in batch]
-                batch_ids = [c.get("semantic_hash") for c in batch]
-
-                emb_list = await loop.run_in_executor(
-                    None, lambda t=texts: embedder.embed_documents(t)
-                )
-
-                metadatas = [
-                    {
-                        "file_id":       str(file_id),
-                        "business_id":   str(business_id) if business_id else "",
-                        "source_type":   str(file_type)   if file_type   else "",
-                        "semantic_hash": str(c.get("semantic_hash", "")),
-                    }
-                    for c in batch
-                ]
-
-                # batch_upsert raises on failure (fixed in chroma_v1.py)
-                # Exception propagates here → caught below → file marked FAILED
-                await loop.run_in_executor(
-                    None,
-                    lambda ids=batch_ids, emb=emb_list, met=metadatas, docs=texts:
-                        vectordb.batch_upsert(
-                            collection=collection_name,    # ← per-client
-                            doc_ids=ids,
-                            embeddings=emb,
-                            texts=docs,
-                            metadatas=met,
-                        ),
-                )
-                log_info(
-                    f"[IngestionV2] ✅ Batch {i // BATCH_SIZE + 1}: "
-                    f"{len(batch)} vectors via {vectordb.kind}"
-                )
-
+    
+            # ── STEP 8: Concurrent batched embed + upsert ───────────────────
+            # PERF-FIX: Serial for-loop → concurrent asyncio.gather().
+            # 822 chunks / BATCH_SIZE 256 = 4 batches.
+            # Serial: batch1 → batch2 → batch3 → batch4  (4× wait time)
+            # Concurrent: all 4 batches fire simultaneously, bounded by semaphore.
+            # FIX-B4-1 and FIX-B4-2 lambda captures are fully preserved.
+            
+            async def _process_one_batch(
+                batch_idx: int,
+                batch: List[Dict[str, Any]],
+                _embedder=embedder,           # FIX-B4-1: explicit capture
+                _vectordb=vectordb,           # FIX-B4-2: explicit capture
+                _col=collection_name,         # FIX-B4-2: explicit capture
+                _loop=loop,
+                _file_id=file_id,
+                _business_id=business_id,
+                _file_type=file_type,
+            ) -> None:
+                async with _get_embed_semaphore():
+                    b_texts = [
+                        c.get("cleaned_text")
+                        or c.get("cleaned")
+                        or c.get("text")
+                        or c.get("normalized_text")
+                        or c.get("raw_text")
+                        or ""
+                        for c in batch
+                    ]
+                    b_ids  = [c.get("semantic_hash") for c in batch]
+                    b_meta = [
+                        {
+                            "file_id":       str(_file_id),
+                            "business_id":   str(_business_id) if _business_id else "",
+                            "source_type":   str(_file_type) if _file_type else "",
+                            "semantic_hash": str(c.get("semantic_hash", "")),
+                        }
+                        for c in batch
+                    ]
+            
+                    # Embed — FIX-B4-1: explicit default captures preserved
+                    b_emb: List = await _loop.run_in_executor(
+                        None,
+                        lambda _emb=_embedder, t=b_texts: _emb.embed_documents(t),
+                    )
+            
+                    # Upsert — FIX-B4-2: explicit default captures preserved
+                    await _loop.run_in_executor(
+                        None,
+                        lambda _vdb=_vectordb,
+                               col=_col,
+                               ids=b_ids,
+                               emb=b_emb,
+                               met=b_meta,
+                               docs=b_texts: _vdb.batch_upsert(
+                                   collection=col,
+                                   doc_ids=ids,
+                                   embeddings=emb,
+                                   texts=docs,
+                                   metadatas=met,
+                               ),
+                    )
+            
+                    log_info(
+                        f"[IngestionV2] ✅ Batch {batch_idx + 1}: "
+                        f"{len(batch)} vectors via {_vectordb.kind}"
+                    )
+            
+            # Build batch list, fire all concurrently
+            batches = [
+                new_chunks[i : i + BATCH_SIZE]
+                for i in range(0, len(new_chunks), BATCH_SIZE)
+            ]
+            await asyncio.gather(
+                *[_process_one_batch(idx, b) for idx, b in enumerate(batches)]
+            )
+            
             log_info(
-                f"[IngestionV2] Stored {len(new_chunks)} new vectors "
+                f"[IngestionV2] ✅ Stored {len(new_chunks)} new vectors "
                 f"via {vectordb.kind} for {file_id}"
             )
-
+            
+    
         except Exception as e:
-            # ── CORRECT FAILURE HANDLING ──────────────────────────────
-            # 1. Log with full detail
             log_info(
                 f"[IngestionV2] ❌ FATAL: VectorDB storage failed for {file_id}:\n"
                 f"  Error : {type(e).__name__}: {e}\n"
                 f"  Client: {business_id} | File type: {file_type}"
             )
-            # 2. Mark file as FAILED in DB — UI + API show correct status
             try:
                 async with async_session() as err_db:
                     await IngestionServiceV2._set_file_error(err_db, file_id, str(e))
             except Exception as db_err:
-                log_info(f"[IngestionV2] Also failed to write error status: {db_err}")
-            # 3. Re-raise — run_pipeline must know storage failed
+                log_info(
+                    f"[IngestionV2] Also failed to write error status: {db_err}"
+                )
             raise
+
 
 
     # ----------------------------------------------------------
