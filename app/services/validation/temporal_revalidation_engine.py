@@ -148,25 +148,31 @@ async def run_temporal_revalidation(batch_size: int = 50) -> Dict[str, Any]:
         
         log_info(f"[TemporalRevalidation] Processing {len(rows)} chunks...")
         
-        processed = 0
+        processed   = 0
         stale_count = 0
-        
+
+        # Collect snapshots first; bulk-append with savepoints after loop
+        pending_snapshots = []
+
         for row in rows:
             try:
                 snapshot = compute_temporal_snapshot(row)
-                await append_temporal_snapshot(session, row.id, snapshot)
-                
-                # Count stale content
+                pending_snapshots.append((row.id, snapshot))
+
                 if snapshot.get("flags", {}).get("stale_content"):
                     stale_count += 1
-                
+
                 processed += 1
-                
+
             except Exception as e:
                 log_warning(
                     f"[TemporalRevalidation] Failed for {row.id}: {e}"
                 )
-        
+
+        # SAFETY-2 + PERF-2: Bulk UPDATE with per-chunk SAVEPOINTs.
+        if pending_snapshots:
+            await append_temporal_snapshot_batch(session, pending_snapshots)
+
         await session.commit()
         
         duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
@@ -195,6 +201,11 @@ async def _fetch_candidates(
     
     Selection: No temporal_revalidation_v2 in validation_layer
     """
+    # SAFETY-1: with_for_update(skip_locked=True)
+    #   PostgreSQL acquires row-level locks on each selected row.
+    #   SKIP LOCKED silently skips rows locked by other workers
+    #   (agentic_validation, conflict_detection) -> disjoint work sets
+    #   -> deadlocks eliminated.
     stmt = (
         select(IngestedContentV2)
         .where(
@@ -207,8 +218,9 @@ async def _fetch_candidates(
         )
         .order_by(IngestedContentV2.created_at.asc())
         .limit(batch_size)
+        .with_for_update(skip_locked=True)   # <- SAFETY-1
     )
-    
+
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -444,26 +456,51 @@ def _derive_temporal_flags(
 # STORAGE
 # ============================================================
 
+async def append_temporal_snapshot_batch(
+    session:   AsyncSession,
+    snapshots: List[Tuple[Any, Dict[str, Any]]],
+) -> None:
+    """
+    PERF-2 + SAFETY-2: Bulk-append temporal snapshots with savepoint isolation.
+
+    Each UPDATE is wrapped in a SAVEPOINT (begin_nested()).
+    On DeadlockDetectedError SQLAlchemy issues ROLLBACK TO SAVEPOINT
+    automatically — other chunks in the batch are unaffected.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    for ingested_id, snapshot in snapshots:
+        try:
+            async with session.begin_nested():   # SAVEPOINT per chunk
+                payload_json = json.dumps([snapshot])
+                stmt = text("""
+                    UPDATE ingested_content
+                    SET validation_layer =
+                        COALESCE(validation_layer, '[]'::jsonb)
+                        || CAST(:payload AS jsonb)
+                    WHERE id = :id
+                """)
+                await session.execute(
+                    stmt,
+                    {"id": ingested_id, "payload": payload_json},
+                )
+        except DBAPIError as e:
+            log_warning(
+                f"[TemporalRevalidation] Savepoint rolled back for chunk "
+                f"{ingested_id}: {e} — skipping this chunk"
+            )
+
+
 async def append_temporal_snapshot(
     session: AsyncSession,
     ingested_id,
     snapshot: Dict[str, Any]
 ) -> None:
-    """Append temporal snapshot to validation_layer"""
-    stmt = text("""
-        UPDATE ingested_content
-        SET validation_layer =
-            COALESCE(validation_layer, '[]'::jsonb)
-            || CAST(:payload AS jsonb)
-        WHERE id = :id
-    """)
-    
-    payload_json = json.dumps([snapshot])
-    
-    await session.execute(
-        stmt,
-        {"id": ingested_id, "payload": payload_json}
-    )
+    """
+    Single-row convenience wrapper — used by external callers and tests.
+    For batch updates use append_temporal_snapshot_batch() instead.
+    """
+    await append_temporal_snapshot_batch(session, [(ingested_id, snapshot)])
 
 # ============================================================
 # TIMESTAMP PARSING

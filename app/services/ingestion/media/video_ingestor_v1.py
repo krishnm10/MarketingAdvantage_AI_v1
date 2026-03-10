@@ -295,53 +295,110 @@ class VideoIngestorV1:
         video_path: str,
         business_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Enterprise-grade video ingestion with deduplication"""
-        log_info(f"[VideoIngestorV1] 🎬 Processing video: {video_path}")
-        
-        # ============================================
-        # STEP 0: DEDUPLICATION CHECK
-        # ============================================
+        """
+        Enterprise-grade video ingestion with deduplication.
+
+        Session Discipline (BUG-5 fix):
+            Phase 1 — dedup check only         (short DB session, closed before CPU)
+            Phase 2 — validate + process       (NO DB connection during cv2 + Whisper)
+            Phase 3 — file record + pipeline   (short DB session for writes only)
+
+        BUG-5 FIX: Previously the entire function ran inside one
+        `async with get_async_session() as db:` block, holding a DB connection
+        across cv2 scene analysis + moviepy audio extraction + Whisper transcription.
+        A long video could hold the connection for hours, exhausting the pool.
+        """
+        log_info(f"[VideoIngestorV1] Processing video: {video_path}")
+
+        # ============================================================
+        # PHASE 1: Short-lived DB session — dedup check ONLY.
+        # Session is closed before any CPU-intensive work begins.
+        # ============================================================
         video_hash, byte_hash = MediaHashComputer.compute_video_hash(video_path)
-        
+
         async with get_async_session() as db:
-            existing_query = select(IngestedFileV2).where(
-                IngestedFileV2.media_hash == video_hash
-            )
-            result = await db.execute(existing_query)
-            existing_file = result.scalar_one_or_none()
-            
-            if existing_file:
-                log_info(
-                    f"[VideoIngestorV1] ⚠️ DUPLICATE DETECTED → "
-                    f"{os.path.basename(video_path)} matches {existing_file.file_name}"
+            result = await db.execute(
+                select(IngestedFileV2).where(
+                    IngestedFileV2.media_hash == video_hash
                 )
-                return {
-                    "status": "duplicate_skipped",
-                    "duplicate_of": str(existing_file.id),
-                    "original_file": existing_file.file_name,
-                    "video_hash": video_hash[:16],
-                    "message": f"Video is duplicate of: {existing_file.file_name}"
-                }
-            
-            log_info(f"[VideoIngestorV1] ✅ Unique video confirmed")
-            
-            # ============================================
-            # VALIDATION
-            # ============================================
-            try:
-                self._validate_video(video_path)
-            except ValueError as e:
-                log_warning(f"[VideoIngestorV1] ❌ Validation failed: {e}")
-                return {"status": "failed", "error": str(e)}
-            
-            # ============================================
-            # FILE RECORD
-            # ============================================
+            )
+            existing_file = result.scalar_one_or_none()
+        # DB SESSION CLOSED — before any blocking CPU work.
+
+        if existing_file:
+            log_info(
+                f"[VideoIngestorV1] DUPLICATE DETECTED: "
+                f"{os.path.basename(video_path)} matches {existing_file.file_name}"
+            )
+            return {
+                "status":        "duplicate_skipped",
+                "duplicate_of":  str(existing_file.id),
+                "original_file": existing_file.file_name,
+                "video_hash":    video_hash[:16],
+                "message":       f"Video is duplicate of: {existing_file.file_name}",
+            }
+
+        log_info(f"[VideoIngestorV1] Unique video confirmed")
+
+        # ============================================================
+        # PHASE 2: CPU-intensive work — NO DB connection held.
+        # BUG-5 FIX: This block previously ran inside the DB session.
+        # ============================================================
+
+        # 2a. Validate (no DB needed — filesystem + format + duration)
+        try:
+            self._validate_video(video_path)
+        except ValueError as e:
+            log_warning(f"[VideoIngestorV1] Validation failed: {e}")
+            return {"status": "failed", "error": str(e)}
+
+        # 2b. Extract metadata (cv2)
+        metadata = await self._extract_metadata_streaming(video_path)
+
+        # 2c. Scene-based keyframe extraction (cv2)
+        keyframes_text = await self._extract_scenes_premium(video_path, metadata)
+
+        # 2d. Audio transcription (moviepy + Whisper)
+        audio_transcript = await self._extract_audio_premium(video_path, metadata)
+
+        # 2e. Combine with quality enhancement
+        semantic_text = self._combine_premium_quality(
+            keyframes_text=keyframes_text,
+            audio_transcript=audio_transcript,
+            metadata=metadata,
+        )
+
+        if not semantic_text.strip():
+            log_warning("[VideoIngestorV1] No quality content extracted")
+            return {"status": "failed", "error": "No semantic content extracted"}
+
+        parsed_payload = {
+            "raw_text": semantic_text,
+            "meta": {
+                "media_type":        "video",
+                "confidence_source": "model",
+                "duration_seconds":  metadata.get("duration", 0),
+                "fps":               metadata.get("fps", 0),
+                "resolution":        metadata.get("resolution", "unknown"),
+                "has_audio":         bool(audio_transcript),
+                "scenes_analyzed":   metadata.get("scenes_count", 0),
+                "video_hash":        video_hash,
+                "text_quality":      "premium",
+                "deduplicated":      True,
+            },
+        }
+
+        # ============================================================
+        # PHASE 3: New short-lived DB session for writes + pipeline.
+        # DB connection acquired AFTER all CPU work is complete.
+        # ============================================================
+        async with get_async_session() as db:
+
+            # 3a. Upsert file record
             file_record = await IngestionServiceV2._get_file_record(db, file_id)
-            
+
             if not file_record:
                 size_mb = os.path.getsize(video_path) / (1024 * 1024)
-                
                 file_record = IngestedFileV2(
                     id=file_id,
                     file_name=os.path.basename(video_path),
@@ -350,13 +407,13 @@ class VideoIngestorV1:
                     business_id=business_id,
                     media_hash=video_hash,
                     meta_data={
-                        "source_type": "video",
-                        "ingested_via": "video_ingestor_v1",
-                        "video_hash": video_hash,
-                        "byte_hash": byte_hash,
-                        "dedup_method": "keyframe_perceptual_hash",
-                        "file_size_mb": round(size_mb, 2),
-                        "quality_mode": "premium",
+                        "source_type":   "video",
+                        "ingested_via":  "video_ingestor_v1",
+                        "video_hash":    video_hash,
+                        "byte_hash":     byte_hash,
+                        "dedup_method":  "keyframe_perceptual_hash",
+                        "file_size_mb":  round(size_mb, 2),
+                        "quality_mode":  "premium",
                     },
                     status="uploaded",
                     created_at=datetime.utcnow(),
@@ -364,80 +421,75 @@ class VideoIngestorV1:
                 )
                 db.add(file_record)
                 await db.commit()
-            
-            # ============================================
-            # PREMIUM PROCESSING
-            # ============================================
-            metadata = await self._extract_metadata_streaming(video_path)
-            
-            # Advanced scene-based keyframe extraction
-            keyframes_text = await self._extract_scenes_premium(video_path, metadata)
-            
-            # Clean audio transcription
-            audio_transcript = await self._extract_audio_premium(video_path, metadata)
-            
-            # Combine with deduplication
-            semantic_text = self._combine_premium_quality(
-                keyframes_text=keyframes_text,
-                audio_transcript=audio_transcript,
-                metadata=metadata
-            )
-            
-            if not semantic_text.strip():
-                log_warning("[VideoIngestorV1] ❌ No quality content extracted")
-                return {"status": "failed", "error": "No semantic content extracted"}
-            
-            # ============================================
-            # EMIT TO PIPELINE (with semantic hash deduplication)
-            # ============================================
-            parsed_payload = {
-                "raw_text": semantic_text,
-                "meta": {
-                    "media_type": "video",
-                    "confidence_source": "model",
-                    "duration_seconds": metadata.get("duration", 0),
-                    "fps": metadata.get("fps", 0),
-                    "resolution": metadata.get("resolution", "unknown"),
-                    "has_audio": bool(audio_transcript),
-                    "scenes_analyzed": metadata.get("scenes_count", 0),
-                    "video_hash": video_hash,
-                    "text_quality": "premium",
-                    "deduplicated": True,
-                },
-            }
-            
+
+            # 3b. Run through ingestion pipeline
             await IngestionServiceV2._run_pipeline(
                 db=db,
                 file_record=file_record,
                 parsed_payload=parsed_payload,
             )
-            
-            log_info(f"[VideoIngestorV1] ✅ Completed premium video ingestion: {file_id}")
-            
-            return {
-                "status": "success",
-                "file_id": file_id,
-                "video_hash": video_hash[:16],
-                "duration": metadata.get("duration", 0),
-                "scenes_analyzed": metadata.get("scenes_count", 0),
-                "text_quality": "premium",
-                "message": "Video ingested with premium quality text"
-            }
+
+        log_info(f"[VideoIngestorV1] Completed premium video ingestion: {file_id}")
+
+        return {
+            "status":          "success",
+            "file_id":         file_id,
+            "video_hash":      video_hash[:16],
+            "duration":        metadata.get("duration", 0),
+            "scenes_analyzed": metadata.get("scenes_count", 0),
+            "text_quality":    "premium",
+            "message":         "Video ingested with premium quality text",
+        }
     
     # ============================================
     # HELPER METHODS
     # ============================================
     
     def _validate_video(self, path: str):
+        """
+        Validate video file before any DB interaction or processing.
+
+        BUG-7 FIX: MAX_VIDEO_DURATION_SEC = 3600 was defined at module level
+        but was NEVER used in this method. A 5-hour 4K video passed validation.
+        Duration check now uses cv2 (already a hard dependency of this module)
+        to read the frame count and fps from the container header without
+        decoding any frames.
+        """
         ext = os.path.splitext(path)[1].lower()
         if ext not in SUPPORTED_EXTENSIONS:
             raise ValueError(f"Unsupported format: {ext}")
-        
+
         size_mb = os.path.getsize(path) / (1024 * 1024)
         if size_mb > MAX_VIDEO_MB:
-            raise ValueError(f"File too large: {size_mb:.1f}MB (max: {MAX_VIDEO_MB}MB)")
-        
-        log_info(f"[VideoIngestorV1] Video size: {size_mb:.2f}MB")
+            raise ValueError(
+                f"File too large: {size_mb:.1f} MB (limit: {MAX_VIDEO_MB} MB)"
+            )
+
+        # Duration check via cv2 — reads container metadata, no frame decoding
+        try:
+            cv2, _ = _import_video_libs()
+            cap = cv2.VideoCapture(path)
+            fps         = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+
+            if fps > 0 and frame_count > 0:
+                duration = frame_count / fps
+                if duration > MAX_VIDEO_DURATION_SEC:
+                    raise ValueError(
+                        f"Video duration {duration:.0f}s exceeds limit of "
+                        f"{MAX_VIDEO_DURATION_SEC}s "
+                        f"({MAX_VIDEO_DURATION_SEC // 60} min)"
+                    )
+        except ValueError:
+            raise  # Re-raise our own ValidationErrors unchanged
+        except Exception as e:
+            log_warning(
+                f"[VideoIngestorV1] Duration check failed for "
+                f"'{os.path.basename(path)}': {e}"
+            )
+
+        log_info(f"[VideoIngestorV1] Video size: {size_mb:.2f} MB")
     
     async def _extract_metadata_streaming(self, video_path: str) -> Dict[str, Any]:
         cv2, np = _import_video_libs()

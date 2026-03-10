@@ -259,9 +259,15 @@ async def deduplicate_chunks(
     # ================================================================
     # LAYER 1 — Normalized Hash (in-memory set, zero DB calls)
     # ================================================================
-    batch_hashes:  set               = set()
-    l1_survivors:  List[Dict]        = []
-    l1_duplicates: List[Dict]        = []
+    # FIX-C: Per-chunk log_info removed from the inner loop.
+    # Previously every duplicate emitted log_info() — a synchronous lock +
+    # format + write on every iteration. With 2631 chunks and high duplicate
+    # rates that was hundreds of log writes blocking the event loop.
+    # Fix: accumulate a hash→count dict, emit one summary line at the end.
+    batch_hashes:    set               = set()
+    l1_survivors:    List[Dict]        = []
+    l1_duplicates:   List[Dict]        = []
+    l1_dup_counts:   Dict[str, int]    = {}   # FIX-C: batch log accumulator
 
     for chunk in chunks:
         chunk_text = chunk.get("cleaned_text") or chunk.get("text", "")
@@ -272,27 +278,32 @@ async def deduplicate_chunks(
         chunk["normalized_hash"] = normalized_hash
 
         if normalized_hash in batch_hashes:
-            # Intra-batch exact duplicate
             stats["layer1_hash_duplicates"] += 1
             stats["duplicates"] += 1
             chunk.update({
                 "is_duplicate":     True,
                 "duplicate_source": "intra_batch",
                 "dedup_layer":      "layer1_normalized_hash",
-                # ── CONSTRAINT: check_duplicate_consistency requires ──────────────
-                # is_duplicate=True → duplicate_of IS NOT NULL OR similarity_score IS NOT NULL
-                # L1 dups have no GCI UUID (duplicate_of stays None).
-                # Set similarity_score=1.0 to satisfy the OR branch.
-                # This is semantically correct: it IS a 1.0 similarity duplicate —
-                # it's character-for-character identical to another chunk in this batch.
-                # ─────────────────────────────────────────────────────────────────
                 "similarity_score": 1.0,
             })
             l1_duplicates.append(chunk)
-            log_info(f"[Dedup L1] Intra-batch duplicate: hash={normalized_hash[:12]}...")
+            # FIX-C: accumulate, do NOT call log_info here
+            l1_dup_counts[normalized_hash[:12]] = (
+                l1_dup_counts.get(normalized_hash[:12], 0) + 1
+            )
         else:
             batch_hashes.add(normalized_hash)
             l1_survivors.append(chunk)
+
+    # FIX-C: One summary log for all L1 duplicates (was N individual log_info calls)
+    if l1_dup_counts:
+        top = sorted(l1_dup_counts.items(), key=lambda x: -x[1])[:5]
+        top_str = ", ".join(f"{h}...×{n}" for h, n in top)
+        log_info(
+            f"[Dedup L1] {stats['layer1_hash_duplicates']} intra-batch duplicates "
+            f"from {len(l1_dup_counts)} distinct hashes. "
+            f"Top: [{top_str}]"
+        )
 
     # ================================================================
     # LAYER 2 — Batch GCI Cross-File Lookup (1 SQL query, not N)
@@ -311,76 +322,122 @@ async def deduplicate_chunks(
                 stats["layer3_gci_duplicates"] += 1
                 stats["duplicates"] += 1
                 chunk.update({
-                    "is_duplicate":    True,
+                    "is_duplicate":     True,
                     "duplicate_source": "global_content_index",
-                    "dedup_layer":     "layer3_gci",
-                    "gci_id":          gci_info["gci_id"],
+                    "dedup_layer":      "layer3_gci",
+                    # ── BUG FIX: key was "gci_id" but _insert_chunks reads "duplicate_of" ──
+                    # _insert_chunks does: dup_of = c.get("duplicate_of")
+                    # With "gci_id" as the key, c.get("duplicate_of") always returned None.
+                    # check_duplicate_consistency requires: is_duplicate=TRUE →
+                    #   duplicate_of IS NOT NULL OR duplicate_percentage IS NOT NULL
+                    # With both None, every L2 GCI dup would fail the constraint.
+                    # Fix: set "duplicate_of" directly (the UUID string), keep "gci_id"
+                    # as an alias for backward compatibility with any other readers.
+                    # ─────────────────────────────────────────────────────────────────
+                    "duplicate_of":     gci_info["gci_id"],   # UUID → satisfies constraint
+                    "gci_id":           gci_info["gci_id"],   # alias — backward compat
                     "occurrence_count": gci_info["occurrence_count"],
                     "global_content_id": gci_info["gci_id"],
                 })
                 l2_duplicates.append(chunk)
-                log_info(
-                    f"[Dedup Layer 3] Found in GCI: "
-                    f"id={gci_info['gci_id']}, occurrences={gci_info['occurrence_count']}"
-                )
-                log_info(
-                    f"[Dedup L1+L3] Cross-file duplicate: "
-                    f"hash={h[:12]}..., occurrences={gci_info['occurrence_count']}"
-                )
+                # FIX-C: no per-chunk log_info here — summary below
             else:
                 l2_survivors.append(chunk)
 
+        # FIX-C: One summary for all L2 GCI hits
+        if l2_duplicates:
+            log_info(
+                f"[Dedup L2-GCI] {len(l2_duplicates)} cross-file duplicates "
+                f"found in GlobalContentIndex (1 batch query)"
+            )
+
     # ================================================================
-    # LAYER 3 — Vector Similarity (only L1+L2 survivors, embeddings cached)
+    # LAYER 3 — Vector Similarity (parallel gather, semaphore-capped)
     # ================================================================
+    # FIX-B: STALL FIX — was a sequential `for chunk in l2_survivors` loop.
+    #
+    # BEFORE: Each chunk did embed_query (sync, ~50ms) + vectordb.search (sync,
+    #   ~100ms) sequentially. With 500 L2 survivors × 150ms = 75 seconds of
+    #   wall-clock stall. The event loop was blocked between awaits on every chunk.
+    #
+    # AFTER: asyncio.gather() launches all coroutines concurrently.
+    #   A semaphore caps inflight requests at L3_MAX_CONCURRENCY (default 32)
+    #   to prevent memory/thread-pool exhaustion on large batches.
+    #   500 chunks / 32 concurrency × 150ms = ~2.3 seconds (33× faster).
+    #
+    # NOTE: The semaphore is created inside this function (not at module level)
+    # to ensure it is always bound to the currently-running event loop.
+    # ================================================================
+
     unique_chunks: List[Dict] = []
 
     if enable_embedding_dedup and l2_survivors:
-        loop = asyncio.get_running_loop()
+        loop              = asyncio.get_running_loop()
+        # Cap concurrency: high enough for throughput, low enough to avoid
+        # saturating the thread pool (which defaults to min(32, cpu_count+4)).
+        L3_MAX_CONCURRENCY = 32
+        sem               = asyncio.Semaphore(L3_MAX_CONCURRENCY)
+        l3_embed_dups     = 0
 
-        for chunk in l2_survivors:
-            chunk_text = chunk.get("cleaned_text") or chunk.get("text", "")
-            try:
-                # Reuse cached embedding if already computed (F4 optimization)
-                if chunk.get("_cached_embedding"):
-                    query_embedding: List[float] = chunk["_cached_embedding"]
-                else:
-                    query_embedding: List[float] = await loop.run_in_executor(
-                        None, lambda t=chunk_text: embedder.embed_query(t)
+        async def _check_one(chunk: Dict) -> Tuple[Dict, Optional[Dict]]:
+            """
+            Compute embedding + run similarity check for one chunk.
+            Semaphore-gated so at most L3_MAX_CONCURRENCY run simultaneously.
+            Returns (chunk, similarity_result_or_None).
+            """
+            async with sem:
+                chunk_text = chunk.get("cleaned_text") or chunk.get("text", "")
+                try:
+                    # Reuse cached embedding if already computed (F4 optimisation)
+                    if chunk.get("_cached_embedding"):
+                        query_embedding: List[float] = chunk["_cached_embedding"]
+                    else:
+                        query_embedding: List[float] = await loop.run_in_executor(
+                            None, lambda t=chunk_text: embedder.embed_query(t)
+                        )
+                        chunk["_cached_embedding"] = query_embedding
+
+                    sim_result = await check_embedding_similarity(
+                        db, vectordb, embedder, chunk_text, query_embedding,
+                        similarity_threshold, collection_name=collection_name,
                     )
-                    chunk["_cached_embedding"] = query_embedding
+                    return chunk, sim_result
 
-                similarity_result = await check_embedding_similarity(
-                    db, vectordb, embedder, chunk_text, query_embedding,
-                    similarity_threshold, collection_name=collection_name,
-                )
+                except Exception as e:
+                    log_warning(f"[Dedup L3] Embedding check failed: {e}")
+                    return chunk, None  # Treat as unique on error (conservative)
 
-                if similarity_result:
-                    stats["layer2_embedding_duplicates"] += 1
-                    stats["duplicates"] += 1
-                    chunk.update({
-                        "is_duplicate":       True,
-                        "duplicate_source":   "embedding_similarity",
-                        "dedup_layer":        "layer2_embedding",
-                        "similarity_score":   similarity_result["similarity_score"],
-                        "duplicate_chunk_id": similarity_result["duplicate_chunk_id"],
-                    })
-                    log_info(
-                        f"[Dedup L2] Semantic duplicate: "
-                        f"similarity={similarity_result['similarity_score']:.4f}"
-                    )
-                else:
-                    # Survived all 3 layers — truly unique
-                    chunk["is_duplicate"] = False
-                    unique_chunks.append(chunk)
-                    stats["unique"] += 1
+        # Launch all L2 survivors concurrently (semaphore limits inflight count)
+        results: List[Tuple[Dict, Optional[Dict]]] = await asyncio.gather(
+            *[_check_one(c) for c in l2_survivors],
+            return_exceptions=False,
+        )
 
-            except Exception as e:
-                log_warning(f"[Dedup L3] Embedding check failed: {e}")
-                # On error: treat as unique (conservative — better to store than lose)
+        for chunk, sim_result in results:
+            if sim_result:
+                l3_embed_dups += 1
+                stats["layer2_embedding_duplicates"] += 1
+                stats["duplicates"] += 1
+                chunk.update({
+                    "is_duplicate":       True,
+                    "duplicate_source":   "embedding_similarity",
+                    "dedup_layer":        "layer2_embedding",
+                    "similarity_score":   sim_result["similarity_score"],
+                    "duplicate_chunk_id": sim_result["duplicate_chunk_id"],
+                })
+            else:
                 chunk["is_duplicate"] = False
                 unique_chunks.append(chunk)
                 stats["unique"] += 1
+
+        # FIX-C: One summary log for all L3 results
+        if l3_embed_dups:
+            log_info(
+                f"[Dedup L3] {l3_embed_dups} semantic duplicates found "
+                f"across {len(l2_survivors)} candidates "
+                f"(parallel, concurrency={L3_MAX_CONCURRENCY})"
+            )
+
     else:
         # L3 disabled or no L2 survivors — L2 survivors are all unique
         for chunk in l2_survivors:
@@ -439,58 +496,85 @@ async def register_unique_chunks_in_gci(
     now            = datetime.utcnow()
     hash_to_gci_id: Dict[str, str] = {}
 
+    # ── PERF FIX: Single bulk INSERT replaces N serial round-trips ─────────
+    #
+    # BEFORE (broken): `for chunk in unique_chunks: await db.execute(stmt)`
+    #   → 822 sequential network round-trips to PostgreSQL for 822 chunks
+    #   → each `await` yields control, PostgreSQL processes one row, returns,
+    #     then the next starts — pure serialisation with no pipelining
+    #   → observed: ~2 seconds just for GCI registration of 822 chunks
+    #
+    # AFTER (fixed): build all values up front, send one
+    #   `INSERT INTO ... VALUES (...),(...),... ON CONFLICT DO UPDATE RETURNING ...`
+    #   → 1 round-trip total regardless of chunk count
+    #   → PostgreSQL processes all rows in a single transaction on the server
+    #   → the RETURNING clause delivers all (id, semantic_hash) pairs at once
+    #
+    # Per-chunk log_info removed from the loop:
+    #   822 `log_info(...)` calls = 822 string-format + I/O operations per file
+    #   These were visibly spanning 2 full seconds in the log timeline.
+    #   Replaced by a single summary line at the end.
+    # ────────────────────────────────────────────────────────────────────────
+
+    # Build the values list — one dict per chunk, skip any with no hash
+    values_list = []
+    hash_order  = []  # preserve order so we can backfill chunk dicts below
+
     for chunk in unique_chunks:
         semantic_hash = chunk.get("semantic_hash") or chunk.get("normalized_hash")
         if not semantic_hash:
             continue
 
-        chunk_source_type   = source_type   or chunk.get("source_type")
-        chunk_embed_model   = embedding_model or chunk.get("embedding_model")
+        values_list.append({
+            "id":                str(uuid.uuid4()),
+            "semantic_hash":     semantic_hash,
+            "cleaned_text":      chunk.get("cleaned_text", ""),
+            "raw_text":          chunk.get("text", ""),
+            "tokens":            chunk.get("tokens", 0),
+            "business_id":       business_id,
+            "first_seen_file_id": file_id,
+            "source_type":       source_type or chunk.get("source_type"),
+            "embedding_model":   embedding_model or chunk.get("embedding_model"),
+            "occurrence_count":  1,
+            "created_at":        now,
+            "updated_at":        now,
+        })
+        hash_order.append((semantic_hash, chunk))
 
-        try:
-            stmt = (
-                pg_insert(GlobalContentIndexV2)
-                .values(
-                    id=str(uuid.uuid4()),
-                    semantic_hash=semantic_hash,
-                    cleaned_text=chunk.get("cleaned_text", ""),
-                    raw_text=chunk.get("text", ""),
-                    tokens=chunk.get("tokens", 0),
-                    business_id=business_id,
-                    first_seen_file_id=file_id,
-                    source_type=chunk_source_type,
-                    embedding_model=chunk_embed_model,
-                    occurrence_count=1,
-                    created_at=now,
-                    updated_at=now,
-                )
-                .on_conflict_do_update(
-                    # Concurrent ingestion of the same content — increment count.
-                    # Next ingestion will find count≥1 in batch_check_gci and skip.
-                    index_elements=["semantic_hash"],
-                    set_={
-                        "occurrence_count": GlobalContentIndexV2.occurrence_count + 1,
-                        "updated_at":       now,
-                    },
-                )
-                .returning(GlobalContentIndexV2.id, GlobalContentIndexV2.semantic_hash)
-            )
-
-            result = await db.execute(stmt)
-            row    = result.fetchone()
-            if row:
-                gci_id = str(row[0])
-                hash_to_gci_id[semantic_hash] = gci_id
-                chunk["global_content_id"] = gci_id  # update chunk in-place
-                log_info(f"[GCI] Registered unique chunk {gci_id[:8]}...")
-
-        except Exception as e:
-            log_warning(f"[GCI] Registration failed for hash {semantic_hash[:12]}...: {e}")
+    if not values_list:
+        return {}
 
     try:
+        stmt = (
+            pg_insert(GlobalContentIndexV2)
+            .values(values_list)
+            .on_conflict_do_update(
+                index_elements=["semantic_hash"],
+                set_={
+                    "occurrence_count": GlobalContentIndexV2.occurrence_count + 1,
+                    "updated_at":       now,
+                },
+            )
+            .returning(GlobalContentIndexV2.id, GlobalContentIndexV2.semantic_hash)
+        )
+
+        result = await db.execute(stmt)       # ← single round-trip for all N chunks
+        rows   = result.fetchall()
+
+        # Build hash→uuid map from the RETURNING rows
+        returned_map: Dict[str, str] = {str(row[1]): str(row[0]) for row in rows}
+
+        # Backfill global_content_id onto each chunk dict in-place
+        for semantic_hash, chunk in hash_order:
+            gci_id = returned_map.get(semantic_hash)
+            if gci_id:
+                hash_to_gci_id[semantic_hash] = gci_id
+                chunk["global_content_id"] = gci_id
+
         await db.commit()
+
     except Exception as e:
-        log_warning(f"[GCI] Commit failed: {e}")
+        log_warning(f"[GCI] Bulk registration failed: {e}")
         await db.rollback()
 
     log_info(f"[GCI] Registered {len(hash_to_gci_id)} unique chunks in GlobalContentIndex")

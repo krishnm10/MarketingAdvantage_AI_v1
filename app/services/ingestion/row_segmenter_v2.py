@@ -6,6 +6,7 @@
 from typing import List, Dict, Any, Optional
 import pandas as pd
 import json
+import math
 from datetime import datetime
 
 # <<< PATCH: use text_cleaner_v2 (newer version) >>>
@@ -35,6 +36,27 @@ async def parse_dataframe_rows(
 
     chunks: List[Dict[str, Any]] = []
 
+    def _sanitize_for_json(obj):
+        """
+        Recursively replace Python float NaN / ±Inf with None so that
+        json.dumps() produces valid JSON that PostgreSQL JSONB will accept.
+
+        ROOT CAUSE: pandas row.to_dict() preserves float('nan') for NULL cells.
+        When stored in meta_data (JSONB), Python serializes NaN as the bare
+        token  NaN  which is valid Python but NOT valid JSON.
+        PostgreSQL raises: invalid input syntax for type json — Token "NaN" is invalid.
+
+        This guard runs on the raw_row dict before it enters metadata so no
+        NaN ever reaches the DB serialisation path.
+        """
+        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return None
+        if isinstance(obj, dict):
+            return {k: _sanitize_for_json(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_sanitize_for_json(v) for v in obj]
+        return obj
+
     # compute columns once for efficiency and consistency
     columns = list(df.columns) if df is not None else []
 
@@ -61,8 +83,11 @@ async def parse_dataframe_rows(
         if not row_text.strip():
             continue
 
-        # Use make_chunk_dict which internally cleans text; pass raw row_text to keep single-source cleaning
-        chunk_data = await make_chunk_dict(
+        # make_chunk_dict is a pure synchronous function — do NOT await it.
+        # BUG FIX: was `await make_chunk_dict(...)` which raised
+        # TypeError: object dict can't be used in 'await' expression
+        # because make_chunk_dict returns a plain dict, not a coroutine.
+        chunk_data = make_chunk_dict(
             row_text,
             db_session=db_session,
             file_id=file_id,
@@ -76,28 +101,55 @@ async def parse_dataframe_rows(
 
         chunks.append(
             {
-                "file_id": file_id,
+                "file_id":     file_id,
                 "source_type": source_type,
-                "row_index": row_index,
-                "columns": columns,
+                "row_index":   row_index,
+                "columns":     columns,
 
-                # Semantic core
-                "text": chunk_data.get("text"),
-                "cleaned_text": chunk_data.get("cleaned_text"),
-                "tokens": chunk_data.get("tokens"),
-                "semantic_hash": chunk_data.get("semantic_hash"),
-                "confidence": chunk_data.get("confidence"),
+                # Semantic core — type-safe fallbacks on every field.
+                # BUG FIX: c.get("tokens") had no int() cast, could store NULL
+                # in DB. AgenticValidation does `chunk.tokens > MIN` → TypeError.
+                "text":          chunk_data.get("text") or row_text,
+                "cleaned_text":  chunk_data.get("cleaned_text") or "",
+                "tokens":        int(chunk_data.get("tokens") or 0),
+                "semantic_hash": chunk_data.get("semantic_hash") or "",
+                "confidence":    float(chunk_data.get("confidence") or 1.0),
 
                 # GlobalContentIndex link
                 "global_content_id": chunk_data.get("global_content_id"),
 
+                # BUG FIX: reasoning_ingestion was never passed through from
+                # make_chunk_dict. _insert_chunks stored {} in DB for ALL
+                # row_segmenter chunks. AgenticValidation reads fields from this
+                # JSON (extraction_confidence, origin_authority, etc.) and does
+                # None > threshold → TypeError: NoneType > int/float.
+                # Fix: pass through from make_chunk_dict, with safe defaults.
+                "reasoning_ingestion": chunk_data.get("reasoning_ingestion") or {
+                    "signal_type":           "narrative",
+                    "business_function":     "general",
+                    "time_horizon":          "timeless",
+                    "origin_authority":      "primary_source",
+                    "extraction_confidence": 0.90,
+                    "granularity":           "tactical_detail",
+                    "data_lineage_id":       chunk_data.get("semantic_hash") or "",
+                    "potentially_regulated": False,
+                    "extraction_timestamp":  datetime.utcnow().isoformat() + "Z",
+                },
+
                 # Metadata (aligned with DB meta_data JSONB field)
+                # BUG FIX: row_dict contains float('nan') for NULL CSV cells
+                # (pandas preserves NaN from missing values). json.dumps() writes
+                # NaN as the bare token NaN — valid Python, invalid JSON.
+                # PostgreSQL JSONB rejects it with:
+                #   invalid input syntax for type json — Token "NaN" is invalid
+                # Fix: sanitize raw_row through _sanitize_for_json() which
+                # recursively replaces NaN/Inf with None before serialisation.
                 "metadata": {
                     "row_index": row_index,
-                    "columns": columns,
-                    "raw_row": row_dict,
+                    "columns":   columns,
+                    "raw_row":   _sanitize_for_json(row_dict),
                     "dedup": {
-                        "semantic_hash": chunk_data.get("semantic_hash"),
+                        "semantic_hash":     chunk_data.get("semantic_hash"),
                         "global_content_id": chunk_data.get("global_content_id"),
                     },
                 },
