@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session_v2 import AsyncSessionLocal
 from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
+from app.utils.env_flags import get_env_bool
 from app.utils.logger import log_info, log_warning, log_debug
 
 # ============================================================
@@ -168,6 +169,21 @@ async def run_agentic_validation(batch_size: int = 50) -> Dict[str, Any]:
     Returns:
         Stats dictionary with processing metrics
     """
+    if not get_env_bool(
+        "ENABLE_AGENTIC_VALIDATION",
+        default=True,
+        aliases=("ENABLE_VALIDATION",),
+    ):
+        log_info("[AgenticValidation] Disabled via env toggle. Skipping run.")
+        return {
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "duration_ms": 0,
+            "skipped": True,
+            "reason": "disabled_by_env",
+        }
+
     start_time = datetime.now(timezone.utc)
     
     async with AsyncSessionLocal() as session:

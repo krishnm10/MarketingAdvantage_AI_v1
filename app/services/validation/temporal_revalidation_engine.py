@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session_v2 import AsyncSessionLocal
 from app.db.models.ingested_content_v2 import IngestedContentV2
+from app.utils.env_flags import get_env_bool
 from app.utils.logger import log_info, log_warning, log_debug
 
 # ============================================================
@@ -132,6 +133,20 @@ async def run_temporal_revalidation(batch_size: int = 50) -> Dict[str, Any]:
     Returns:
         Processing stats
     """
+    if not get_env_bool(
+        "ENABLE_TEMPORAL_REVALIDATION",
+        default=True,
+        aliases=("ENABLE_TEMPORAL",),
+    ):
+        log_info("[TemporalRevalidation] Disabled via env toggle. Skipping run.")
+        return {
+            "processed": 0,
+            "stale_flagged": 0,
+            "duration_ms": 0,
+            "skipped": True,
+            "reason": "disabled_by_env",
+        }
+
     start_time = datetime.now(timezone.utc)
     
     async with AsyncSessionLocal() as session:

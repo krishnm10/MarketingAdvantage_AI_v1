@@ -57,14 +57,28 @@ from app.core.config.client_config_schema import (
 # Do NOT rename or move them.
 # =============================================
 
-BATCH_SIZE:  int = 256
+def _safe_env_int(key: str, default: int, min_value: int = 1) -> int:
+    """
+    Parse positive integer env var with fallback.
+    """
+    raw = os.getenv(key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+        return value if value >= min_value else default
+    except (TypeError, ValueError):
+        return default
+
+
+BATCH_SIZE: int = _safe_env_int("INGEST_BATCH_SIZE", 256)
 
 # ── Concurrent embed semaphore ────────────────────────────────────────
 # Limits parallel embed+upsert batches inside embed_and_store().
 # Tune via HF_EMBED_CONCURRENCY in .env (default 4).
 # Local ST/Ollama: 4 → fills your 8-core SSD machine without thrashing.
 # HF API mode:     4 → 4 concurrent POSTs without hitting rate limits.
-_EMBED_CONCURRENCY: int = int(os.getenv("HF_EMBED_CONCURRENCY", "4"))
+_EMBED_CONCURRENCY: int = _safe_env_int("HF_EMBED_CONCURRENCY", 4)
 _EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None  # lazy — safe at import
 
 def _get_embed_semaphore() -> asyncio.Semaphore:
@@ -960,6 +974,7 @@ class IngestionServiceV2:
             except Exception as e:
                 log_info(f"[ERROR] Direct ingestion failed for {file_id}: {e}")
                 await IngestionServiceV2._set_file_error(db, file_id, str(e))
+                raise
 
     # ----------------------------------------------------------
     # Helpers
@@ -1040,39 +1055,11 @@ class IngestionServiceV2:
             log_info(f"[IngestionV2] No chunks to ingest for {file_id}")
             return
 
-<<<<<<< ours
-
-        unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
-            db, chunks, file_id, business_id,
-            collection_name=pipeline.config.vectordb.collection,
-            pipeline=pipeline,          # FIX-D: pass resolved pipeline
-        )
-=======
         try:
             unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
-                db, chunks, file_id, business_id
-            )
-        except Exception as dedup_err:
-            # Fail-open fallback: dedup issues should not block ingestion.
-            # This specifically protects direct-ingestion flows from transient
-            # runtime issues (for example, an UnboundLocalError in stats
-            # collection) while preserving an audit trail in logs.
-            log_info(
-                f"[IngestionV2] Dedup failed for {file_id}; falling back to "
-                f"non-deduplicated ingestion. Error: {type(dedup_err).__name__}: {dedup_err}"
-            )
-            unique_chunks = chunks
-            dedup_stats = {
-                "total": len(chunks),
-                "unique": len(chunks),
-                "duplicates": 0,
-                "dedup_ratio": 0.0,
-            }
->>>>>>> theirs
-
-        try:
-            unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
-                db, chunks, file_id, business_id
+                db, chunks, file_id, business_id,
+                collection_name=pipeline.config.vectordb.collection,
+                pipeline=pipeline,          # FIX-D: pass resolved pipeline
             )
         except Exception as dedup_err:
             # Fail-open fallback: dedup issues should not block ingestion.
@@ -1119,6 +1106,7 @@ class IngestionServiceV2:
                 source_type=file_type,
                 embedding_model=embedding_model,
             )
+
 
 
         # ═══════════════════════════════════════════════════════════
@@ -1552,24 +1540,25 @@ class IngestionServiceV2:
         is_structured_data = first_source in ("csv", "xlsx", "xls")
 
         # AFTER (FIXED):
+        enable_embedding_dedup = True
         if is_structured_data:
             log_info(
-                f"[IngestionV2] Structured data detected ({first_source}) — "
+                f"[IngestionV2] Structured data detected ({first_source}) - "
                 f"skipping L3 vector similarity dedup (L1/L2 sufficient for row data)"
             )
-            unique_chunks, stats = await deduplicate_chunks(
-                db=db,
-                chunks=chunks,
-                vectordb=pipeline.vectordb,
-                embedder=pipeline.embedder,
-                file_id=file_id,
-                business_id=business_id,
-                enable_embedding_dedup=False,                              # B10: actually skip L3
-                collection_name=collection_name or pipeline.config.vectordb.collection,  # B10: pass resolved name
-            )
-        
+            enable_embedding_dedup = False
 
-        # FIXED — matches B5-FIX-4 key names exactly
+        unique_chunks, stats = await deduplicate_chunks(
+            db=db,
+            chunks=chunks,
+            vectordb=pipeline.vectordb,
+            embedder=pipeline.embedder,
+            file_id=file_id,
+            business_id=business_id,
+            enable_embedding_dedup=enable_embedding_dedup,
+            collection_name=collection_name or pipeline.config.vectordb.collection,  # B10: pass resolved name
+        )
+        # FIXED - matches B5-FIX-4 key names exactly
         log_info(
             f"[IngestionV2] Dedup complete for {file_id}: "
             f"{stats['unique']} unique, {stats['duplicates']} duplicates, "
@@ -1651,46 +1640,65 @@ class IngestionServiceV2:
 
         # ── PRE-PASS: resolve duplicate_of for L3 vector similarity dups ─────
         # BUG FIX: The DB constraint "check_duplicate_consistency" requires that
-        # every row with is_duplicate=TRUE satisfies:
-        #   duplicate_of IS NOT NULL  OR  duplicate_percentage IS NOT NULL
+        # every row with is_duplicate=TRUE has duplicate_of IS NOT NULL.
         #
         # Previous behaviour for L3 dups:
         #   duplicate_of    = None  (no GCI UUID was fetched)
         #   similarity_score = 0.955 (set by dedup engine)
         #   duplicate_percentage = not in INSERT → stored as SQL NULL
         #
-        # The constraint checks duplicate_percentage, NOT similarity_score.
-        # duplicate_percentage IS NULL → constraint fires → CheckViolationError.
+        # similarity_score / duplicate_percentage do not satisfy this check.
+        # If duplicate_of remains NULL, PostgreSQL raises CheckViolationError.
         #
         # L2 GCI dups work because duplicate_of = gci_uuid IS NOT NULL.
         # L1 intra-batch dups and L3 vector dups have BOTH duplicate_of=None
         # AND duplicate_percentage missing → both were always at risk.
         # Only now (first real L3 dup from Crisil PDF) did we hit the wall.
         #
-        # Fix: two-pronged
-        #   A) Add duplicate_percentage to INSERT, set to similarity_score value
-        #      (non-NULL for all dups → satisfies OR branch of constraint)
-        #   B) For L3 dups, look up the GCI UUID via semantic_hash and populate
-        #      duplicate_of — provides the cleaner reference AND satisfies AND branch
+        # Fix: resolve duplicate_of for L3 vector duplicates.
+        #   A) Preferred: GCI UUID lookup by semantic_hash
+        #   B) Fallback: existing ingested_content row UUID by semantic_hash
         # ─────────────────────────────────────────────────────────────────────
-        # Collect L3 dups that have a duplicate_chunk_id (semantic_hash) but no duplicate_of
-        l3_hash_to_chunk = {}
+        # Collect L3 dups that have a duplicate_chunk_id (semantic_hash) but no duplicate_of.
+        # Use list buckets so multiple chunks sharing the same hash all get patched.
+        l3_hash_to_chunks: Dict[str, List[Dict[str, Any]]] = {}
         for c in chunks:
             if (bool(c.get("is_duplicate")) and
                 c.get("duplicate_of") is None and
                 c.get("duplicate_chunk_id")):
-                l3_hash_to_chunk[c["duplicate_chunk_id"]] = c
+                h = c["duplicate_chunk_id"]
+                l3_hash_to_chunks.setdefault(h, []).append(c)
 
-        if l3_hash_to_chunk:
+        if l3_hash_to_chunks:
             from app.db.models.global_content_index_v2 import GlobalContentIndexV2 as _GCI
+            from app.db.models.ingested_content_v2 import IngestedContentV2 as _IC
             from sqlalchemy import select as _select
+
+            unresolved_hashes = set(l3_hash_to_chunks.keys())
+
+            # 1) Preferred: resolve to GCI UUID by semantic_hash.
             res = await db.execute(
                 _select(_GCI.semantic_hash, _GCI.id)
-                .where(_GCI.semantic_hash.in_(list(l3_hash_to_chunk.keys())))
+                .where(_GCI.semantic_hash.in_(list(unresolved_hashes)))
             )
             for row_hash, row_uuid in res.all():
-                if row_hash in l3_hash_to_chunk:
-                    l3_hash_to_chunk[row_hash]["duplicate_of"] = str(row_uuid)
+                if row_hash in l3_hash_to_chunks:
+                    for chunk_ref in l3_hash_to_chunks[row_hash]:
+                        chunk_ref["duplicate_of"] = str(row_uuid)
+                    unresolved_hashes.discard(row_hash)
+
+            # 2) Fallback: resolve to an existing ingested_content row UUID.
+            # This keeps duplicate rows insertable even when legacy vectors exist
+            # in VectorDB without corresponding GCI rows.
+            if unresolved_hashes:
+                res_ic = await db.execute(
+                    _select(_IC.semantic_hash, _IC.id)
+                    .where(_IC.semantic_hash.in_(list(unresolved_hashes)))
+                )
+                for row_hash, row_uuid in res_ic.all():
+                    if row_hash in l3_hash_to_chunks:
+                        for chunk_ref in l3_hash_to_chunks[row_hash]:
+                            chunk_ref["duplicate_of"] = str(row_uuid)
 
         all_rows: list = []   # accumulate all param dicts; sent as single executemany
         for i, c in enumerate(chunks):
@@ -1897,6 +1905,11 @@ class IngestionServiceV2:
             embedder:        Any = pipeline.embedder
             vectordb:        Any = pipeline.vectordb
             collection_name: str = pipeline.config.vectordb.collection
+            embedder_kind:   str = str(getattr(embedder, "kind", "") or "").lower()
+            if not embedder_kind:
+                embedder_kind = str(
+                    getattr(getattr(embedder, "info", None), "provider", "") or ""
+                ).lower()
     
             # ── STEP 4: Check which known hashes exist in VectorDB ──────────
             # FIX-B4-1: `collection_name`, `vectordb`, `known_hashes` all
@@ -1963,6 +1976,17 @@ class IngestionServiceV2:
             # Concurrent: all 4 batches fire simultaneously, bounded by semaphore.
             # FIX-B4-1 and FIX-B4-2 lambda captures are fully preserved.
             
+            # HuggingFace SentenceTransformer instances are not safe for
+            # concurrent encode() calls from multiple threads on the same object.
+            # If we run 4 parallel batches, some futures can hang and file status
+            # never reaches "processed". Keep batch processing serial for HF.
+            batch_parallelism = 1 if "huggingface" in embedder_kind else _EMBED_CONCURRENCY
+            batch_semaphore = asyncio.Semaphore(max(1, int(batch_parallelism)))
+            log_info(
+                f"[IngestionV2] Embedding runtime: kind={embedder_kind or 'unknown'}, "
+                f"batch_size={BATCH_SIZE}, parallelism={batch_parallelism}"
+            )
+
             async def _process_one_batch(
                 batch_idx: int,
                 batch: List[Dict[str, Any]],
@@ -1974,7 +1998,7 @@ class IngestionServiceV2:
                 _business_id=business_id,
                 _file_type=file_type,
             ) -> None:
-                async with _get_embed_semaphore():
+                async with batch_semaphore:
                     b_texts = [
                         c.get("cleaned_text")
                         or c.get("cleaned")

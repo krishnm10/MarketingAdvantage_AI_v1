@@ -75,6 +75,7 @@ from app.services.validation.scheduler import (
     get_validation_scheduler,
     SchedulerConfig,
 )
+from app.utils.env_flags import get_env_bool
 
 # ─────────────────────────────────────────────────────────────────────────────
 # New Pluggable Pipeline Factory (NEW — auto-registers all plugins on import)
@@ -170,9 +171,21 @@ async def lifespan(app: FastAPI):
             temporal_batch_size=int(os.getenv("TEMPORAL_BATCH_SIZE", "50")),
 
             # Enable/disable individual workers
-            enable_validation=os.getenv("ENABLE_VALIDATION", "true").lower() == "true",
-            enable_conflict=os.getenv("ENABLE_CONFLICT", "true").lower() == "true",
-            enable_temporal=os.getenv("ENABLE_TEMPORAL", "true").lower() == "true",
+            enable_validation=get_env_bool(
+                "ENABLE_AGENTIC_VALIDATION",
+                default=True,
+                aliases=("ENABLE_VALIDATION",),
+            ),
+            enable_conflict=get_env_bool(
+                "ENABLE_CONFLICT_ANALYSIS",
+                default=True,
+                aliases=("ENABLE_CONFLICT",),
+            ),
+            enable_temporal=get_env_bool(
+                "ENABLE_TEMPORAL_REVALIDATION",
+                default=True,
+                aliases=("ENABLE_TEMPORAL",),
+            ),
         )   # ← FIX: closing parenthesis was missing in original
 
         scheduler = await start_validation_scheduler(scheduler_config)

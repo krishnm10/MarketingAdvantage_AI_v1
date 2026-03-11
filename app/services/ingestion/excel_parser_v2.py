@@ -7,6 +7,7 @@
 import pandas as pd
 import asyncio
 import os
+import time
 from typing import Dict, Any, List, Optional
 
 from app.services.ingestion.row_segmenter_v2 import parse_dataframe_rows
@@ -36,11 +37,40 @@ def try_read_excel(file_path: str) -> Dict[str, pd.DataFrame]:
     Returns a dict of { sheet_name: DataFrame }
     Handles merged cells, empty sheets, and large workbooks gracefully.
     """
-    try:
-        sheets = pd.read_excel(file_path, sheet_name=None, engine="openpyxl")
-        return sheets
-    except Exception as e:
-        raise ValueError(f"[excel_parser_v2] Failed to read Excel file: {file_path}: {e}")
+    max_retries = 3
+    retry_delay_sec = 1.0
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return pd.read_excel(file_path, sheet_name=None, engine="openpyxl")
+        except Exception as e:
+            last_error = e
+            msg = str(e).lower()
+            is_zip_error = "file is not a zip file" in msg
+
+            # Common with watcher-based ingestion when file write is not fully flushed yet.
+            if is_zip_error and attempt < max_retries:
+                time.sleep(retry_delay_sec)
+                continue
+
+            # Fallback: some users upload CSV data with .xlsx extension.
+            if is_zip_error:
+                try:
+                    df = pd.read_csv(file_path)
+                    log_warning(
+                        f"[excel_parser_v2] '{file_path}' is not a valid xlsx zip. "
+                        "Parsed as CSV fallback."
+                    )
+                    return {"Sheet1": df}
+                except Exception:
+                    pass
+
+            break
+
+    raise ValueError(
+        f"[excel_parser_v2] Failed to read Excel file: {file_path}: {last_error}"
+    )
 
 
 # -------------------------------------------------------------------

@@ -31,6 +31,14 @@ class PromptedEmbedder(BaseEmbedder):
         self._prompts = prompts
 
     @property
+    def kind(self) -> str:
+        """
+        Preserve wrapped embedder identity for runtime heuristics.
+        """
+        base_kind = getattr(self._base, "kind", "")
+        return str(base_kind) if base_kind else "prompted"
+
+    @property
     def info(self) -> EmbedderInfo:
         # keep original provider/model but mark wrapper in provider for debugging
         i = self._base.info

@@ -21,7 +21,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL","postgresql://postgres:Mahadeva%401
 CHROMA_PATH = os.environ.get("CHROMA_PATH", "./chroma_db")
 GCI_TABLE_SCHEMA = None   # auto-detected below
 GCI_TABLE = "global_content_index"
-CHROMA_COLLECTION = "ingested_content"
+CHROMA_COLLECTION = "ingested_content_local"
 
 BATCH = 16   # how many items to embed per batch (tune)
 SLEEP_BETWEEN_BATCHES = 0.2
