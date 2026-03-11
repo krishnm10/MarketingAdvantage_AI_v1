@@ -55,6 +55,23 @@ async def _batch_exists(vectordb, collection: str, all_ids: list) -> set:
     return existing
 
 
+async def _bulk_list_ids(vectordb, collection: str):
+    """
+    Return all vector IDs if the backend exposes bulk listing.
+    Falls back to None when unsupported.
+    """
+    _, adapter = get_chroma_collection()
+    loop = asyncio.get_running_loop()
+    try:
+        all_data = await loop.run_in_executor(
+            None,
+            lambda: adapter.get(include=[]),
+        )
+    except Exception:
+        return None
+    return {doc_id for doc_id in (all_data or {}).get("ids", []) if doc_id}
+
+
 # -----------------------------------------------------------
 # DETECT ORPHANS (READ-ONLY)
 # -----------------------------------------------------------
@@ -107,18 +124,27 @@ async def detect_orphans(
 
     # 4. Compute drift
     db_without_vdb = sorted(db_hashes - existing_in_vdb)
-    # Approximate vector orphans: vectors not accounted for by DB hashes
-    estimated_vdb_orphans = max(0, vdb_total - len(existing_in_vdb))
+    vdb_ids = await _bulk_list_ids(vectordb, collection)
+    vectordb_without_db = sorted(vdb_ids - db_hashes) if vdb_ids is not None else []
+    # Approximate vector orphans only when bulk listing is unavailable
+    estimated_vdb_orphans = (
+        len(vectordb_without_db)
+        if vdb_ids is not None
+        else max(0, vdb_total - len(existing_in_vdb))
+    )
 
     return {
         "backend": backend,
         "db_without_vectordb": db_without_vdb[:100],  # Cap response size
+        "vectordb_without_db": vectordb_without_db[:100],
+        "vectordb_orphans_exact": vdb_ids is not None,
         "estimated_vectordb_orphans": estimated_vdb_orphans,
         "counts": {
             "db_total": len(db_hashes),
             "vectordb_total": vdb_total,
             "db_matched_in_vectordb": len(existing_in_vdb),
             "db_orphans": len(db_without_vdb),
+            "vectordb_orphans": estimated_vdb_orphans,
             "estimated_vectordb_orphans": estimated_vdb_orphans,
         },
     }
@@ -146,14 +172,9 @@ async def fix_vectordb_to_db(
     db_hashes = {row[0] for row in result.all() if row[0]}
 
     # Try bulk listing (works for Chroma via adapter, fallback for others)
-    _, adapter = get_chroma_collection()
-    try:
-        all_data = adapter.get(include=[])
-        vdb_ids = set(all_data.get("ids", []))
-    except Exception:
-        vdb_ids = set()
+    vdb_ids = await _bulk_list_ids(vectordb, collection)
 
-    if not vdb_ids:
+    if vdb_ids is None:
         return {
             "status": "skipped",
             "message": f"Bulk ID listing not available for {vectordb.kind}. Use detect endpoint instead.",

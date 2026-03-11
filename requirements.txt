@@ -218,4 +218,4 @@ redis>=5.0.0
 pinecone-client>=3.0.0
 weaviate-client>=4.0.0
 pymilvus>=2.4.0
-
+weaviate-client>=4.0.0

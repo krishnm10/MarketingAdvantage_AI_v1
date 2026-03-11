@@ -280,9 +280,15 @@ class RetrievalRepository:
                 )
             elif db_type == "weaviate":
                 from app.core.vectordb.weaviate_v1 import WeaviateVectorDB
+                headers_raw = os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON", "").strip()
                 self._vectordb = WeaviateVectorDB(
                     url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
                     api_key=os.getenv("WEAVIATE_API_KEY") or None,
+                    additional_headers=__import__("json").loads(headers_raw) if headers_raw else {},
+                    embedded=os.getenv("WEAVIATE_EMBEDDED", "false").lower() in ("1", "true", "yes"),
+                    grpc_host=os.getenv("WEAVIATE_GRPC_HOST") or None,
+                    grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
+                    skip_init_checks=os.getenv("WEAVIATE_SKIP_INIT_CHECKS", "false").lower() in ("1", "true", "yes"),
                 )
             elif db_type == "redis":
                 from app.core.vectordb.redis_v1 import RedisVectorDB

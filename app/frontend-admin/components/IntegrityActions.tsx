@@ -14,7 +14,11 @@ export default function IntegrityActions() {
     setLoading("db-to-vectordb");
     setResult(null);
     try {
-      const res = await apiClient.post("/api/v2/ingestion-admin/sync/fix/db-to-vectordb");
+      const res = await apiClient.post(
+        "/api/v2/ingestion-admin/sync/fix/db-to-vectordb",
+        undefined,
+        { timeout: 10 * 60 * 1000 }
+      );
       setResult(`✅ DB → VectorDB: ${res.data?.reembedded ?? 0} vectors re-embedded (${res.data?.backend ?? "unknown"})`);
     } catch (err: any) {
       setResult(`❌ DB → VectorDB failed: ${err?.response?.data?.detail || err.message}`);
@@ -33,7 +37,11 @@ export default function IntegrityActions() {
     setLoading("vectordb-to-db");
     setResult(null);
     try {
-      const res = await apiClient.post("/api/v2/ingestion-admin/sync/fix/vectordb-to-db");
+      const res = await apiClient.post(
+        "/api/v2/ingestion-admin/sync/fix/vectordb-to-db",
+        undefined,
+        { timeout: 10 * 60 * 1000 }
+      );
       setResult(`✅ VectorDB → DB: ${res.data?.deleted_vectors ?? 0} orphan vectors deleted (${res.data?.backend ?? "unknown"})`);
     } catch (err: any) {
       setResult(`❌ VectorDB → DB failed: ${err?.response?.data?.detail || err.message}`);

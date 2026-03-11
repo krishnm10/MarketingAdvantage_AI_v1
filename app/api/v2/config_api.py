@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.guards import require_role
+from app.core.pipeline_factory import pipeline_factory
 from app.db.session_v2 import get_db
 from app.db.models.admin_audit_log import AdminAuditLog
 
@@ -196,6 +197,8 @@ async def update_config(
     # Also update os.environ so running process picks up changes immediately
     for k, v in payload.updates.items():
         os.environ[k] = v
+
+    pipeline_factory.invalidate_all()
 
     # ── Audit log ─────────────────────────────────────────────────────────
     try:

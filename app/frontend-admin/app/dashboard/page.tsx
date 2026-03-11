@@ -39,20 +39,41 @@ interface SystemConfig {
   qdrant_host: string;
   qdrant_port: string;
   qdrant_url: string;
+  qdrant_prefer_grpc: string;
+  qdrant_timeout: string;
   chroma_path: string;
   chroma_host: string;
   chroma_port: string;
   chroma_ssl: string;
+  chroma_tenant: string;
+  chroma_database: string;
+  chroma_telemetry: string;
+  milvus_uri: string;
   milvus_host: string;
   milvus_port: string;
+  milvus_db_name: string;
+  milvus_alias: string;
   weaviate_url: string;
+  weaviate_embedded: string;
+  weaviate_grpc_host: string;
+  weaviate_grpc_port: string;
+  weaviate_skip_init_checks: string;
+  weaviate_headers_json: string;
   pinecone_index: string;
+  pinecone_namespace: string;
+  pinecone_metric: string;
+  pinecone_embedding_dim: string;
   pinecone_region: string;
   pinecone_mode: string;
+  pinecone_pod_type: string;
   pinecone_local_path: string;
   redis_url: string;
   redis_host: string;
   redis_port: string;
+  redis_db: string;
+  redis_ssl: string;
+  redis_ssl_ca_certs: string;
+  redis_prefix: string;
   openai_embed_model: string;
   cohere_embed_model: string;
   openai_llm_model: string;
@@ -218,20 +239,41 @@ export default function UnifiedDashboard() {
         qdrant_host: env.QDRANT_HOST || "localhost",
         qdrant_port: env.QDRANT_PORT || "6333",
         qdrant_url: env.QDRANT_URL || "",
+        qdrant_prefer_grpc: env.QDRANT_PREFER_GRPC || "false",
+        qdrant_timeout: env.QDRANT_TIMEOUT || "30",
         chroma_path: env.CHROMA_PATH || "./chroma_db",
         chroma_host: env.CHROMA_HOST || "",
         chroma_port: env.CHROMA_PORT || "8000",
         chroma_ssl: env.CHROMA_SSL || "false",
+        chroma_tenant: env.CHROMA_TENANT || "default_tenant",
+        chroma_database: env.CHROMA_DATABASE || "default_database",
+        chroma_telemetry: env.CHROMA_TELEMETRY || "false",
+        milvus_uri: env.MILVUS_URI || "",
         milvus_host: env.MILVUS_HOST || "localhost",
         milvus_port: env.MILVUS_PORT || "19530",
+        milvus_db_name: env.MILVUS_DB_NAME || "default",
+        milvus_alias: env.MILVUS_ALIAS || "default",
         weaviate_url: env.WEAVIATE_URL || "http://localhost:8080",
+        weaviate_embedded: env.WEAVIATE_EMBEDDED || "false",
+        weaviate_grpc_host: env.WEAVIATE_GRPC_HOST || "",
+        weaviate_grpc_port: env.WEAVIATE_GRPC_PORT || "50051",
+        weaviate_skip_init_checks: env.WEAVIATE_SKIP_INIT_CHECKS || "false",
+        weaviate_headers_json: env.WEAVIATE_ADDITIONAL_HEADERS_JSON || "",
         pinecone_index: env.PINECONE_INDEX_NAME || "ingested-content",
+        pinecone_namespace: env.PINECONE_NAMESPACE || "default",
+        pinecone_metric: env.PINECONE_METRIC || "cosine",
+        pinecone_embedding_dim: env.PINECONE_EMBEDDING_DIM || "",
         pinecone_region: env.PINECONE_REGION || "us-east-1",
         pinecone_mode: env.PINECONE_MODE || "cloud",
+        pinecone_pod_type: env.PINECONE_POD_TYPE || "",
         pinecone_local_path: env.PINECONE_LOCAL_PATH || "./pinecone_local_db",
         redis_url: env.REDIS_URL || "",
         redis_host: env.REDIS_HOST || "localhost",
         redis_port: env.REDIS_PORT || "6379",
+        redis_db: env.REDIS_DB || "0",
+        redis_ssl: env.REDIS_SSL || "false",
+        redis_ssl_ca_certs: env.REDIS_SSL_CA_CERTS || "",
+        redis_prefix: env.REDIS_PREFIX || "vec:",
         openai_embed_model: env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
         cohere_embed_model: env.COHERE_EMBED_MODEL || "embed-english-v3.0",
         openai_llm_model: env.OPENAI_LLM_MODEL || "gpt-4o-mini",
@@ -599,6 +641,8 @@ export default function UnifiedDashboard() {
                 <ConfigRow label="Active VectorDB" value="qdrant" icon={Database} />
                 <ConfigRow label="Qdrant Host" value={`${config.qdrant_host}:${config.qdrant_port}`} icon={Server} />
                 {config.qdrant_url && <ConfigRow label="Qdrant URL" value={config.qdrant_url} icon={Wifi} />}
+                <ConfigRow label="Qdrant Prefer gRPC" value={config.qdrant_prefer_grpc} icon={Server} />
+                <ConfigRow label="Qdrant Timeout" value={config.qdrant_timeout} icon={Clock} />
               </>
             )}
             {config.vectordb === "chroma" && (
@@ -613,18 +657,29 @@ export default function UnifiedDashboard() {
                 ) : (
                   <ConfigRow label="ChromaDB Path" value={config.chroma_path} icon={HardDrive} />
                 )}
+                <ConfigRow label="Chroma Tenant" value={config.chroma_tenant} icon={Database} />
+                <ConfigRow label="Chroma Database" value={config.chroma_database} icon={Database} />
+                <ConfigRow label="Chroma Telemetry" value={config.chroma_telemetry} icon={Activity} />
               </>
             )}
             {config.vectordb === "milvus" && (
               <>
                 <ConfigRow label="Active VectorDB" value="milvus" icon={Database} />
+                {config.milvus_uri && <ConfigRow label="Milvus URI" value={config.milvus_uri} icon={Wifi} />}
                 <ConfigRow label="Milvus Host" value={`${config.milvus_host}:${config.milvus_port}`} icon={Server} />
+                <ConfigRow label="Milvus DB Name" value={config.milvus_db_name} icon={Database} />
+                <ConfigRow label="Milvus Alias" value={config.milvus_alias} icon={HardDrive} />
               </>
             )}
             {config.vectordb === "weaviate" && (
               <>
                 <ConfigRow label="Active VectorDB" value="weaviate" icon={Database} />
                 <ConfigRow label="Weaviate URL" value={config.weaviate_url} icon={Wifi} />
+                <ConfigRow label="Weaviate Embedded" value={config.weaviate_embedded} icon={Server} />
+                {config.weaviate_grpc_host && <ConfigRow label="Weaviate gRPC Host" value={config.weaviate_grpc_host} icon={Server} />}
+                <ConfigRow label="Weaviate gRPC Port" value={config.weaviate_grpc_port} icon={Server} />
+                <ConfigRow label="Weaviate Skip Init Checks" value={config.weaviate_skip_init_checks} icon={Activity} />
+                {config.weaviate_headers_json && <ConfigRow label="Weaviate Headers JSON" value={config.weaviate_headers_json} icon={HardDrive} />}
               </>
             )}
             {config.vectordb === "pinecone" && (
@@ -632,7 +687,11 @@ export default function UnifiedDashboard() {
                 <ConfigRow label="Active VectorDB" value="pinecone" icon={Database} />
                 <ConfigRow label="Pinecone Mode" value={config.pinecone_mode} icon={Server} />
                 <ConfigRow label="Pinecone Index" value={config.pinecone_index} icon={HardDrive} />
+                <ConfigRow label="Pinecone Namespace" value={config.pinecone_namespace} icon={HardDrive} />
+                <ConfigRow label="Pinecone Metric" value={config.pinecone_metric} icon={Database} />
+                <ConfigRow label="Pinecone Embedding Dim" value={config.pinecone_embedding_dim || "auto"} icon={Brain} />
                 <ConfigRow label="Pinecone Region" value={config.pinecone_region} icon={Server} />
+                {config.pinecone_pod_type && <ConfigRow label="Pinecone Pod Type" value={config.pinecone_pod_type} icon={HardDrive} />}
                 {config.pinecone_mode === "local" && (
                   <ConfigRow label="Pinecone Local Path" value={config.pinecone_local_path} icon={HardDrive} />
                 )}
@@ -642,6 +701,10 @@ export default function UnifiedDashboard() {
               <>
                 <ConfigRow label="Active VectorDB" value="redis" icon={Database} />
                 <ConfigRow label="Redis Endpoint" value={config.redis_url || `${config.redis_host}:${config.redis_port}`} icon={Server} />
+                <ConfigRow label="Redis DB" value={config.redis_db} icon={Database} />
+                <ConfigRow label="Redis SSL" value={config.redis_ssl} icon={Server} />
+                {config.redis_ssl_ca_certs && <ConfigRow label="Redis CA Cert" value={config.redis_ssl_ca_certs} icon={HardDrive} />}
+                <ConfigRow label="Redis Prefix" value={config.redis_prefix} icon={HardDrive} />
               </>
             )}
           </div>

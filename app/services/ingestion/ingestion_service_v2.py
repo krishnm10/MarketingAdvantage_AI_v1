@@ -10,12 +10,13 @@ import hashlib
 import re
 import os
 import asyncio
+from collections import Counter
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 # ── FastAPI / SQLAlchemy ──────────────────────────────────────────────
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy import select, insert, update, func
+from sqlalchemy import select, insert, update, func, delete
 
 # ── App internals ─────────────────────────────────────────────────────
 from app.api.v2.ingestion_ws_api import broadcast
@@ -182,6 +183,9 @@ def _build_config_from_env(
                 port=int(chroma_port),
                 ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
                 api_key_env="CHROMA_API_KEY" if os.getenv("CHROMA_API_KEY") else None,
+                tenant=os.getenv("CHROMA_TENANT", "default_tenant"),
+                database=os.getenv("CHROMA_DATABASE", "default_database"),
+                anonymized_telemetry=os.getenv("CHROMA_TELEMETRY", "false").lower() in ("1", "true", "yes"),
             ),
         )
     elif vectordb_type == "qdrant":
@@ -219,6 +223,7 @@ def _build_config_from_env(
                 metric=os.getenv("PINECONE_METRIC", "cosine"),
                 cloud=os.getenv("PINECONE_CLOUD", "aws"),
                 region=os.getenv("PINECONE_REGION", "us-east-1"),
+                pod_type=os.getenv("PINECONE_POD_TYPE") or None,
                 local_path=os.getenv("PINECONE_LOCAL_PATH") or None,
             ),
         )
@@ -232,6 +237,8 @@ def _build_config_from_env(
                 token_env="MILVUS_TOKEN" if os.getenv("MILVUS_TOKEN") else None,
                 host=os.getenv("MILVUS_HOST", "localhost"),
                 port=int(os.getenv("MILVUS_PORT", "19530")),
+                db_name=os.getenv("MILVUS_DB_NAME", "default"),
+                alias=os.getenv("MILVUS_ALIAS", "default"),
             ),
         )
     elif vectordb_type == "weaviate":
@@ -242,6 +249,15 @@ def _build_config_from_env(
             weaviate=WeaviateConfig(
                 url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
                 api_key_env="WEAVIATE_API_KEY" if os.getenv("WEAVIATE_API_KEY") else None,
+                embedded=os.getenv("WEAVIATE_EMBEDDED", "false").lower() in ("1", "true", "yes"),
+                grpc_host=os.getenv("WEAVIATE_GRPC_HOST") or None,
+                grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
+                skip_init_checks=os.getenv("WEAVIATE_SKIP_INIT_CHECKS", "false").lower() in ("1", "true", "yes"),
+                additional_headers=(
+                    __import__("json").loads(os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON", "{}") or "{}")
+                    if (os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON") or "").strip()
+                    else {}
+                ),
             ),
         )
     elif vectordb_type == "redis":
@@ -257,6 +273,8 @@ def _build_config_from_env(
                 username=os.getenv("REDIS_USERNAME") or None,
                 db=int(os.getenv("REDIS_DB", "0")),
                 ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
+                ssl_ca_certs=os.getenv("REDIS_SSL_CA_CERTS") or None,
+                prefix=os.getenv("REDIS_PREFIX", "vec:"),
             ),
         )
     else:
@@ -843,6 +861,7 @@ class IngestionServiceV2:
         parsed_payload: Dict[str, Any],
     ):
         await IngestionServiceV2._ensure_file_entry(db, file_record)
+        await IngestionServiceV2._set_file_processing(db, file_record.id)
 
         file_id     = file_record.id
         business_id = file_record.business_id
@@ -1348,6 +1367,16 @@ class IngestionServiceV2:
                 f"  Error : {type(e).__name__}: {e}\n"
                 f"  Client: {business_id} | File type: {file_type}"
             )
+            try:
+                await IngestionServiceV2._compensate_failed_vector_storage(
+                    file_id=file_id,
+                    business_id=business_id,
+                    chunks=chunks,
+                )
+            except Exception as cleanup_err:
+                log_info(
+                    f"[IngestionV2] Compensation cleanup also failed for {file_id}: {cleanup_err}"
+                )
             # 2. Mark file as FAILED in DB — UI + API show correct status
             try:
                 async with async_session() as err_db:
@@ -1370,11 +1399,91 @@ class IngestionServiceV2:
             .where(IngestedFileV2.id == file_id)
             .values(
                 error_message=str(error_message)[:255],
-                status="failed",
+                status="error",
                 updated_at=datetime.utcnow(),
             )
         )
         await db.commit()
+
+    @staticmethod
+    async def _set_file_processing(db: AsyncSession, file_id: str):
+        await db.execute(
+            update(IngestedFileV2)
+            .where(IngestedFileV2.id == file_id)
+            .values(
+                status="processing",
+                error_message=None,
+                updated_at=datetime.utcnow(),
+            )
+        )
+        await db.commit()
+
+    @staticmethod
+    async def _compensate_failed_vector_storage(
+        *,
+        file_id: str,
+        business_id: Optional[str],
+        chunks: List[Dict[str, Any]],
+    ) -> None:
+        semantic_hashes = list(
+            dict.fromkeys(
+                str(chunk.get("semantic_hash"))
+                for chunk in chunks
+                if chunk.get("semantic_hash")
+            )
+        )
+        gci_counts = Counter(
+            chunk.get("global_content_id")
+            for chunk in chunks
+            if chunk.get("global_content_id")
+        )
+
+        # Best-effort cleanup for partially written vectors.
+        if semantic_hashes:
+            try:
+                pipeline = _get_pipeline(business_id)
+                pipeline.vectordb.delete_many(
+                    collection=pipeline.config.vectordb.collection,
+                    doc_ids=semantic_hashes,
+                )
+            except Exception as vectordb_err:
+                log_info(
+                    f"[IngestionV2] Vector cleanup skipped for {file_id}: {vectordb_err}"
+                )
+
+        async with async_session() as db:
+            await db.execute(
+                delete(IngestedContentV2).where(IngestedContentV2.file_id == file_id)
+            )
+
+            for global_content_id, decrement in gci_counts.items():
+                row = await db.get(GlobalContentIndexV2, global_content_id)
+                if not row:
+                    continue
+
+                remaining_refs_result = await db.execute(
+                    select(func.count())
+                    .select_from(IngestedContentV2)
+                    .where(IngestedContentV2.global_content_id == global_content_id)
+                )
+                remaining_refs = int(remaining_refs_result.scalar() or 0)
+                next_occurrence = max(0, int(row.occurrence_count or 0) - decrement)
+
+                if remaining_refs == 0 and (
+                    next_occurrence == 0 or str(row.first_seen_file_id or "") == str(file_id)
+                ):
+                    await db.delete(row)
+                    continue
+
+                row.occurrence_count = max(remaining_refs, next_occurrence, 1 if remaining_refs > 0 else 0)
+                row.updated_at = datetime.utcnow()
+
+            await db.commit()
+            log_info(
+                f"[IngestionV2] Compensation cleanup completed for {file_id}: "
+                f"removed_chunks_for_file, adjusted_gci={len(gci_counts)}, "
+                f"vector_ids={len(semantic_hashes)}"
+            )
 
     @staticmethod
     async def _update_file_status(

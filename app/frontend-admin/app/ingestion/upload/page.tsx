@@ -42,6 +42,7 @@ export default function UploadPage() {
 
       const res = await apiClient.post<UploadResponse>("/api/v2/ingestion/upload", formData, {
         headers: { "Content-Type": "multipart/form-data" },
+        timeout: 10 * 60 * 1000,
       });
 
       const payload = res.data || {};
@@ -70,6 +71,9 @@ export default function UploadPage() {
     } catch (err: any) {
       console.error("Upload error:", err);
       const message =
+        (err?.code === "ECONNABORTED"
+          ? "Upload is taking longer than the default window. The backend may still be ingesting the file; check the ingestion files page shortly."
+          : null) ||
         err?.response?.data?.detail ||
         err?.response?.data?.message ||
         "Upload failed. Please try again.";

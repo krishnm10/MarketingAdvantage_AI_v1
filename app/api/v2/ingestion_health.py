@@ -223,9 +223,21 @@ async def _check_weaviate() -> dict:
     url = os.getenv("WEAVIATE_URL", "http://localhost:8080")
     api_key = os.getenv("WEAVIATE_API_KEY") or None
     hdrs = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-    data = await _http_get(f"{url}/v1/.well-known/ready", headers=hdrs)
-    if data is not None:
-        return _ok(f"Ready | {url}")
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=_T, trust_env=False) as client:
+            resp = await client.get(f"{url}/v1/.well-known/ready", headers=hdrs)
+            if resp.status_code < 400:
+                return _ok(f"Ready | {url}")
+
+            # Fallback for deployments exposing the meta endpoint but not the ready endpoint.
+            meta = await client.get(f"{url}/v1/meta", headers=hdrs)
+            if meta.status_code < 400:
+                return _ok(f"Connected | {url}")
+    except Exception:
+        pass
+
     return _fail(f"Cannot reach {url}")
 
 

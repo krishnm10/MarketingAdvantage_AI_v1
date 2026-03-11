@@ -28,11 +28,17 @@ export default function SyncHealth() {
     setLoading(true);
     setError("");
     apiClient
-      .get("/api/v2/ingestion-admin/sync/orphans")
+      .get("/api/v2/ingestion-admin/sync/orphans", { timeout: 5 * 60 * 1000 })
       .then((res) => setData(res.data))
       .catch((err) => {
         console.error("Sync API Error:", err);
-        setError(err?.response?.data?.detail || "Failed to load sync status. Check backend endpoint.");
+        setError(
+          (err?.code === "ECONNABORTED"
+            ? "Sync check is taking longer than the UI timeout. The backend may still be processing; refresh again shortly."
+            : null) ||
+          err?.response?.data?.detail ||
+          "Failed to load sync status. Check backend endpoint."
+        );
       })
       .finally(() => setLoading(false));
   };

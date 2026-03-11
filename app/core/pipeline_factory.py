@@ -191,6 +191,7 @@ class PipelineFactory:
     def __init__(self, *, cache_pipelines: bool = True):
         self._cache_enabled = bool(cache_pipelines)
         self._cache: Dict[str, AssembledPipeline] = {}
+        self._cache_fingerprints: Dict[str, str] = {}
         self._lock  = RLock()
 
     # =========================================================================
@@ -218,16 +219,25 @@ class PipelineFactory:
             ValueError:           Invalid config combination.
         """
         client_id = config.client_id
+        config_fingerprint = config.model_dump_json()
 
         # ── Return cached pipeline if available ──────────────────────
         if self._cache_enabled:
             with self._lock:
                 if client_id in self._cache:
+                    cached_fingerprint = self._cache_fingerprints.get(client_id)
+                    if cached_fingerprint == config_fingerprint:
+                        logger.info(
+                            "[PipelineFactory] Cache hit for client '%s'.",
+                            client_id,
+                        )
+                        return self._cache[client_id]
                     logger.info(
-                        "[PipelineFactory] Cache hit for client '%s'.",
+                        "[PipelineFactory] Cache stale for client '%s' — rebuilding.",
                         client_id,
                     )
-                    return self._cache[client_id]
+                    del self._cache[client_id]
+                    self._cache_fingerprints.pop(client_id, None)
 
         logger.info(
             "[PipelineFactory] Building pipeline | client=%s | "
@@ -292,6 +302,7 @@ class PipelineFactory:
         if self._cache_enabled:
             with self._lock:
                 self._cache[client_id] = pipeline
+                self._cache_fingerprints[client_id] = config_fingerprint
                 logger.info(
                     "[PipelineFactory] Cached pipeline for client '%s'.",
                     client_id,
@@ -304,6 +315,7 @@ class PipelineFactory:
         with self._lock:
             if client_id in self._cache:
                 del self._cache[client_id]
+                self._cache_fingerprints.pop(client_id, None)
                 logger.info(
                     "[PipelineFactory] Cache invalidated for '%s'.", client_id
                 )
@@ -313,6 +325,7 @@ class PipelineFactory:
         with self._lock:
             count = len(self._cache)
             self._cache.clear()
+            self._cache_fingerprints.clear()
             logger.info(
                 "[PipelineFactory] All %d cached pipelines cleared.", count
             )
@@ -388,6 +401,9 @@ class PipelineFactory:
                 url=c.url,
                 api_key=_env(c.api_key_env) if c.api_key_env else None,
                 embedded=c.embedded,
+                grpc_host=c.grpc_host,
+                grpc_port=c.grpc_port,
+                skip_init_checks=c.skip_init_checks,
                 additional_headers=c.additional_headers,
             )
 

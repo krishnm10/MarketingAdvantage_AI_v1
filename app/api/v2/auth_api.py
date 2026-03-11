@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import timedelta
+import os
 from app.db.session_v2 import get_db
 from app.auth.generate_token import create_access_token, verify_access_token
 
@@ -10,7 +11,7 @@ router = APIRouter(prefix="/api/v2/auth", tags=["Authentication"])
 # -----------------------------------------------------------
 # CONFIG
 # -----------------------------------------------------------
-ACCESS_TOKEN_EXPIRE_MINUTES = 30  # 30-minute session timeout
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 # -----------------------------------------------------------
 # TEMP USERS (until DB-based auth is added)

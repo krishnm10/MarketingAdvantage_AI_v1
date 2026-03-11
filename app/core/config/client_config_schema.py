@@ -158,6 +158,9 @@ class WeaviateConfig(BaseModel):
         None, description="Env var NAME for WCS API key."
     )
     embedded:           bool             = False
+    grpc_host:          Optional[str]    = None
+    grpc_port:          int              = 50051
+    skip_init_checks:   bool             = False
     additional_headers: Dict[str, str]   = Field(default_factory=dict)
 
 

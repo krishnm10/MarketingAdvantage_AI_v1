@@ -111,6 +111,8 @@ async def lifespan(app: FastAPI):
 
     # ─────────────────────────────────────────────────────────────────
     active_vectordb = os.getenv("MAI_VECTORDB", "chroma").lower()
+    pipeline_factory.invalidate_all()
+    logger.info("[Startup] Cleared cached pipelines before initialization.")
 
     # STEP 1: Initialize active vector DB via compatibility adapter
     # ─────────────────────────────────────────────────────────────────
