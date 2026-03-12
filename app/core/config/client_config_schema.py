@@ -141,6 +141,7 @@ class QdrantConfig(BaseModel):
     )
     host:         str   = "localhost"
     port:         int   = 6333
+    transport:    Literal["auto", "http", "grpc"] = "auto"
     prefer_grpc:  bool  = False
     timeout:      float = 30.0
 
@@ -158,6 +159,7 @@ class WeaviateConfig(BaseModel):
         None, description="Env var NAME for WCS API key."
     )
     embedded:           bool             = False
+    transport:          Literal["auto", "http", "grpc"] = "auto"
     grpc_host:          Optional[str]    = None
     grpc_port:          int              = 50051
     skip_init_checks:   bool             = False
@@ -192,6 +194,7 @@ class MilvusConfig(BaseModel):
     port:          int  = 19530
     db_name:       str  = "default"
     alias:         str  = "default"
+    transport:     Literal["auto", "grpc"] = "grpc"
 
 
 class RedisConfig(BaseModel):

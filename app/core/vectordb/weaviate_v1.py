@@ -32,6 +32,7 @@ class WeaviateVectorDB(BaseVectorDB):
         api_key: Optional[str] = None,
         additional_headers: Optional[Dict[str, str]] = None,
         embedded: bool = False,
+        prefer_grpc: bool = True,
         grpc_host: Optional[str] = None,
         grpc_port: int = 50051,
         skip_init_checks: bool = False,
@@ -46,8 +47,9 @@ class WeaviateVectorDB(BaseVectorDB):
         self._url = url.rstrip("/")
         self._api_key = api_key
         self._additional_headers = additional_headers or {}
+        self._prefer_grpc = bool(prefer_grpc)
         # If startup checks are skipped, assume gRPC may be unavailable and prefer REST reads.
-        self._prefer_rest_reads = bool(skip_init_checks)
+        self._prefer_rest_reads = bool(skip_init_checks) or not self._prefer_grpc
 
         if embedded:
             import weaviate.embedded as _emb
@@ -76,10 +78,11 @@ class WeaviateVectorDB(BaseVectorDB):
             )
 
         logger.info(
-            "[WeaviateVectorDB] Connected | url=%s | grpc=%s:%s | embedded=%s | skip_init_checks=%s",
+            "[WeaviateVectorDB] Connected | url=%s | grpc=%s:%s | prefer_grpc=%s | embedded=%s | skip_init_checks=%s",
             url,
             grpc_host or (urlparse(url).hostname or url),
             grpc_port,
+            self._prefer_grpc,
             embedded,
             skip_init_checks,
         )

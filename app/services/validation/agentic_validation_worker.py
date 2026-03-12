@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session_v2 import AsyncSessionLocal
 from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
+from app.utils.env_flags import get_env_bool
 from app.utils.logger import log_info, log_warning, log_debug
 
 # ============================================================
@@ -168,6 +169,21 @@ async def run_agentic_validation(batch_size: int = 50) -> Dict[str, Any]:
     Returns:
         Stats dictionary with processing metrics
     """
+    if not get_env_bool(
+        "ENABLE_AGENTIC_VALIDATION",
+        default=True,
+        aliases=("ENABLE_VALIDATION",),
+    ):
+        log_info("[AgenticValidation] Disabled via env toggle. Skipping run.")
+        return {
+            "processed": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "duration_ms": 0,
+            "skipped": True,
+            "reason": "disabled_by_env",
+        }
+
     start_time = datetime.now(timezone.utc)
     
     async with AsyncSessionLocal() as session:
@@ -186,28 +202,35 @@ async def run_agentic_validation(batch_size: int = 50) -> Dict[str, Any]:
         log_info(f"[AgenticValidation] Processing {len(rows)} chunks...")
         
         succeeded = 0
-        failed = 0
-        failures = []
-        
+        failed    = 0
+        failures  = []
+
+        # Collect (id, snapshot) pairs — bulk-append with savepoints after loop
+        pending_snapshots = []
+
         for row in rows:
             try:
                 snapshot = await validate_ingested_chunk(session, row)
-                await append_validation_snapshot(session, row.id, snapshot)
+                pending_snapshots.append((row.id, snapshot))
                 succeeded += 1
-                
-                # Log quality warnings
+
+                # Log quality warnings (pure CPU — no I/O)
                 _check_quality_warnings(row.id, snapshot)
-                
+
             except Exception as e:
                 failed += 1
-                failures.append({
-                    "chunk_id": str(row.id),
-                    "error": str(e)
-                })
+                failures.append({"chunk_id": str(row.id), "error": str(e)})
                 log_warning(
                     f"[AgenticValidation] Validation failed for {row.id}: {e}"
                 )
-        
+
+        # SAFETY-2 + PERF-2: Bulk UPDATE with per-chunk savepoints.
+        # Each UPDATE is wrapped in a SAVEPOINT.  On DeadlockDetectedError
+        # SQLAlchemy issues ROLLBACK TO SAVEPOINT automatically — other chunks
+        # in the batch are unaffected.
+        if pending_snapshots:
+            await append_validation_snapshot_batch(session, pending_snapshots)
+
         # Commit all successful validations
         await session.commit()
         
@@ -236,12 +259,19 @@ async def _fetch_pending_validation(
 ) -> List[IngestedContentV2]:
     """
     Fetch chunks that need validation.
-    
+
     Selection criteria:
     - No validation_layer OR
     - Missing current validation version
-    
-    Orders by created_at (FIFO processing)
+
+    Orders by created_at (FIFO processing).
+
+    SAFETY-1: with_for_update(skip_locked=True)
+      Acquires row-level locks on each selected row.
+      SKIP LOCKED means rows already locked by another worker
+      (temporal_revalidation, conflict_detection) are silently skipped
+      rather than blocking → workers process disjoint sets → deadlocks
+      eliminated.
     """
     stmt = (
         select(IngestedContentV2)
@@ -255,8 +285,9 @@ async def _fetch_pending_validation(
         )
         .order_by(IngestedContentV2.created_at.asc())  # FIFO
         .limit(batch_size)
+        .with_for_update(skip_locked=True)   # ← SAFETY-1
     )
-    
+
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -286,19 +317,48 @@ async def validate_ingested_chunk(
     # 1. DATA INTEGRITY CHECKS
     # --------------------------------------------------------
     
-    if not chunk.global_content_id:
-        raise ValueError(f"Chunk {chunk.id} missing global_content_id")
-    
-    gci = await session.get(GlobalContentIndexV2, chunk.global_content_id)
-    if not gci:
-        raise ValueError(
-            f"Chunk {chunk.id} references non-existent "
-            f"GlobalContentIndex {chunk.global_content_id}"
+    # ── Resolve canonical text ──────────────────────────────────────────────
+    # PRIMARY: read from GlobalContentIndex (GCI) — the dedup-canonical version
+    # FALLBACK: use chunk's own cleaned_text when GCI link is absent
+    #
+    # BUG FIX: previously raised ValueError when global_content_id was NULL.
+    # This permanently blocked validation for:
+    #   a) Chunks ingested before the GCI registration fix (legacy rows)
+    #   b) Any edge-case where GCI write succeeded but FK wasn't propagated
+    # The chunk stayed "pending" forever, causing infinite retry spam in logs.
+    #
+    # New behaviour:
+    #   - global_content_id present & GCI row found  → use gci.cleaned_text (canonical)
+    #   - global_content_id present but GCI row gone → fall back to chunk.cleaned_text
+    #     and log a warning (GCI row may have been deleted)
+    #   - global_content_id absent (NULL)            → fall back to chunk.cleaned_text
+    #     and log a warning (pre-GCI-fix legacy chunk)
+    # In all fallback cases validation still completes; only canonical source differs.
+    # ─────────────────────────────────────────────────────────────────────────
+    canonical_text = None
+
+    if chunk.global_content_id:
+        gci = await session.get(GlobalContentIndexV2, chunk.global_content_id)
+        if gci and gci.cleaned_text and gci.cleaned_text.strip():
+            canonical_text = gci.cleaned_text
+        else:
+            log_warning(
+                f"[AgenticValidation] Chunk {chunk.id} has global_content_id "
+                f"{chunk.global_content_id} but GCI row is missing or empty — "
+                f"falling back to chunk.cleaned_text"
+            )
+    else:
+        log_warning(
+            f"[AgenticValidation] Chunk {chunk.id} has no global_content_id "
+            f"(legacy chunk pre-dating GCI registration) — "
+            f"falling back to chunk.cleaned_text"
         )
-    
-    canonical_text = gci.cleaned_text
-    if not canonical_text or not canonical_text.strip():
-        raise ValueError(f"Chunk {chunk.id} has empty canonical text")
+
+    if not canonical_text:
+        canonical_text = chunk.cleaned_text or chunk.text or ""
+
+    if not canonical_text.strip():
+        raise ValueError(f"Chunk {chunk.id} has empty text — cannot validate")
     
     reasoning = chunk.reasoning_ingestion or {}
     
@@ -652,32 +712,43 @@ def derive_validation_flags(
     freshness: float,
     actionability: float,
     regulated: bool,
-    age_days: int
+    age_days,          # int or None — see BUG FIX below
 ) -> Dict[str, bool]:
     """
     Derive quality/risk flags for governance.
     """
     thresholds = ValidationThresholds()
-    
+
+    # ── BUG FIX: age_days can be None ────────────────────────────────────────
+    # score_temporal_freshness() returns {"age_days": None, ...} when
+    # extraction_timestamp is missing (structured data before reasoning_ingestion
+    # passthrough fix). The caller does temporal_metadata.get("age_days", 0)
+    # which returns None — NOT 0 — because the key EXISTS with value None.
+    # Python dict.get() only uses the default when the key is ABSENT.
+    # None > 730 → TypeError every single validation run → ALL chunks stuck.
+    # Fix: coerce None → 0 (unknown age = assume not critically stale).
+    # ─────────────────────────────────────────────────────────────────────────
+    safe_age = age_days if age_days is not None else 0
+
     return {
         # Quality warnings
         "low_signal_quality": signal < thresholds.WARN_SIGNAL_QUALITY,
         "untrusted_source": authority < thresholds.CRITICAL_AUTHORITY,
         "stale_content": freshness < thresholds.WARN_TEMPORAL_FRESHNESS,
         "non_actionable": actionability < thresholds.MIN_ACTIONABILITY,
-        
+
         # Critical flags
-        "critically_stale": age_days > thresholds.CRITICAL_AGE_DAYS,
+        "critically_stale": safe_age > thresholds.CRITICAL_AGE_DAYS,
         "below_minimum_quality": any([
             signal < thresholds.MIN_SIGNAL_QUALITY,
             authority < thresholds.MIN_SOURCE_AUTHORITY,
             freshness < thresholds.MIN_TEMPORAL_FRESHNESS,
         ]),
-        
+
         # Governance flags
         "potentially_regulated": regulated,
         "requires_review": authority < 0.5 or freshness < 0.3,
-        
+
         # Conflict flags (placeholder for Step-2.2)
         "high_conflict": False,
     }
@@ -708,33 +779,55 @@ def _check_quality_warnings(chunk_id, snapshot: Dict[str, Any]) -> None:
 # STORAGE (Append-Only)
 # ============================================================
 
+async def append_validation_snapshot_batch(
+    session:   AsyncSession,
+    snapshots: List[Tuple[Any, Dict[str, Any]]],
+) -> None:
+    """
+    PERF-2 + SAFETY-2: Bulk-append validation snapshots with savepoint isolation.
+
+    For each (chunk_id, snapshot) pair:
+      - Appends snapshot inside a SAVEPOINT (begin_nested()).
+      - On DeadlockDetectedError SQLAlchemy issues ROLLBACK TO SAVEPOINT
+        automatically.  The outer transaction and all other SAVEPOINTs survive.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    for ingested_id, snapshot in snapshots:
+        try:
+            async with session.begin_nested():   # SAVEPOINT per chunk
+                payload_json = json.dumps([snapshot])
+                stmt = text("""
+                    UPDATE ingested_content
+                    SET validation_layer =
+                        COALESCE(validation_layer, '[]'::jsonb)
+                        || CAST(:payload AS jsonb)
+                    WHERE id = :id
+                """)
+                await session.execute(
+                    stmt,
+                    {"id": ingested_id, "payload": payload_json},
+                )
+        except DBAPIError as e:
+            # Savepoint rolled back automatically — outer transaction intact.
+            log_warning(
+                f"[AgenticValidation] Savepoint rolled back for chunk "
+                f"{ingested_id}: {e} — skipping this chunk"
+            )
+
+
 async def append_validation_snapshot(
     session: AsyncSession,
     ingested_id,
     snapshot: Dict[str, Any]
 ) -> None:
     """
-    Append validation snapshot to validation_layer (JSONB array).
-    
+    Single-row convenience wrapper — used by external callers and tests.
+    For batch updates, use append_validation_snapshot_batch() instead.
+
     NOTE: asyncpg requires explicit JSON encoding + CAST to jsonb
     """
-    stmt = text("""
-        UPDATE ingested_content
-        SET validation_layer =
-            COALESCE(validation_layer, '[]'::jsonb)
-            || CAST(:payload AS jsonb)
-        WHERE id = :id
-    """)
-    
-    payload_json = json.dumps([snapshot])
-    
-    await session.execute(
-        stmt,
-        {
-            "id": ingested_id,
-            "payload": payload_json,
-        }
-    )
+    await append_validation_snapshot_batch(session, [(ingested_id, snapshot)])
 
 # ============================================================
 # UTILITY FUNCTIONS

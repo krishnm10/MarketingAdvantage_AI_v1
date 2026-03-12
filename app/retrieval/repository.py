@@ -232,15 +232,23 @@ class RetrievalRepository:
         if self._vectordb is None:
             db_type = os.getenv("MAI_VECTORDB", "chroma").lower()
             log_info(f"[REPO] Initializing pluggable vector DB: {db_type}")
+            vector_transport = (os.getenv("MAI_VECTOR_TRANSPORT", "auto") or "auto").strip().lower()
+            if vector_transport not in ("auto", "http", "grpc"):
+                vector_transport = "auto"
             
             if db_type == "qdrant":
                 from app.core.vectordb.qdrant_v1 import QdrantVectorDB
+                qdrant_transport = (os.getenv("QDRANT_TRANSPORT") or vector_transport).strip().lower()
                 self._vectordb = QdrantVectorDB(
                     url=os.getenv("QDRANT_URL") or None,
                     host=os.getenv("QDRANT_HOST", "localhost"),
                     port=int(os.getenv("QDRANT_PORT") or "6333"),
                     api_key=os.getenv("QDRANT_API_KEY") or None,
-                    prefer_grpc=os.getenv("QDRANT_PREFER_GRPC", "").lower() in ("1", "true", "yes"),
+                    prefer_grpc=(
+                        True if qdrant_transport == "grpc" else
+                        False if qdrant_transport == "http" else
+                        os.getenv("QDRANT_PREFER_GRPC", "").lower() in ("1", "true", "yes")
+                    ),
                     timeout=float(os.getenv("QDRANT_TIMEOUT") or "30"),
                 )
             elif db_type == "chroma":
@@ -281,11 +289,13 @@ class RetrievalRepository:
             elif db_type == "weaviate":
                 from app.core.vectordb.weaviate_v1 import WeaviateVectorDB
                 headers_raw = os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON", "").strip()
+                weaviate_transport = (os.getenv("WEAVIATE_TRANSPORT") or vector_transport).strip().lower()
                 self._vectordb = WeaviateVectorDB(
                     url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
                     api_key=os.getenv("WEAVIATE_API_KEY") or None,
                     additional_headers=__import__("json").loads(headers_raw) if headers_raw else {},
                     embedded=os.getenv("WEAVIATE_EMBEDDED", "false").lower() in ("1", "true", "yes"),
+                    prefer_grpc=(weaviate_transport != "http"),
                     grpc_host=os.getenv("WEAVIATE_GRPC_HOST") or None,
                     grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
                     skip_init_checks=os.getenv("WEAVIATE_SKIP_INIT_CHECKS", "false").lower() in ("1", "true", "yes"),

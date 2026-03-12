@@ -71,6 +71,19 @@ from app.core.rag_pipeline import RAGPipeline, RAGResult  # ← NEW
 logger = logging.getLogger(__name__)
 
 
+def _prefer_grpc_transport(
+    transport: str,
+    *,
+    fallback: bool = False,
+) -> bool:
+    mode = str(transport or "auto").strip().lower()
+    if mode == "grpc":
+        return True
+    if mode == "http":
+        return False
+    return bool(fallback)
+
+
 # =============================================================================
 # AssembledPipeline — final wired container
 # =============================================================================
@@ -298,6 +311,8 @@ class PipelineFactory:
             reranker=reranker,
             config=config,
         )
+        pipeline._collection_ensured = True
+        pipeline._embedding_dim = embedding_dim
 
         if self._cache_enabled:
             with self._lock:
@@ -376,7 +391,10 @@ class PipelineFactory:
                     "qdrant",
                     url=c.url,
                     api_key=api_key,
-                    prefer_grpc=c.prefer_grpc,
+                    prefer_grpc=_prefer_grpc_transport(
+                        c.transport,
+                        fallback=c.prefer_grpc,
+                    ),
                     timeout=c.timeout,
                 )
 
@@ -391,7 +409,10 @@ class PipelineFactory:
                 "qdrant",
                 host=c.host or "localhost",
                 port=c.port or 6333,
-                prefer_grpc=c.prefer_grpc,
+                prefer_grpc=_prefer_grpc_transport(
+                    c.transport,
+                    fallback=c.prefer_grpc,
+                ),
                 timeout=c.timeout,
             )
         if t == VectorDBType.WEAVIATE:
@@ -401,6 +422,7 @@ class PipelineFactory:
                 url=c.url,
                 api_key=_env(c.api_key_env) if c.api_key_env else None,
                 embedded=c.embedded,
+                prefer_grpc=_prefer_grpc_transport(c.transport, fallback=True),
                 grpc_host=c.grpc_host,
                 grpc_port=c.grpc_port,
                 skip_init_checks=c.skip_init_checks,
@@ -426,6 +448,11 @@ class PipelineFactory:
 
         if t == VectorDBType.MILVUS:
             c = cfg.milvus
+            if str(c.transport).lower() != "grpc":
+                logger.warning(
+                    "[PipelineFactory] Milvus transport '%s' requested, but PyMilvus uses gRPC. Proceeding with gRPC.",
+                    c.transport,
+                )
             return vectordb_registry.build(
                 "milvus",
                 uri=c.uri,

@@ -8,15 +8,14 @@ Install:
   pip install ollama
 
 Notes:
-- Ollama embeddings do not always have a true batch endpoint, so we implement
-  safe parallel batching via a small threadpool.
+- Prefer Ollama's batch embed API when available.
+- Fall back to the legacy single-prompt endpoint only for older clients.
 ================================================================================
 """
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from typing import List, Optional
+from typing import List
 
 from app.core.embedders.base import BaseEmbedder, EmbedderInfo, _l2_normalize
 
@@ -41,9 +40,10 @@ class OllamaEmbedder(BaseEmbedder):
         self._model = model
         self._max_workers = int(max_workers)
         self._normalize = bool(normalize)
+        self._supports_batch_embed = hasattr(self._client, "embed")
 
         # Determine dim once (cheap + avoids config mismatch later)
-        test = self._client.embeddings(model=self._model, prompt="dim_probe")["embedding"]
+        test = self.embed_query("dim_probe")
         self._dim = len(test)
 
     @property
@@ -66,5 +66,11 @@ class OllamaEmbedder(BaseEmbedder):
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         if not texts:
             return []
-        with ThreadPoolExecutor(max_workers=self._max_workers) as pool:
-            return list(pool.map(self._embed_one, texts))
+        if self._supports_batch_embed:
+            response = self._client.embed(model=self._model, input=texts)
+            return [
+                _l2_normalize([float(x) for x in vec]) if self._normalize else [float(x) for x in vec]
+                for vec in response["embeddings"]
+            ]
+
+        return [self._embed_one(text) for text in texts]

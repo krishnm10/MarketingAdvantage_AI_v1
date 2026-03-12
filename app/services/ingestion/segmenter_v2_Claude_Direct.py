@@ -1,28 +1,55 @@
 # =============================================
-# segmenter_v2.py — RSC++ Semantic Chunker (Patched for Patch B)
-# Fully aligned with IngestionServiceV2 and DB Schema
-# STEP-1 PATCH: Reasoning Ingestion Metadata (NON-BREAKING)
+# segmenter_v2.py — RSC++ Semantic Chunker
+# ENTERPRISE REDESIGN: Pure chunking, zero GCI writes.
+#
+# ARCHITECTURE CHANGE (Self-Poisoning GCI — Final Fix):
+#   BEFORE: make_chunk_dict() wrote to GCI during chunking via
+#           pg_insert + SELECT + UPDATE. This caused two failures:
+#
+#   FAILURE 1 — Intra-ingestion inflation:
+#     PDF parsers often process overlapping page content across
+#     multiple recursive_semantic_chunk() calls within one ingestion.
+#     Each call wrote to GCI. Shared boundary chunks got
+#     occurrence_count=2 before dedup ran. Dedup then flagged them
+#     as cross-file duplicates — producing 50% false positives on
+#     FIRST ingestion of any multi-page document.
+#
+#   FAILURE 2 — Write-before-confirm:
+#     GCI was written to before dedup confirmed uniqueness.
+#     A chunk was registered as "known content" even if the same
+#     ingestion was about to deduplicate it. This corrupted the
+#     cross-file duplicate registry irreversibly.
+#
+#   AFTER (this file):
+#     make_chunk_dict() does ZERO DB writes. It is a pure function:
+#     text → hash + metadata dict. No side effects, fully idempotent.
+#
+#     GCI registration happens EXCLUSIVELY in register_unique_chunks_in_gci()
+#     inside deduplication_engine_v2.py, called from _run_pipeline()
+#     AFTER the full 3-layer dedup confirms uniqueness.
+#
+#   GUARANTEED CORRECTNESS:
+#     • Any GCI entry at dedup-read time = content from a prior ingestion
+#     • No GCI inflation possible within a single ingestion run
+#     • Intra-file duplicates caught by L1 (in-memory set, zero DB calls)
+#     • Cross-file duplicates caught by L2 (single batch GCI SQL IN query)
+#     • Semantic near-duplicates caught by L3 (vector similarity, async)
 # =============================================
 
 import re
-import uuid
-import hashlib
 from typing import List, Dict, Any
 from datetime import datetime
-from functools import lru_cache
-from app.config.ingestion_settings import EMBEDDING_MODEL_NAME
+import asyncio
+from collections import deque
 
-# =============================================
-# ✅ NEW IMPORT: Normalized Hash from Deduplication Engine
-# =============================================
-from app.services.ingestion.deduplication_engine_v2 import create_normalized_hash                                               
-                                                                     # ❗ Removed embed model usage here — embedding is now centralized in ingestion_service_v2
-# to avoid blocking event loop inside segmenter.
-# We still keep lazy-loader for future optional use.
-@lru_cache(maxsize=1)
-def get_embed_model():
-    from sentence_transformers import SentenceTransformer
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+from app.services.ingestion.deduplication_engine_v2 import create_normalized_hash
+from app.utils.text_cleaner_v2 import clean_text
+from app.utils.logger import log_info, log_warning
+
+# GlobalContentIndexV2 import removed — segmenter no longer writes to GCI.
+# GCI writes are handled exclusively by register_unique_chunks_in_gci()
+# in deduplication_engine_v2.py after dedup confirms uniqueness.
+
 
 # -------------------------------------------------------------------
 # TOKEN COUNTER
@@ -30,24 +57,21 @@ def get_embed_model():
 def count_tokens(text: str) -> int:
     return len(text.split())
 
+
 # -------------------------------------------------------------------
-# ✅ UPDATED: SEMANTIC HASH GENERATOR (Normalized for Better Dedup)
+# SEMANTIC HASH GENERATOR
 # -------------------------------------------------------------------
 def make_semantic_hash(text: str) -> str:
     """
-    ✅ UPDATED: Creates a normalized semantic hash for production-grade deduplication.
-
-    This ensures that minor variations don't create different hashes:
-    - "Hello World" and "hello world" → Same hash
-    - "Text" and "Text " (extra space) → Same hash
-    - "Hello!" and "Hello" → Same hash
-
-    Uses the centralized deduplication engine for consistency across the system.
+    Normalized semantic hash — identical content always produces identical hash.
+    "Hello World" == "hello world" == "HELLO  WORLD" == "Hello World!"
+    Uses centralized create_normalized_hash for full pipeline consistency.
     """
     return create_normalized_hash(text)
 
+
 # -------------------------------------------------------------------
-# STEP-1: REASONING INGESTION METADATA (ADDITIVE, SAFE)
+# STEP-1: REASONING INGESTION METADATA
 # -------------------------------------------------------------------
 def build_reasoning_ingestion_metadata(
     *,
@@ -55,14 +79,9 @@ def build_reasoning_ingestion_metadata(
     source_type: str,
     semantic_hash: str,
 ) -> Dict[str, Any]:
-    """
-    Step-1 ingestion-time reasoning metadata.
-    Rule-based, deterministic, non-interpretive.
-    """
-
+    """Rule-based, deterministic, non-interpretive ingestion metadata."""
     text_lower = text.lower()
 
-    # ---- signal_type ----
     if any(k in text_lower for k in ["%", "revenue", "growth", "cost", "rate"]):
         signal_type = "metric"
     elif any(k in text_lower for k in ["how to", "steps", "process", "guide"]):
@@ -72,7 +91,6 @@ def build_reasoning_ingestion_metadata(
     else:
         signal_type = "narrative"
 
-    # ---- business_function ----
     if any(k in text_lower for k in ["finance", "revenue", "profit", "cost"]):
         business_function = "finance"
     elif any(k in text_lower for k in ["operation", "supply", "logistics"]):
@@ -88,7 +106,6 @@ def build_reasoning_ingestion_metadata(
     else:
         business_function = "general"
 
-    # ---- time_horizon ----
     if any(k in text_lower for k in ["will", "forecast", "expected", "future"]):
         time_horizon = "forecast"
     elif any(k in text_lower for k in ["currently", "today", "now"]):
@@ -98,7 +115,6 @@ def build_reasoning_ingestion_metadata(
     else:
         time_horizon = "timeless"
 
-    # ---- granularity ----
     if len(text) < 300:
         granularity = "executive_summary"
     elif len(text) < 1200:
@@ -107,38 +123,36 @@ def build_reasoning_ingestion_metadata(
         granularity = "raw_data"
 
     return {
-        "signal_type": signal_type,
-        "business_function": business_function,
-        "time_horizon": time_horizon,
+        "signal_type":            signal_type,
+        "business_function":      business_function,
+        "time_horizon":           time_horizon,
         "origin_authority": (
             "primary_source"
             if source_type in {"pdf", "docx", "csv", "xls", "xlsx"}
             else "secondary_source"
         ),
-        "extraction_confidence": 0.90,
-        "granularity": granularity,
-        "data_lineage_id": semantic_hash,
-        "potentially_regulated": any(
+        "extraction_confidence":  0.90,
+        "granularity":            granularity,
+        "data_lineage_id":        semantic_hash,
+        "potentially_regulated":  any(
             k in text_lower for k in ["gdpr", "hipaa", "sox", "regulation"]
         ),
-        "extraction_timestamp": datetime.utcnow().isoformat() + "Z",
+        "extraction_timestamp":   datetime.utcnow().isoformat() + "Z",
     }
+
 
 # -------------------------------------------------------------------
 # MERGE SMALL CHUNKS
 # -------------------------------------------------------------------
 def merge_small_chunks(chunks: List[Any], min_len: int) -> List[str]:
     merged, buffer = [], ""
-
     for ch in chunks:
         if isinstance(ch, dict):
             ch = ch.get("cleaned_text") or ch.get("text") or ""
         elif not isinstance(ch, str):
             ch = str(ch)
-
         if not ch.strip():
             continue
-
         if len(ch) < min_len:
             buffer += " " + ch
         else:
@@ -146,18 +160,10 @@ def merge_small_chunks(chunks: List[Any], min_len: int) -> List[str]:
                 merged.append(buffer.strip())
                 buffer = ""
             merged.append(ch)
-
     if buffer:
         merged.append(buffer.strip())
-
     return merged
 
-from sqlalchemy import select, update
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-
-from app.utils.text_cleaner_v2 import clean_text
-from app.utils.logger import log_info, log_warning
-from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 
 # -------------------------------------------------------------------
 # RECURSIVE SEMANTIC CHUNKING (RSC++)
@@ -166,25 +172,30 @@ async def recursive_semantic_chunk(
     text: str,
     max_chunk_len: int = 600,
     min_chunk_len: int = 150,
-    db_session=None,
+    db_session=None,        # retained for call-site compatibility — NOT used for GCI
     file_id=None,
     business_id=None,
     source_type: str = None,
+    embedding_model: str | None = None,
 ) -> List[Dict[str, Any]]:
-
+    """
+    Pure text-to-chunk conversion. Fully idempotent — no DB side effects.
+    db_session is accepted for backwards compatibility but intentionally unused.
+    GCI writes are performed post-dedup by register_unique_chunks_in_gci().
+    """
     cleaned = clean_text(text)
     if not cleaned.strip():
         return []
 
     if len(cleaned) <= max_chunk_len:
-        chunk = await make_chunk_dict(
+        chunk = make_chunk_dict(
             cleaned,
-            db_session=db_session,
             file_id=file_id,
             business_id=business_id,
             source_type=source_type,
+            embedding_model=embedding_model,
         )
-        return [chunk]
+        return [chunk] if chunk else []
 
     sentences = re.split(r"(?<=[.!?]) +", cleaned)
 
@@ -192,17 +203,15 @@ async def recursive_semantic_chunk(
         mid = len(cleaned) // 2
         left = await recursive_semantic_chunk(
             cleaned[:mid],
-            db_session=db_session,
-            file_id=file_id,
-            business_id=business_id,
-            source_type=source_type,
+            max_chunk_len=max_chunk_len, min_chunk_len=min_chunk_len,
+            file_id=file_id, business_id=business_id,
+            source_type=source_type, embedding_model=embedding_model,
         )
         right = await recursive_semantic_chunk(
             cleaned[mid:],
-            db_session=db_session,
-            file_id=file_id,
-            business_id=business_id,
-            source_type=source_type,
+            max_chunk_len=max_chunk_len, min_chunk_len=min_chunk_len,
+            file_id=file_id, business_id=business_id,
+            source_type=source_type, embedding_model=embedding_model,
         )
         return left + right
 
@@ -222,10 +231,9 @@ async def recursive_semantic_chunk(
             refined.extend(
                 await recursive_semantic_chunk(
                     ch,
-                    db_session=db_session,
-                    file_id=file_id,
-                    business_id=business_id,
-                    source_type=source_type,
+                    max_chunk_len=max_chunk_len, min_chunk_len=min_chunk_len,
+                    file_id=file_id, business_id=business_id,
+                    source_type=source_type, embedding_model=embedding_model,
                 )
             )
         else:
@@ -235,106 +243,52 @@ async def recursive_semantic_chunk(
 
     result = []
     for ch in merged:
-        c = await make_chunk_dict(
+        c = make_chunk_dict(
             ch,
-            db_session=db_session,
-            file_id=file_id,
-            business_id=business_id,
-            source_type=source_type,
+            file_id=file_id, business_id=business_id,
+            source_type=source_type, embedding_model=embedding_model,
         )
-        result.append(c)
+        if c:
+            result.append(c)
 
     return result
 
+
 # -------------------------------------------------------------------
-# ✅ UPDATED: DEDUP-AWARE CHUNK BUILDER (Enhanced with Normalized Hash)
+# CHUNK BUILDER — pure function, no DB writes
 # -------------------------------------------------------------------
-async def make_chunk_dict(
+def make_chunk_dict(
     text: str,
-    db_session=None,
+    db_session=None,        # retained for call-site compatibility — NOT used
     file_id=None,
     business_id=None,
     source_type: str = None,
+    embedding_model: str | None = None,
 ) -> Dict[str, Any]:
     """
-    ✅ UPDATED: Enhanced chunk dictionary builder with normalized hash support.
+    Pure chunk dict builder. Zero DB writes. Fully idempotent.
 
-    Changes:
-    - Uses normalized hash via make_semantic_hash() (now uses create_normalized_hash)
-    - Explicitly includes normalized_hash field for deduplication engine
-    - All existing functionality preserved (GCI, reasoning metadata, etc.)
+    global_content_id is intentionally None here. It is populated with the
+    actual GCI UUID by register_unique_chunks_in_gci() after dedup confirms
+    the chunk is unique and writes it to GlobalContentIndexV2.
     """
     cleaned = clean_text(text)
     if not cleaned.strip():
         return {}
 
-    # ✅ This now uses normalized hash via create_normalized_hash()
     semantic_hash = make_semantic_hash(cleaned)
-    tokens = count_tokens(cleaned)
-    now = datetime.utcnow()
-
-    gci_id = None
-
-    if db_session is not None:
-
-        stmt = pg_insert(GlobalContentIndexV2).values(
-            id=str(uuid.uuid4()),
-            semantic_hash=semantic_hash,
-            cleaned_text=cleaned,
-            raw_text=text,
-            tokens=tokens,
-            business_id=business_id,
-            first_seen_file_id=file_id,
-            source_type=source_type,
-            occurrence_count=1,
-            created_at=now,
-            updated_at=now,
-        ).on_conflict_do_nothing(index_elements=["semantic_hash"])
-
-        try:
-            await db_session.execute(stmt)
-            await db_session.commit()
-        except Exception as e:
-            log_warning(f"[segmenter_v2] GCI insert conflict: {e}")
-
-        result = await db_session.execute(
-            select(GlobalContentIndexV2).where(
-                GlobalContentIndexV2.semantic_hash == semantic_hash
-            )
-        )
-        row = result.scalar_one_or_none()
-
-        if row:
-            gci_id = row.id
-
-            try:
-                await db_session.execute(
-                    update(GlobalContentIndexV2)
-                    .where(GlobalContentIndexV2.id == gci_id)
-                    .values(
-                        occurrence_count=GlobalContentIndexV2.occurrence_count + 1,
-                        updated_at=now,
-                    )
-                )
-                await db_session.commit()
-            except Exception as e:
-                log_warning(f"[segmenter_v2] Occurrence_count update failed: {e}")
-
-            log_info(
-                f"[segmenter_v2] Added/Updated GCI entry {str(gci_id)[:8]}...)"
-            )
+    tokens        = count_tokens(cleaned)
 
     return {
-        "text": text,
-        "cleaned_text": cleaned,
-        "tokens": tokens,
-        "semantic_hash": semantic_hash,
-        "normalized_hash": semantic_hash,  # ✅ NEW: Explicit normalized_hash field
-        "confidence": 1.0,
-        "global_content_id": str(gci_id) if gci_id else None,
-        "source_type": source_type,
-
-        # ✅ STEP-1 ADDITIVE METADATA (SAFE)
+        "text":              text,
+        "cleaned_text":      cleaned,
+        "tokens":            tokens,
+        "semantic_hash":     semantic_hash,
+        "normalized_hash":   semantic_hash,
+        "confidence":        1.0,
+        "global_content_id": None,   # set by register_unique_chunks_in_gci() post-dedup
+        "source_type":       source_type,
+        "embedding_model":   embedding_model,
         "reasoning_ingestion": build_reasoning_ingestion_metadata(
             text=cleaned,
             source_type=source_type or "unknown",
