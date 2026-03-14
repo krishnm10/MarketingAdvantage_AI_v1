@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /c/ProjectK/MarketingAdvantage_AI_v1 -type f -name \"*.py\" ! -path \"*/.venv/*\" ! -path \"*/__pycache__/*\" 2>/dev/null | sort)"
+    ]
+  }
+}

@@ -64,34 +64,33 @@ class ImageCaptionerCPU(ImageCaptioner):
             from PIL import Image
             import pytesseract
 
-            img = Image.open(image_path)
+            with Image.open(image_path) as img:
+                ocr_text = ""
+                if self._ocr_ready:
+                    try:
+                        ocr_text = pytesseract.image_to_string(img)
+                    except Exception:
+                        ocr_text = ""
 
-            ocr_text = ""
-            if self._ocr_ready:
-                try:
-                    ocr_text = pytesseract.image_to_string(img)
-                except Exception:
-                    ocr_text = ""
+                # VERY IMPORTANT:
+                # Chart detection is intentionally simple here.
+                # LLM explainer will do the real semantic work.
+                is_chart = any(
+                    token in ocr_text.lower()
+                    for token in ["%", "year", "202", "axis", "total"]
+                )
 
-            # VERY IMPORTANT:
-            # Chart detection is intentionally simple here.
-            # LLM explainer will do the real semantic work.
-            is_chart = any(
-                token in ocr_text.lower()
-                for token in ["%", "year", "202", "axis", "total"]
-            )
+                caption = (
+                    "This image appears to be a chart or data figure."
+                    if is_chart
+                    else "This image appears to be a photograph or illustration."
+                )
 
-            caption = (
-                "This image appears to be a chart or data figure."
-                if is_chart
-                else "This image appears to be a photograph or illustration."
-            )
-
-            return {
-                "caption": caption,
-                "ocr_text": ocr_text.strip(),
-                "objects": None,
-                "is_chart": is_chart,
-            }
+                return {
+                    "caption": caption,
+                    "ocr_text": ocr_text.strip(),
+                    "objects": None,
+                    "is_chart": is_chart,
+                }
 
         return await loop.run_in_executor(None, _run)

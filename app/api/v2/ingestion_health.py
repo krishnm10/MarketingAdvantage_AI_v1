@@ -33,10 +33,8 @@ def _skip(msg: str) -> dict:
 def _tcp_reachable(host: str, port: int, timeout: float = 2) -> bool:
     """True if a TCP connect succeeds within *timeout* seconds."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect((host, port))
-        s.close()
+        with socket.create_connection((host, port), timeout=timeout):
+            pass
         return True
     except Exception:
         return False
@@ -251,22 +249,35 @@ async def _check_redis() -> dict:
     )
     if not reachable:
         return _fail(f"Cannot reach {host}:{port}")
+    client = None
     try:
         import redis as redis_lib
         if url:
-            c = redis_lib.Redis.from_url(url, socket_timeout=_T)
+            client = redis_lib.Redis.from_url(url, socket_timeout=_T)
         else:
-            c = redis_lib.Redis(host=host, port=port,
-                                password=os.getenv("REDIS_PASSWORD") or None,
-                                socket_timeout=_T)
-        pong = c.ping()
-        c.close()
+            client = redis_lib.Redis(
+                host=host,
+                port=port,
+                password=os.getenv("REDIS_PASSWORD") or None,
+                socket_timeout=_T,
+            )
+        pong = client.ping()
         addr = url or f"{host}:{port}"
         return _ok(f"Connected | {addr}") if pong else _fail("Ping failed")
     except ImportError:
         return {"status": "not_installed", "message": "redis-py not installed"}
     except Exception as e:
         return _fail(str(e))
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+            try:
+                client.connection_pool.disconnect()
+            except Exception:
+                pass
 
 
 _VECTORDB_CHECKS = {

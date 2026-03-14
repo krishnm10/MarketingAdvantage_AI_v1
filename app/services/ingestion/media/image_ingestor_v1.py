@@ -150,9 +150,9 @@ class ImageIngestorV1:
              # 2. Load image safely (format-agnostic)
              # ----------------------------------------------
              try:
-                 image = Image.open(image_path)
-                 image.verify()  # integrity check
-                 image = Image.open(image_path)  # reload after verify
+                 # Verify integrity without leaving the file handle open.
+                 with Image.open(image_path) as image:
+                     image.verify()
              except Exception as e:
                  log_info(f"[ImageIngestorV1] ❌ Invalid image: {e}")
                  return {

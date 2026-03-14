@@ -70,6 +70,7 @@ const SECTIONS: ConfigSection[] = [
     gradient: "from-fuchsia-500 to-fuchsia-700 shadow-fuchsia-600/20",
     keys: [
       { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number" },
+      { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number" },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean" },

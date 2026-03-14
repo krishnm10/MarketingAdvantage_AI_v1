@@ -34,11 +34,10 @@ class MediaHashComputer:
             - byte_hash: Exact file hash for identical files
         """
         try:
-            img = Image.open(image_path)
-            
-            # dHash - difference hash, robust to minor edits
-            dhash = imagehash.dhash(img, hash_size=16)  # 256-bit hash
-            perceptual_hash = str(dhash)
+            with Image.open(image_path) as img:
+                # dHash - difference hash, robust to minor edits
+                dhash = imagehash.dhash(img, hash_size=16)  # 256-bit hash
+                perceptual_hash = str(dhash)
             
             # Also compute byte-level hash for exact duplicates
             byte_hash = MediaHashComputer._compute_file_hash(image_path)

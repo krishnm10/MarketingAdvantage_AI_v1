@@ -93,6 +93,46 @@ def _vector_transport_env(prefix: str) -> str:
 
 BATCH_SIZE: int = _safe_env_int("INGEST_BATCH_SIZE", 256)
 
+
+def _resolve_embed_parallelism(embedder_kind: Optional[str]) -> int:
+    """
+    Resolve concurrent embed+upsert batch parallelism from env.
+
+    Precedence:
+      1. INGEST_<PROVIDER>_EMBED_PARALLELISM
+      2. INGEST_EMBED_PARALLELISM
+      3. EMBED_PARALLELISM
+      4. HF_EMBED_CONCURRENCY (legacy fallback)
+
+    HuggingFace stays capped at 1 because concurrent encode() calls on the
+    same model instance are not thread-safe.
+    """
+    kind = (embedder_kind or "").strip().lower()
+    if "huggingface" in kind:
+        return 1
+
+    provider = re.sub(r"[^a-z0-9]+", "_", kind).strip("_").upper()
+    keys = [
+        f"INGEST_{provider}_EMBED_PARALLELISM" if provider else "",
+        "INGEST_EMBED_PARALLELISM",
+        "EMBED_PARALLELISM",
+        "HF_EMBED_CONCURRENCY",
+    ]
+    for key in keys:
+        if not key:
+            continue
+        raw = os.getenv(key)
+        if raw is None:
+            continue
+        try:
+            value = int(raw)
+            if value >= 1:
+                return value
+        except (TypeError, ValueError):
+            continue
+
+    return 4
+
 # ── Concurrent embed semaphore ────────────────────────────────────────
 # Limits parallel embed+upsert batches inside embed_and_store().
 # Tune via HF_EMBED_CONCURRENCY in .env (default 4).
@@ -2078,7 +2118,7 @@ class IngestionServiceV2:
             # concurrent encode() calls from multiple threads on the same object.
             # If we run 4 parallel batches, some futures can hang and file status
             # never reaches "processed". Keep batch processing serial for HF.
-            batch_parallelism = 1 if "huggingface" in embedder_kind else _EMBED_CONCURRENCY
+            batch_parallelism = _resolve_embed_parallelism(embedder_kind)
             batch_semaphore = asyncio.Semaphore(max(1, int(batch_parallelism)))
             log_info(
                 f"[IngestionV2] Embedding runtime: kind={embedder_kind or 'unknown'}, "
