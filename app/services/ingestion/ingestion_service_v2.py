@@ -26,8 +26,12 @@ from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 from app.services.ingestion.parsers_router_v2 import ParserRouterV2
-from app.services.ingestion.segmenter_v2 import recursive_semantic_chunk
 from app.services.ingestion.row_segmenter_v2 import parse_dataframe_rows
+from app.services.ingestion.chunking_registry import (
+    clear_chunker_cache,
+    get_chunker,
+    list_chunking_strategies,
+)
 from app.services.ingestion.deduplication_engine_v2 import (
     deduplicate_chunks,
     create_normalized_hash,
@@ -233,6 +237,93 @@ def _coerce_to_str(value: Any) -> str:
         return ""
 
 
+def _normalize_business_id(business_id: Optional[Any]) -> str:
+    """
+    Normalize tenant/business identifier to a stable string key.
+    Accepts UUID objects, strings, or None.
+    """
+    if business_id is None:
+        return "default"
+    raw = str(business_id).strip()
+    return raw or "default"
+
+
+def _business_env_prefix(client_id: str) -> str:
+    """
+    Convert client_id into an env-safe key segment used by MAI_{TENANT}_* vars.
+    """
+    return client_id.lower().replace("-", "_")
+
+
+def clear_ingestion_pipeline_cache() -> None:
+    """
+    Clear ingestion-side pipeline resolver cache.
+    Call this after config/env updates to avoid stale pipeline instances.
+    """
+    _get_pipeline_for_client.cache_clear()
+    clear_chunker_cache()
+    log_info("[IngestionV2] Cleared ingestion pipeline resolver cache")
+
+
+def _resolve_chunking_strategy(pipeline: Any = None) -> str:
+    """
+    Resolve active chunking strategy from pipeline config first, then env.
+    """
+    strategy: Optional[str] = None
+    try:
+        if pipeline is not None:
+            chunk_cfg = getattr(
+                getattr(getattr(pipeline, "config", None), "ingestion", None),
+                "chunking",
+                None,
+            )
+            if chunk_cfg is not None:
+                raw = getattr(chunk_cfg, "strategy", None)
+                if raw is not None:
+                    strategy = raw.value if hasattr(raw, "value") else str(raw)
+    except Exception:
+        strategy = None
+
+    if not strategy:
+        strategy = os.getenv("CHUNKING_STRATEGY", "semantic")
+
+    normalized = str(strategy).strip().lower()
+    valid = set(list_chunking_strategies())
+    if normalized not in valid:
+        valid_str = ", ".join(sorted(valid))
+        raise ValueError(
+            f"Unknown chunking strategy '{normalized}'. "
+            f"Valid values: {valid_str}"
+        )
+    return normalized
+
+
+async def _chunk_text_with_strategy(
+    text: str,
+    *,
+    db_session: AsyncSession,
+    file_id: str,
+    business_id: Optional[Any],
+    source_type: Optional[str],
+    embedding_model: str,
+    pipeline: Any = None,
+    strategy_override: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Strategy-aware chunking entrypoint.
+    """
+    strategy = (strategy_override or _resolve_chunking_strategy(pipeline)).lower()
+    chunker = get_chunker(strategy)
+    return await chunker.chunk(
+        text,
+        db_session=db_session,
+        file_id=file_id,
+        business_id=business_id,
+        source_type=source_type,
+        embedding_model=embedding_model,
+    )
+
+
 # ============================================================
 # PLUGGABLE PIPELINE RESOLVER  (env-var driven — no JSON files)
 #
@@ -256,9 +347,9 @@ def _coerce_to_str(value: Any) -> str:
 # ============================================================
 
 @lru_cache(maxsize=16)
-def _get_pipeline(business_id: Optional[str] = None):
+def _get_pipeline_for_client(client_id: str):
     """
-    Resolve a live AssembledPipeline for the given business.
+    Resolve a live AssembledPipeline for normalized client_id.
     Config is read purely from environment variables — no JSON files.
     Works identically in dev, staging, and production.
 
@@ -267,11 +358,11 @@ def _get_pipeline(business_id: Optional[str] = None):
     _extract_chunks, _dedup_chunks, and _embed_and_store.
     Each call re-read env vars, rebuilt config, and called
     pipeline_factory.build() which constructs embedder + vectordb objects.
-    With cache: first call per business_id builds the pipeline,
+    With cache: first call per client_id builds the pipeline,
     subsequent calls return the cached object instantly.
     maxsize=16 covers 16 distinct business_ids comfortably.
     """
-    b = (business_id or "default").lower().replace("-", "_")
+    b = _business_env_prefix(client_id)
 
     vectordb_type = os.getenv(
         f"MAI_{b.upper()}_VECTORDB",
@@ -289,12 +380,20 @@ def _get_pipeline(business_id: Optional[str] = None):
     ).lower()
 
     config = _build_config_from_env(
-        client_id=business_id or "default",
+        client_id=client_id,
         vectordb_type=vectordb_type,
         embedder_type=embedder_type,
         llm_type=llm_type,
     )
     return pipeline_factory.build(config)
+
+
+def _get_pipeline(business_id: Optional[Any] = None):
+    """
+    Resolve pipeline using UUID-safe business_id normalization.
+    """
+    client_id = _normalize_business_id(business_id)
+    return _get_pipeline_for_client(client_id)
 
 
 def _build_config_from_env(
@@ -1347,6 +1446,7 @@ class IngestionServiceV2:
             if pipeline is None:
                 pipeline = _get_pipeline(business_id)
             embedding_model = pipeline.embedder.info.model
+            active_chunking_strategy = _resolve_chunking_strategy(pipeline)
 
             if asyncio.iscoroutine(parsed_payload):
                 parsed_payload = await parsed_payload
@@ -1472,13 +1572,15 @@ class IngestionServiceV2:
                         async def _process_visual(vtext: str) -> List[Dict]:
                             explanation = await _explain_visual_with_llm(vtext)
                             source = explanation if explanation else vtext
-                            chunks = await recursive_semantic_chunk(
+                            chunks = await _chunk_text_with_strategy(
                                 source,
                                 db_session=db,
                                 file_id=str(file_id),
                                 business_id=business_id,
                                 source_type=file_type,
                                 embedding_model=embedding_model,
+                                pipeline=pipeline,
+                                strategy_override=active_chunking_strategy,
                             )
                             orig_hash = hashlib.sha256(
                                 vtext.encode("utf-8")
@@ -1505,13 +1607,15 @@ class IngestionServiceV2:
                     # Each item's subchunks are extend()ed and the local list
                     # goes out of scope immediately — never all in RAM at once.
                     for plain_text in plain_texts:
-                        subchunks = await recursive_semantic_chunk(
+                        subchunks = await _chunk_text_with_strategy(
                             plain_text,
                             db_session=db,
                             file_id=str(file_id),
                             business_id=business_id,
                             source_type=file_type,
                             embedding_model=embedding_model,
+                            pipeline=pipeline,
+                            strategy_override=active_chunking_strategy,
                         )
                         # FIX-B3-1: extend + let subchunks go out of scope
                         result.extend(subchunks)
@@ -1538,13 +1642,15 @@ class IngestionServiceV2:
             if _looks_like_visual_content(text):
                 explanation = await _explain_visual_with_llm(text)
                 if explanation:
-                    explained_chunks = await recursive_semantic_chunk(
+                    explained_chunks = await _chunk_text_with_strategy(
                         explanation,
                         db_session=db,
                         file_id=str(file_id),
                         business_id=business_id,
                         source_type=file_type,
                         embedding_model=embedding_model,
+                        pipeline=pipeline,
+                        strategy_override=active_chunking_strategy,
                     )
                     orig_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
                     for ch in explained_chunks:
@@ -1556,13 +1662,15 @@ class IngestionServiceV2:
                         ch.setdefault("embedding_model", embedding_model)
                     return explained_chunks
 
-            chunks = await recursive_semantic_chunk(
+            chunks = await _chunk_text_with_strategy(
                 text,
                 db_session=db,
                 file_id=str(file_id),
                 business_id=business_id,
                 source_type=file_type,
                 embedding_model=embedding_model,
+                pipeline=pipeline,
+                strategy_override=active_chunking_strategy,
             )
             for ch in chunks:
                 ch.setdefault("embedding_model", embedding_model)
@@ -1642,7 +1750,7 @@ class IngestionServiceV2:
         # and semantically correct for row-based data.
         # ─────────────────────────────────────────────────────────────────────
         first_source = (chunks[0].get("source_type") or "").lower() if chunks else ""
-        is_structured_data = first_source in ("csv", "xlsx", "xls")
+        is_structured_data = first_source in ("csv", "xlsx", "xls", "excel")
 
         # AFTER (FIXED):
         enable_hash_dedup = bool(dedup_cfg.enable_hash_dedup)

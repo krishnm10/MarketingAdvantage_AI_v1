@@ -1,4 +1,3 @@
-import asyncio
 from app.services.validation.agentic_validation_worker import (
     score_signal_quality,
     score_source_authority,
@@ -8,7 +7,7 @@ from app.services.validation.agentic_validation_worker import (
 )
 from datetime import datetime, timezone, timedelta
 
-async def test_accuracy():
+def test_accuracy():
     print("=== Validation Accuracy Tests ===\n")
     
     # Test 1: Signal Quality
@@ -51,4 +50,4 @@ async def test_accuracy():
     print("✅ All tests complete\n")
 
 if __name__ == "__main__":
-    asyncio.run(test_accuracy())
+    test_accuracy()

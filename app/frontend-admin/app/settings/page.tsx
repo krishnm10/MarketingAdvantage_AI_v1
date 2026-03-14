@@ -71,12 +71,17 @@ const SECTIONS: ConfigSection[] = [
     keys: [
       { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number" },
       { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number" },
+      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust"] },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean" },
       { key: "MAI_DEDUP_SIMILARITY_THRESHOLD", label: "L3 Similarity Threshold", type: "number" },
       { key: "DEDUP_EMBED_BATCH_SIZE", label: "L3 Embed Batch Size", type: "number" },
       { key: "DEDUP_SEARCH_CONCURRENCY", label: "L3 Search Concurrency", type: "number" },
+      { key: "CHUNK_WINDOW_SIZE", label: "Overlap Window Size", type: "number" },
+      { key: "CHUNK_OVERLAP_SIZE", label: "Overlap Size", type: "number" },
+      { key: "CHUNK_SMART_TARGET_TOKENS", label: "Smart Target Tokens", type: "number" },
+      { key: "CHUNK_RECURSIVE_OVERLAP_CHARS", label: "Recursive Overlap Chars", type: "number" },
     ],
   },
   {

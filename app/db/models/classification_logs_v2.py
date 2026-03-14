@@ -50,8 +50,8 @@ class ClassificationLogsV2(Base):
 
     def __repr__(self):
         return (
-            f\"<ClassificationLogsV2(id={self.id}, taxonomy_path='{self.taxonomy_path}', "
-            f"confidence={self.confidence}, model={self.model_version}, status={self.classification_status})>\"
+            f"<ClassificationLogsV2(id={self.id}, taxonomy_path='{self.taxonomy_path}', "
+            f"confidence={self.confidence}, model={self.model_version}, status={self.classification_status})>"
         )
 
     def to_dict(self):

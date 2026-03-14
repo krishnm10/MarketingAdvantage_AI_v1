@@ -115,6 +115,15 @@ _SENSITIVE_KEYS = {
     "CHROMA_API_KEY",
 }
 
+_VALID_CHUNKING_STRATEGIES = {
+    "semantic",
+    "recursive",
+    "overlap",
+    "smart_check",
+    "recursive_overlap",
+    "rust",
+}
+
 
 def _mask(key: str, val: str) -> str:
     """Return masked value for sensitive keys."""
@@ -170,15 +179,30 @@ async def update_config(
 
     # Safety: block writing to certain critical keys from UI unless intended
     blocked = set()
+    invalid_values = {}
     for key in payload.updates:
         # Validate key format
         if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
             blocked.add(key)
+            continue
+        if key == "CHUNKING_STRATEGY":
+            value = str(payload.updates[key]).strip().lower()
+            if value not in _VALID_CHUNKING_STRATEGIES:
+                invalid_values[key] = value
 
     if blocked:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid key names: {blocked}",
+        )
+    if invalid_values:
+        valid = ", ".join(sorted(_VALID_CHUNKING_STRATEGIES))
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Invalid config values: {invalid_values}. "
+                f"Valid CHUNKING_STRATEGY values: {valid}"
+            ),
         )
 
     # Read old values for audit diff BEFORE writing
@@ -199,6 +223,12 @@ async def update_config(
         os.environ[k] = v
 
     pipeline_factory.invalidate_all()
+    try:
+        from app.services.ingestion.ingestion_service_v2 import clear_ingestion_pipeline_cache
+
+        clear_ingestion_pipeline_cache()
+    except Exception as e:
+        logger.warning("Failed to clear ingestion pipeline cache: %s", e)
 
     # ── Audit log ─────────────────────────────────────────────────────────
     try:
