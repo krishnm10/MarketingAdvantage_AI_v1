@@ -6,6 +6,7 @@ import { useAuth } from "@/lib/useAuth";
 import { Upload, FileUp, CheckCircle2, XCircle, Lock, Loader2, AlertTriangle } from "lucide-react";
 
 type UploadState = "idle" | "success" | "duplicate" | "error";
+type UploadResultState = Exclude<UploadState, "idle">;
 
 type UploadResponse = {
   status?: string;
@@ -19,76 +20,130 @@ type UploadResponse = {
   };
 };
 
+type UploadResult = {
+  fileName: string;
+  state: UploadResultState;
+  message: string;
+};
+
 export default function UploadPage() {
   const { role } = useAuth();
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [status, setStatus] = useState<UploadState>("idle");
   const [statusMessage, setStatusMessage] = useState("");
+  const [uploadResults, setUploadResults] = useState<UploadResult[]>([]);
   const [loading, setLoading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const canUpload = role === "admin" || role === "editor";
 
+  const setSelectedFiles = (incomingFiles: FileList | File[]) => {
+    const nextFiles = Array.from(incomingFiles);
+    setFiles(nextFiles);
+    setStatus("idle");
+    setStatusMessage("");
+    setUploadResults([]);
+  };
+
   const handleUpload = async () => {
-    if (!file) return;
+    if (!files.length) return;
     setLoading(true);
     setStatus("idle");
     setStatusMessage("");
+    setUploadResults([]);
 
-    try {
+    const results: UploadResult[] = [];
+
+    for (const file of files) {
       const formData = new FormData();
       formData.append("file", file);
 
-      const res = await apiClient.post<UploadResponse>("/api/v2/ingestion/upload", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
-        timeout: 10 * 60 * 1000,
-      });
+      try {
+        const res = await apiClient.post<UploadResponse>("/api/v2/ingestion/upload", formData, {
+          headers: { "Content-Type": "multipart/form-data" },
+          timeout: 10 * 60 * 1000,
+        });
 
-      const payload = res.data || {};
-      const details = payload.details || {};
+        const payload = res.data || {};
+        const details = payload.details || {};
 
-      if (
-        payload.status === "duplicate_skipped" ||
-        (details.status === "skipped" && details.reason === "db_duplicate")
-      ) {
-        setStatus("duplicate");
-        setStatusMessage(
-          payload.message ||
-            `Duplicate detected. '${details.file_name || payload.file_name || file.name}' was already ingested.`
-        );
-        return;
+        if (
+          payload.status === "duplicate_skipped" ||
+          (details.status === "skipped" && details.reason === "db_duplicate")
+        ) {
+          results.push({
+            fileName: file.name,
+            state: "duplicate",
+            message:
+              payload.message ||
+              `Duplicate detected. '${details.file_name || payload.file_name || file.name}' was already ingested.`,
+          });
+          continue;
+        }
+
+        if (payload.status === "success") {
+          results.push({
+            fileName: file.name,
+            state: "success",
+            message: payload.message || `File '${payload.file_name || file.name}' uploaded successfully.`,
+          });
+          continue;
+        }
+
+        results.push({
+          fileName: file.name,
+          state: "error",
+          message: "Upload failed. Please try again.",
+        });
+      } catch (err: any) {
+        console.error("Upload error:", err);
+        const message =
+          (err?.code === "ECONNABORTED"
+            ? "Upload is taking longer than the default window. The backend may still be ingesting the file; check the ingestion files page shortly."
+            : null) ||
+          err?.response?.data?.detail ||
+          err?.response?.data?.message ||
+          "Upload failed. Please try again.";
+
+        results.push({
+          fileName: file.name,
+          state: "error",
+          message,
+        });
       }
-
-      if (payload.status === "success") {
-        setStatus("success");
-        setStatusMessage(payload.message || `File '${payload.file_name || file.name}' uploaded successfully.`);
-        return;
-      }
-
-      setStatus("error");
-      setStatusMessage("Upload failed. Please try again.");
-    } catch (err: any) {
-      console.error("Upload error:", err);
-      const message =
-        (err?.code === "ECONNABORTED"
-          ? "Upload is taking longer than the default window. The backend may still be ingesting the file; check the ingestion files page shortly."
-          : null) ||
-        err?.response?.data?.detail ||
-        err?.response?.data?.message ||
-        "Upload failed. Please try again.";
-      setStatus("error");
-      setStatusMessage(message);
-    } finally {
-      setLoading(false);
     }
+
+    const successCount = results.filter((result) => result.state === "success").length;
+    const duplicateCount = results.filter((result) => result.state === "duplicate").length;
+    const errorCount = results.filter((result) => result.state === "error").length;
+
+    setUploadResults(results);
+
+    if (errorCount > 0) {
+      setStatus("error");
+      setStatusMessage(
+        `${successCount} uploaded, ${duplicateCount} duplicates, ${errorCount} failed out of ${results.length} files.`
+      );
+    } else if (duplicateCount > 0) {
+      setStatus("duplicate");
+      setStatusMessage(
+        `${successCount} uploaded and ${duplicateCount} duplicates skipped out of ${results.length} files.`
+      );
+    } else {
+      setStatus("success");
+      setStatusMessage(`${successCount} file${successCount === 1 ? "" : "s"} uploaded successfully.`);
+    }
+
+    setLoading(false);
   };
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const droppedFile = e.dataTransfer.files?.[0];
-    if (droppedFile) setFile(droppedFile);
+    if (e.dataTransfer.files?.length) {
+      setSelectedFiles(e.dataTransfer.files);
+    }
   };
 
   if (!canUpload)
@@ -102,8 +157,8 @@ export default function UploadPage() {
   return (
     <div className="max-w-lg space-y-6">
       <div>
-        <h1 className="text-2xl font-bold text-white">Upload New File</h1>
-        <p className="text-slate-400 text-sm mt-1">Drag & drop or browse to upload files for ingestion</p>
+        <h1 className="text-2xl font-bold text-white">Upload Files</h1>
+        <p className="text-slate-400 text-sm mt-1">Drag & drop or browse to upload one or more files for ingestion</p>
       </div>
 
       <div className="rounded-xl border border-slate-700/50 bg-slate-800/50 backdrop-blur-sm p-6 space-y-5">
@@ -116,7 +171,7 @@ export default function UploadPage() {
           className={`border-2 border-dashed rounded-xl p-8 text-center cursor-pointer transition-all ${
             dragOver
               ? "border-primary-500 bg-primary-500/10"
-              : file
+              : files.length
               ? "border-emerald-500/50 bg-emerald-500/5"
               : "border-slate-600 hover:border-slate-500 hover:bg-slate-700/30"
           }`}
@@ -124,19 +179,31 @@ export default function UploadPage() {
           <input
             ref={fileInputRef}
             type="file"
-            onChange={(e) => setFile(e.target.files?.[0] || null)}
+            multiple
+            onChange={(e) => setSelectedFiles(e.target.files || [])}
             className="hidden"
           />
-          {file ? (
+          {files.length ? (
             <div className="space-y-2">
               <FileUp className="w-10 h-10 text-emerald-400 mx-auto" />
-              <p className="text-white font-medium">{file.name}</p>
-              <p className="text-slate-400 text-xs">{(file.size / 1024).toFixed(1)} KB</p>
+              <p className="text-white font-medium">
+                {files.length} file{files.length === 1 ? "" : "s"} selected
+              </p>
+              <div className="space-y-1">
+                {files.slice(0, 5).map((file) => (
+                  <p key={`${file.name}-${file.size}`} className="text-slate-300 text-xs">
+                    {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                  </p>
+                ))}
+                {files.length > 5 && (
+                  <p className="text-slate-500 text-xs">+{files.length - 5} more files</p>
+                )}
+              </div>
             </div>
           ) : (
             <div className="space-y-2">
               <Upload className="w-10 h-10 text-slate-500 mx-auto" />
-              <p className="text-slate-300">Drop a file here or click to browse</p>
+              <p className="text-slate-300">Drop files here or click to browse</p>
               <p className="text-slate-500 text-xs">Supports PDF, DOCX, TXT, CSV, JSON</p>
             </div>
           )}
@@ -145,13 +212,13 @@ export default function UploadPage() {
         {/* Upload Button */}
         <button
           onClick={handleUpload}
-          disabled={!file || loading}
+          disabled={!files.length || loading}
           className="w-full flex items-center justify-center gap-2 bg-gradient-to-r from-primary-600 to-primary-500 text-white py-2.5 rounded-lg hover:from-primary-500 hover:to-primary-400 disabled:opacity-40 disabled:cursor-not-allowed transition-all font-medium shadow-lg shadow-primary-500/20"
         >
           {loading ? (
             <><Loader2 className="w-4 h-4 animate-spin" /> Uploading...</>
           ) : (
-            <><Upload className="w-4 h-4" /> Upload File</>
+            <><Upload className="w-4 h-4" /> Upload {files.length > 1 ? "Files" : "File"}</>
           )}
         </button>
 
@@ -169,6 +236,28 @@ export default function UploadPage() {
         {status === "error" && (
           <div className="flex items-center gap-2 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
             <XCircle className="w-4 h-4" /> {statusMessage}
+          </div>
+        )}
+
+        {uploadResults.length > 0 && (
+          <div className="rounded-lg border border-slate-700/50 bg-slate-900/40 p-4 space-y-2">
+            <p className="text-sm font-medium text-white">Upload results</p>
+            <div className="space-y-2">
+              {uploadResults.map((result, index) => (
+                <div
+                  key={`${result.fileName}-${result.state}-${index}`}
+                  className="flex items-start gap-2 text-sm text-slate-300"
+                >
+                  {result.state === "success" && <CheckCircle2 className="mt-0.5 h-4 w-4 text-emerald-400" />}
+                  {result.state === "duplicate" && <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-300" />}
+                  {result.state === "error" && <XCircle className="mt-0.5 h-4 w-4 text-red-400" />}
+                  <div>
+                    <p className="text-white">{result.fileName}</p>
+                    <p className="text-xs text-slate-400">{result.message}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
       </div>
