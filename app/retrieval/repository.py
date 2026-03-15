@@ -98,27 +98,48 @@ def _normalize_signal(obj: Any) -> Dict[str, Any]:
             )
             return {}
         
-        # ✅ FIXED: Find snapshot with tap_trust_score (agentic validation)
-        agentic_snapshot = None
-        for snapshot in valid_snapshots:
-            if 'tap_trust_score' in snapshot:
-                tap_trust = snapshot.get('tap_trust_score', 0.0)
-                agentic_snapshot = snapshot
-                log_debug(
-                    f"[NormalizeSignal] Found tap_trust_score={tap_trust:.4f} "
-                    f"in snapshot (method={snapshot.get('method', 'agentic_validation')})"
-                )
-                break
-        
-        if not agentic_snapshot:
-            # Fallback to first snapshot (usually has tap_trust_score)
-            agentic_snapshot = valid_snapshots[0]
+        # Prefer snapshots with tap_trust_score, then pick the latest by timestamp.
+        candidate_snapshots = [
+            s for s in valid_snapshots if "tap_trust_score" in s
+        ]
+        if not candidate_snapshots:
+            candidate_snapshots = valid_snapshots
             log_debug(
-                f"[NormalizeSignal] No tap_trust_score found, using first snapshot "
-                f"from {len(valid_snapshots)} total"
+                f"[NormalizeSignal] No tap_trust_score found, selecting latest of "
+                f"{len(valid_snapshots)} snapshots"
             )
-        
-        return _validate_snapshot(agentic_snapshot)
+
+        ranked: List[Tuple[Optional[datetime], int, Dict[str, Any]]] = []
+        for idx, snapshot in enumerate(candidate_snapshots):
+            ts = (
+                _extract_timestamp(snapshot, "validated_at")
+                or _extract_timestamp(snapshot, "updated_at")
+                or _extract_timestamp(snapshot, "created_at")
+                or _extract_timestamp(snapshot, "extraction_timestamp")
+            )
+            ranked.append((ts, idx, snapshot))
+
+        if any(ts is not None for ts, _, _ in ranked):
+            # Latest timestamp wins; index tie-break keeps deterministic ordering.
+            _, _, chosen = max(
+                ranked,
+                key=lambda x: (x[0] or datetime.min.replace(tzinfo=timezone.utc), x[1]),
+            )
+        else:
+            # If timestamps are missing, treat right-most snapshot as latest.
+            chosen = candidate_snapshots[-1]
+
+        if "tap_trust_score" in chosen:
+            try:
+                tap_trust = float(chosen.get("tap_trust_score", 0.0))
+            except Exception:
+                tap_trust = 0.0
+            log_debug(
+                f"[NormalizeSignal] Selected latest tap_trust_score={tap_trust:.4f} "
+                f"(method={chosen.get('method', 'agentic_validation')})"
+            )
+
+        return _validate_snapshot(chosen)
     
     # Case 4: Unexpected type
     log_warning(

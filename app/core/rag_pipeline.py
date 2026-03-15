@@ -105,11 +105,16 @@ class RAGResult:
 
     def summary(self) -> str:
         """One-line summary for logging."""
+        trust_str = (
+            f"{self.trust_score:.2f}"
+            if self.trust_score is not None
+            else "N/A"
+        )
         return (
             f"RAGResult | query={self.query[:60]!r} | "
             f"chunks={len(self.context_chunks)} | "
             f"reranked={self.reranked} | "
-            f"trust={self.trust_score:.2f if self.trust_score else 'N/A'} | "
+            f"trust={trust_str} | "
             f"total_ms={self.latency.get('total_ms', 0):.0f}"
         )
 

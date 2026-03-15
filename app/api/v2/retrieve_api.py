@@ -94,9 +94,9 @@ async def retrieve_query(
     Mirrors retrieve_cli.py but exposed as an HTTP API.
     """
     from app.retrieval.runtime import RetrievalRuntime
-    from app.retrieval.policy import DEFAULT_POLICY_REGISTRY
     from app.retrieval.repository import RetrievalRepository
     from app.retrieval.types_retrieve import QueryContext, RetrievalIntent
+    from app.retrieval.policy import DEFAULT_POLICY_REGISTRY
 
     # Validate intent
     intent_map = {
@@ -127,11 +127,6 @@ async def retrieve_query(
         policy_registry=DEFAULT_POLICY_REGISTRY,
     )
 
-    # Override max_results if user requested specific top_k
-    if req.top_k is not None:
-        policy = DEFAULT_POLICY_REGISTRY.resolve(intent_enum)
-        policy.max_results = req.top_k
-
     # 3. Retrieve
     ctx = QueryContext(
         query=req.query,
@@ -143,6 +138,7 @@ async def retrieve_query(
         ranked_results, dropped = await runtime.retrieve(
             ctx=ctx,
             query_embedding=query_embedding,
+            max_results_override=req.top_k,
         )
     except Exception as e:
         logger.error(f"[RetrieveAPI] Retrieval failed: {e}", exc_info=True)

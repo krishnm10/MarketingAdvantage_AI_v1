@@ -28,6 +28,23 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_CONFIG_DIRS = [
+    _REPO_ROOT / "app" / "core" / "configs",
+    _REPO_ROOT / "configs",  # backward-compatible fallback
+]
+
+
+def _find_client_config(client_id: str) -> Optional[Path]:
+    for base in _CONFIG_DIRS:
+        json_path = base / f"{client_id}.json"
+        if json_path.exists():
+            return json_path
+        yaml_path = base / f"{client_id}.yaml"
+        if yaml_path.exists():
+            return yaml_path
+    return None
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response models
@@ -83,24 +100,20 @@ async def rag_query(req: RAGQueryRequest):
 
     The pipeline must be built first via POST /api/v2/rag/pipeline/build
     OR it will be built on-the-fly if a config file exists at
-    configs/{client_id}.json.
+    app/core/configs/{client_id}.json.
 
     The pipeline is cached after first build — subsequent queries are fast.
     """
-    # Try to get cached pipeline first
-    cached = pipeline_factory.list_cached()
-    if req.client_id not in cached:
-        # Try to auto-load from configs directory
-        config_path = Path(f"configs/{req.client_id}.json")
-        if not config_path.exists():
-            config_path = Path(f"configs/{req.client_id}.yaml")
-
-        if not config_path.exists():
+    pipeline = pipeline_factory.get_cached(req.client_id)
+    if pipeline is None:
+        config_path = _find_client_config(req.client_id)
+        if config_path is None:
+            searched_dirs = ", ".join(str(p) for p in _CONFIG_DIRS)
             raise HTTPException(
                 status_code=404,
                 detail=(
                     f"No pipeline found for client_id='{req.client_id}' "
-                    f"and no config file at configs/{req.client_id}.json. "
+                    f"and no config file in: {searched_dirs}. "
                     f"Use POST /api/v2/rag/pipeline/build first."
                 ),
             )
@@ -115,9 +128,9 @@ async def rag_query(req: RAGQueryRequest):
                 status_code=500,
                 detail=f"Failed to auto-build pipeline from config: {e}",
             )
+        pipeline = pipeline_factory.get_cached(req.client_id)
 
     try:
-        pipeline = pipeline_factory._cache.get(req.client_id)
         if not pipeline:
             raise HTTPException(
                 status_code=500,
@@ -217,13 +230,12 @@ async def pipeline_health(
     client_id: str = Query(..., description="Client ID to check"),
 ):
     """Per-client pipeline health check (VectorDB reachability, etc.)"""
-    cached = pipeline_factory.list_cached()
-    if client_id not in cached:
+    pipeline = pipeline_factory.get_cached(client_id)
+    if pipeline is None:
         raise HTTPException(
             status_code=404,
             detail=f"No cached pipeline for client_id='{client_id}'.",
         )
-    pipeline = pipeline_factory._cache[client_id]
     return pipeline.health_check()
 
 

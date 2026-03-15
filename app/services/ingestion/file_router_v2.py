@@ -110,14 +110,20 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         file_hash = _compute_file_hash(temp_path)
         _write_log(f"[HASH] {original_file_name} → {file_hash}")
 
-        # ✅ DB deduplication check
+        # ✅ DB deduplication check (hash-only, tenant-scoped)
+        safe_business_id = _safe_uuid(business_id)
         async with async_session() as db:
-            existing = await db.scalar(
-                select(IngestedFileV2).where(
-                    (IngestedFileV2.meta_data["file_hash"].as_string() == file_hash)
-                    | (IngestedFileV2.file_name == original_file_name)
-                )
+            dedup_query = select(IngestedFileV2).where(
+                IngestedFileV2.meta_data["file_hash"].as_string() == file_hash
             )
+            if safe_business_id:
+                dedup_query = dedup_query.where(
+                    IngestedFileV2.business_id == safe_business_id
+                )
+            else:
+                dedup_query = dedup_query.where(IngestedFileV2.business_id.is_(None))
+
+            existing = await db.scalar(dedup_query)
             if existing:
                 log_warning(f"[file_router_v2] DB duplicate detected: {original_file_name}")
                 _write_log(f"[SKIPPED_DB_DUPLICATE] {original_file_name}")
@@ -136,7 +142,7 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             await db.execute(
                 insert(IngestedFileV2).values(
                     id=file_id,
-                    business_id=_safe_uuid(business_id),
+                    business_id=safe_business_id,
                     file_name=original_file_name,
                     file_type=file_ext.replace(".", ""),
                     file_path=saved_path,

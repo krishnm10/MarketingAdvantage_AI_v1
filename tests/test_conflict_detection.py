@@ -70,18 +70,20 @@ def test_polarity_detection():
     print("✅ All polarity tests passed!\n")
 
 
-async def test_async_retrieval():
-    """Test async conflict modifier (mock)"""
+def test_async_retrieval():
+    """Test async conflict modifier (mock)."""
     print("=== Async Conflict Modifier Test ===\n")
-    
-    from app.db.session_v2 import AsyncSessionLocal
-    
-    async with AsyncSessionLocal() as session:
-        # Test with non-existent ID (should return 1.0)
-        modifier = await get_conflict_modifier_async(session, "non-existent-id")
-        assert modifier == 1.0
-        print(f"   Non-existent ID: {modifier} ✅\n")
-    
+
+    async def _run():
+        from app.db.session_v2 import AsyncSessionLocal
+
+        async with AsyncSessionLocal() as session:
+            # Test with non-existent ID (should return 1.0)
+            modifier = await get_conflict_modifier_async(session, "non-existent-id")
+            assert modifier == 1.0
+            print(f"   Non-existent ID: {modifier} ✅\n")
+
+    asyncio.run(_run())
     print("✅ Async test passed!\n")
 
 
@@ -90,4 +92,4 @@ if __name__ == "__main__":
     test_polarity_detection()
     
     # Run async tests
-    asyncio.run(test_async_retrieval())
+    test_async_retrieval()

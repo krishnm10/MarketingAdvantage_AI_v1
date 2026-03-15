@@ -350,6 +350,11 @@ class PipelineFactory:
         with self._lock:
             return list(self._cache.keys())
 
+    def get_cached(self, client_id: str) -> Optional[AssembledPipeline]:
+        """Return cached pipeline for client_id if present, else None."""
+        with self._lock:
+            return self._cache.get(client_id)
+
     # =========================================================================
     # Component builders (private)
     # =========================================================================

@@ -35,6 +35,7 @@ class RetrievalRuntime:
         *,
         query_embedding=None,
         intent=None,
+        max_results_override: Optional[int] = None,
     ) -> Tuple[List[RankedResult], List[RetrievalCandidate]]:
         """
         Retrieval entry point.
@@ -63,11 +64,15 @@ class RetrievalRuntime:
         # 1. Resolve policy
         # -------------------------------------------------
         policy = self.policy_registry.resolve(ctx.intent)
+        effective_max_results = max(
+            1,
+            int(max_results_override) if max_results_override is not None else int(policy.max_results),
+        )
 
         # -------------------------------------------------
         # 2. Determine recall size
         # -------------------------------------------------
-        recall_limit = max(policy.max_results * 40, 200)
+        recall_limit = max(effective_max_results * 40, 200)
 
         # -------------------------------------------------
         # 3. Semantic recall + hydration
@@ -140,4 +145,4 @@ class RetrievalRuntime:
         # -------------------------------------------------
         ranked.sort(key=lambda r: r.score, reverse=True)
 
-        return ranked[: policy.max_results], dropped
+        return ranked[:effective_max_results], dropped

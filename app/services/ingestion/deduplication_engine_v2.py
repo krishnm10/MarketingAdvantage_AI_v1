@@ -517,18 +517,20 @@ async def deduplicate_chunks(
             return_exceptions=True,   # ← FIX-B5-3: was False (default)
         )
 
-        for result in results:
+        for source_chunk, result in zip(l2_survivors, results):
             # FIX-B5-3: handle exception results gracefully
             if isinstance(result, BaseException):
                 log_warning(
                     f"[Dedup L3] gather() caught exception — "
                     f"treating affected chunk as unique: {result}"
                 )
-                # We cannot recover the chunk from a bare exception.
-                # The chunk's fate: not in l1_duplicates, not in l2_duplicates,
-                # not in unique_chunks → silently dropped.
-                # Better: the inner try/except in _check_one() catches all
-                # errors before they reach gather — this branch is a last resort.
+                # Preserve the original chunk so failures in the L3 check path
+                # never drop content from downstream storage/embedding.
+                source_chunk["is_duplicate"] = False
+                source_chunk.setdefault("reasoning_ingestion", {}).update({
+                    "dedup_l3_error": str(result)[:512]
+                })
+                unique_chunks.append(source_chunk)
                 stats["unique"] += 1
                 continue
 

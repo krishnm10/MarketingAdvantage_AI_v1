@@ -93,9 +93,10 @@ async def _broadcast_log(level: str, msg: str):
     except Exception as e:
         logger.debug(f"Broadcast failed: {e}")
 
-def _safe_async_run(coro):
-    """Run async coroutine safely from sync context."""
+def _safe_async_run(async_fn, *args):
+    """Run async function safely from sync context."""
     try:
+        coro = async_fn(*args)
         loop = asyncio.get_event_loop()
         if loop.is_running():
             asyncio.ensure_future(coro)
@@ -103,6 +104,11 @@ def _safe_async_run(coro):
             loop.run_until_complete(coro)
     except Exception as e:
         logger.debug(f"Logger async dispatch failed: {e}")
+        try:
+            if "coro" in locals():
+                coro.close()
+        except Exception:
+            pass
 
 # ----------------------------------
 # PUBLIC LOG FUNCTIONS (with WS broadcast)
@@ -110,16 +116,16 @@ def _safe_async_run(coro):
 
 def log_info(msg: str):
     logger.info(msg)
-    _safe_async_run(_broadcast_log("INFO", msg))
+    _safe_async_run(_broadcast_log, "INFO", msg)
 
 def log_warning(msg: str):
     logger.warning(msg)
-    _safe_async_run(_broadcast_log("WARNING", msg))
+    _safe_async_run(_broadcast_log, "WARNING", msg)
 
 def log_error(msg: str):
     logger.error(msg)
-    _safe_async_run(_broadcast_log("ERROR", msg))
+    _safe_async_run(_broadcast_log, "ERROR", msg)
 
 def log_debug(msg: str):
     logger.debug(msg)
-    _safe_async_run(_broadcast_log("DEBUG", msg))
+    _safe_async_run(_broadcast_log, "DEBUG", msg)
