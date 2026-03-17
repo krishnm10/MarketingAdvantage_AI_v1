@@ -114,6 +114,7 @@ class AssembledPipeline:
     ):
         self.client_id = client_id
         self.config    = config
+        self._closed   = False
 
         # ── Store individual components (useful for debugging/testing) ──
         self.vectordb  = vectordb
@@ -173,6 +174,14 @@ class AssembledPipeline:
         Returns component-by-component health status.
         """
         return self.rag.health_check()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        close_fn = getattr(self.vectordb, "close", None)
+        if callable(close_fn):
+            close_fn()
+        self._closed = True
 
     def __repr__(self) -> str:
         return (
@@ -249,8 +258,9 @@ class PipelineFactory:
                         "[PipelineFactory] Cache stale for client '%s' — rebuilding.",
                         client_id,
                     )
-                    del self._cache[client_id]
+                    stale_pipeline = self._cache.pop(client_id)
                     self._cache_fingerprints.pop(client_id, None)
+                    stale_pipeline.close()
 
         logger.info(
             "[PipelineFactory] Building pipeline | client=%s | "
@@ -329,8 +339,9 @@ class PipelineFactory:
         """Remove a cached pipeline — forces rebuild on next .build() call."""
         with self._lock:
             if client_id in self._cache:
-                del self._cache[client_id]
+                pipeline = self._cache.pop(client_id)
                 self._cache_fingerprints.pop(client_id, None)
+                pipeline.close()
                 logger.info(
                     "[PipelineFactory] Cache invalidated for '%s'.", client_id
                 )
@@ -338,9 +349,12 @@ class PipelineFactory:
     def invalidate_all(self) -> None:
         """Clear entire pipeline cache."""
         with self._lock:
-            count = len(self._cache)
+            cached_pipelines = list(self._cache.values())
+            count = len(cached_pipelines)
             self._cache.clear()
             self._cache_fingerprints.clear()
+            for pipeline in cached_pipelines:
+                pipeline.close()
             logger.info(
                 "[PipelineFactory] All %d cached pipelines cleared.", count
             )

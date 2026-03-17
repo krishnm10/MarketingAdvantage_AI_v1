@@ -14,6 +14,9 @@ interface IngestedFile {
   file_type: string;
   status: string;
   total_chunks: number;
+  unique_chunks: number;
+  duplicate_chunks: number;
+  dedup_ratio: number;
   created_at: string;
 }
 
@@ -52,6 +55,9 @@ export default function IngestionListPage() {
     <span key={`type-${f.id}`} className="text-slate-400 font-mono text-xs">{f.file_type}</span>,
     <span key={`status-${f.id}`} className={statusColor(f.status)}>{f.status}</span>,
     <span key={`chunks-${f.id}`} className="text-slate-300 font-mono">{f.total_chunks}</span>,
+    <span key={`unique-${f.id}`} className="text-emerald-400 font-mono">{f.unique_chunks}</span>,
+    <span key={`dup-${f.id}`} className="text-amber-400 font-mono">{f.duplicate_chunks}</span>,
+    <span key={`ratio-${f.id}`} className="text-slate-300 font-mono">{Number(f.dedup_ratio ?? 0).toFixed(2)}%</span>,
     <span key={`date-${f.id}`} className="text-slate-400 text-xs">{formatDateTime(f.created_at)}</span>,
   ]);
 
@@ -80,7 +86,7 @@ export default function IngestionListPage() {
           <p className="text-slate-500 text-sm mt-1">Upload a file to get started</p>
         </div>
       ) : (
-        <Table headers={["File Name", "Type", "Status", "Chunks", "Created At"]} rows={rows} />
+        <Table headers={["File Name", "Type", "Status", "Chunks", "Unique", "Duplicates", "Dedup %", "Created At"]} rows={rows} />
       )}
     </div>
   );

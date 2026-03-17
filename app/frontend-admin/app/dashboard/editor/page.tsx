@@ -2,7 +2,7 @@
 import { useAuth } from "@/lib/useAuth";
 import { Pencil, Lock } from "lucide-react";
 
-export default function ChunksTable({ chunks }: { chunks: any[] }) {
+function ChunksTable({ chunks }: { chunks: any[] }) {
   const { role } = useAuth();
   const canEdit = role === "admin" || role === "editor";
 
@@ -38,4 +38,8 @@ export default function ChunksTable({ chunks }: { chunks: any[] }) {
       </table>
     </div>
   );
+}
+
+export default function EditorPage() {
+  return <ChunksTable chunks={[]} />;
 }

@@ -1,0 +1,4 @@
+Employees must wear ID badges inside secure zones.
+Visitors must sign in at the front desk.
+Confidential reports must not be shared externally.
+

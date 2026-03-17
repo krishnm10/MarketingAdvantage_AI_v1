@@ -1,15 +1,7 @@
-import { AuthProvider } from "../app/providers/auth";
-
-export default function RootLayout({
+export default function RequireAuth({
   children,
 }: {
   children: React.ReactNode;
 }) {
-  return (
-    <html>
-      <body>
-        <AuthProvider>{children}</AuthProvider>
-      </body>
-    </html>
-  );
+  return <>{children}</>;
 }

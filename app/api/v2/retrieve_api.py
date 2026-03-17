@@ -144,6 +144,9 @@ async def retrieve_query(
         logger.error(f"[RetrieveAPI] Retrieval failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Retrieval failed: {str(e)}")
 
+    finally:
+        repository.close()
+
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
     # 4. Build response

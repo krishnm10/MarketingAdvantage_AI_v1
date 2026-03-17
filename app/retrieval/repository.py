@@ -247,6 +247,21 @@ class RetrievalRepository:
         # Pluggable vector DB (lazy-loaded from .env if not provided)
         self._vectordb = vectordb
         self._collection = collection or os.getenv("MAI_COLLECTION", "ingested_content")
+
+    def close(self) -> None:
+        vectordb = self._vectordb
+        if vectordb is None:
+            return
+        self._vectordb = None
+        close_fn = getattr(vectordb, "close", None)
+        if callable(close_fn):
+            close_fn()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
     
     def _get_vectordb(self):
         """Lazy-load vector DB from .env config (pluggable: qdrant, chroma, pinecone, milvus, weaviate, redis)"""

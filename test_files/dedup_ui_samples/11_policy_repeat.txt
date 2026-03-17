@@ -1,0 +1,8 @@
+All vendor access requests must be reviewed by security before account activation.
+
+All vendor access requests must be reviewed by security before account activation.
+
+All vendor access requests must be reviewed by security before account activation.
+
+Temporary credentials must expire within 24 hours.
+

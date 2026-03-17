@@ -4,6 +4,10 @@ import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { ReactNode, useEffect } from "react";
 
+type SessionUser = {
+  role?: string;
+};
+
 interface RequireRoleProps {
   allowedRoles: string[];
   children: ReactNode;
@@ -12,16 +16,15 @@ interface RequireRoleProps {
 export default function RequireRole({ allowedRoles, children }: RequireRoleProps) {
   const { data: session, status } = useSession();
   const router = useRouter();
+  const userRole = (session?.user as SessionUser | undefined)?.role;
 
   useEffect(() => {
     if (status === "loading") return;
 
-    // Redirect if no session or role mismatch
-    const userRole = session?.user?.role;
     if (!session || !allowedRoles.includes(userRole || "")) {
       router.replace("/auth/login");
     }
-  }, [session, status, router, allowedRoles]);
+  }, [session, status, router, allowedRoles, userRole]);
 
   if (status === "loading") {
     return (
@@ -31,7 +34,7 @@ export default function RequireRole({ allowedRoles, children }: RequireRoleProps
     );
   }
 
-  if (!session || !allowedRoles.includes(session.user?.role || "")) {
+  if (!session || !allowedRoles.includes(userRole || "")) {
     return (
       <div className="flex justify-center items-center h-screen">
         <p className="text-red-500 text-sm">

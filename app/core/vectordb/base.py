@@ -85,6 +85,13 @@ class BaseVectorDB(abc.ABC):
         """
         raise NotImplementedError
 
+    def close(self) -> None:
+        """
+        Release backend resources if the connector owns open clients/sockets.
+        Connectors that do not need cleanup can inherit this no-op.
+        """
+        return None
+
     @abc.abstractmethod
     def ensure_collection(
         self,

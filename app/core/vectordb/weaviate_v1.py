@@ -48,6 +48,7 @@ class WeaviateVectorDB(BaseVectorDB):
         self._api_key = api_key
         self._additional_headers = additional_headers or {}
         self._prefer_grpc = bool(prefer_grpc)
+        self._closed = False
         # If startup checks are skipped, assume gRPC may be unavailable and prefer REST reads.
         self._prefer_rest_reads = bool(skip_init_checks) or not self._prefer_grpc
 
@@ -101,6 +102,16 @@ class WeaviateVectorDB(BaseVectorDB):
         except Exception as exc:
             logger.warning("[WeaviateVectorDB] health_check failed: %s", exc)
             return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            self._client.close()
+        except Exception as exc:
+            logger.debug("[WeaviateVectorDB] close() ignored error: %s", exc)
+        finally:
+            self._closed = True
 
     def ensure_collection(
         self,
@@ -541,7 +552,7 @@ class WeaviateVectorDB(BaseVectorDB):
 
     def __del__(self):
         try:
-            self._client.close()
+            self.close()
         except Exception:
             pass
 
