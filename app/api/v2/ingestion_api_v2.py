@@ -14,10 +14,49 @@ from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.utils.logger import log_info, log_warning
 from app.config import ingestion_settings
 from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
+import aiofiles
+import re
 import uuid
 import os
 
 router = APIRouter(prefix="/api/v2/ingestion", tags=["Ingestion v2"])
+
+# -----------------------------------------------------------
+# MEDIA UPLOAD CONSTANTS
+# -----------------------------------------------------------
+_MAX_MEDIA_UPLOAD_BYTES: int = 200 * 1024 * 1024  # 200 MB hard cap
+_UPLOAD_CHUNK_SIZE: int = 1024 * 256              # 256 KB streaming chunks
+
+_ALLOWED_MEDIA_KINDS = frozenset({"audio", "image", "video"})
+
+_ALLOWED_EXTENSIONS: dict[str, frozenset[str]] = {
+    "audio": frozenset({".mp3", ".wav", ".flac", ".ogg", ".aac", ".m4a", ".wma"}),
+    "image": frozenset({".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tiff", ".svg"}),
+    "video": frozenset({".mp4", ".avi", ".mov", ".mkv", ".webm", ".wmv", ".flv"}),
+}
+
+_ALLOWED_CONTENT_TYPES: dict[str, frozenset[str]] = {
+    "audio": frozenset({"audio/mpeg", "audio/wav", "audio/flac", "audio/ogg", "audio/aac", "audio/mp4", "audio/x-ms-wma"}),
+    "image": frozenset({"image/jpeg", "image/png", "image/gif", "image/bmp", "image/webp", "image/tiff", "image/svg+xml"}),
+    "video": frozenset({"video/mp4", "video/x-msvideo", "video/quicktime", "video/x-matroska", "video/webm", "video/x-ms-wmv", "video/x-flv"}),
+}
+
+# Filename sanitisation regex: allow only alphanumerics, hyphens, underscores, and a single dot before the extension.
+_UNSAFE_FILENAME_RE = re.compile(r"[^\w.\-]")
+
+
+def _sanitize_filename(raw: str) -> str:
+    """Return a safe, flat filename stripped of path separators and special chars."""
+    # Take only the trailing component → defeat ../ and absolute-path tricks
+    name = os.path.basename(raw)
+    # Collapse any remaining path-separator look-alikes (e.g. backslash on non-Windows)
+    name = name.replace("\\", "_").replace("/", "_")
+    # Strip non-word characters (keeps [a-zA-Z0-9_], dots, hyphens)
+    name = _UNSAFE_FILENAME_RE.sub("_", name)
+    # Collapse repeated underscores / dots
+    name = re.sub(r"[_.]{2,}", "_", name)
+    # Ensure the name is never empty
+    return name or "unnamed_upload"
 
 # -----------------------------------------------------------
 # FILE UPLOAD INGESTION ENDPOINT
@@ -206,16 +245,76 @@ async def ingest_media(
         - perceptual_hash/acoustic_hash: Hash used for deduplication
     """
     try:
-        log_info(f"[ingestion_api_v2] Received media upload: {file.filename} ({media_kind})")
-        
+        # --------------------------------------------------
+        # 1. Validate media_kind
+        # --------------------------------------------------
+        media_kind = media_kind.strip().lower()
+        if media_kind not in _ALLOWED_MEDIA_KINDS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Invalid media_kind '{media_kind}'. Must be one of: {', '.join(sorted(_ALLOWED_MEDIA_KINDS))}",
+            )
+
+        # --------------------------------------------------
+        # 2. Validate content-type header
+        # --------------------------------------------------
+        declared_ct = (file.content_type or "").lower().split(";")[0].strip()
+        if declared_ct and declared_ct not in _ALLOWED_CONTENT_TYPES[media_kind]:
+            raise HTTPException(
+                status_code=415,
+                detail=f"Content-Type '{declared_ct}' is not acceptable for media_kind='{media_kind}'.",
+            )
+
+        # --------------------------------------------------
+        # 3. Validate file extension
+        # --------------------------------------------------
+        safe_name = _sanitize_filename(file.filename or "upload")
+        _, ext = os.path.splitext(safe_name)
+        ext = ext.lower()
+        if ext not in _ALLOWED_EXTENSIONS[media_kind]:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Extension '{ext}' is not allowed for media_kind='{media_kind}'. "
+                       f"Accepted: {', '.join(sorted(_ALLOWED_EXTENSIONS[media_kind]))}.",
+            )
+
+        log_info(f"[ingestion_api_v2] Received media upload: {safe_name} ({media_kind})")
+
+        # --------------------------------------------------
+        # 4. Stream file to disk asynchronously with size cap
+        # --------------------------------------------------
         file_id = str(uuid.uuid4())
         upload_dir = "static/uploads/media"
         os.makedirs(upload_dir, exist_ok=True)
-        file_path = os.path.join(upload_dir, f"{file_id}_{file.filename}")
-        
-        # Save uploaded file
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
+        file_path = os.path.join(upload_dir, f"{file_id}_{safe_name}")
+
+        # Resolve to absolute and verify it stays inside the upload directory
+        abs_upload_dir = os.path.realpath(upload_dir)
+        abs_file_path = os.path.realpath(file_path)
+        if not abs_file_path.startswith(abs_upload_dir + os.sep):
+            raise HTTPException(status_code=400, detail="Invalid filename.")
+
+        bytes_written = 0
+        async with aiofiles.open(abs_file_path, "wb") as out:
+            while True:
+                chunk = await file.read(_UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                bytes_written += len(chunk)
+                if bytes_written > _MAX_MEDIA_UPLOAD_BYTES:
+                    # Abort: remove partial file and reject
+                    await out.close()
+                    try:
+                        os.remove(abs_file_path)
+                    except OSError:
+                        pass
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {_MAX_MEDIA_UPLOAD_BYTES // (1024 * 1024)} MB upload limit.",
+                    )
+                await out.write(chunk)
+
+        file_path = abs_file_path  # use resolved path from here on
         
         # --------------------------------------------------
         # Resolve business_id safely (MEDIA ONLY)
