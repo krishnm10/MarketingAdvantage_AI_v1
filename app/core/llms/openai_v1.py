@@ -135,16 +135,42 @@ class OpenAILLM(BaseLLM):
         temperature: float = 0.3,
         max_tokens: int = 1024,
     ) -> AsyncGenerator[str, None]:
-        """Yield SSE text chunks from OpenAI streaming endpoint."""
+        """Yield SSE text chunks from OpenAI streaming endpoint.
+
+        The synchronous OpenAI SDK stream is offloaded to a thread so the
+        event loop is never blocked during token-by-token iteration.
+        """
+        import asyncio
+        import queue as _queue
+
         messages = self._build_messages(prompt, system_prompt)
-        with self._client.chat.completions.create(
-            model=self._model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        ) as stream:
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content
-                if delta:
-                    yield delta
+        q: _queue.Queue[Optional[str]] = _queue.Queue()
+
+        def _sync_stream() -> None:
+            try:
+                with self._client.chat.completions.create(
+                    model=self._model,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                ) as stream_iter:
+                    for chunk in stream_iter:
+                        delta = chunk.choices[0].delta.content
+                        if delta:
+                            q.put(delta)
+            finally:
+                q.put(None)
+
+        task = asyncio.get_running_loop().run_in_executor(None, _sync_stream)
+        while True:
+            try:
+                item = await asyncio.to_thread(q.get, timeout=0.5)
+            except Exception:
+                if task.done():
+                    break
+                continue
+            if item is None:
+                break
+            yield item
+        await task

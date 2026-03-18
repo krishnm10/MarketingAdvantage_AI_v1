@@ -64,11 +64,23 @@ def create_normalization_prompt(text_input: str) -> str:
 # -------------------------------------------------------------------
 # CACHE
 # -------------------------------------------------------------------
+_MAX_CACHE_SIZE: int = 4096  # bound in-memory cache to prevent unbounded growth
 _cache: Dict[str, str] = {}
 _cache_lock = asyncio.Lock()
 
 def _cache_key(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cache_put(key: str, value: str) -> None:
+    """Insert into the bounded cache, evicting oldest entries when full."""
+    if len(_cache) >= _MAX_CACHE_SIZE:
+        # Evict ~25% oldest entries to amortise eviction cost
+        evict_count = _MAX_CACHE_SIZE // 4
+        keys_to_evict = list(_cache.keys())[:evict_count]
+        for k in keys_to_evict:
+            _cache.pop(k, None)
+    _cache[key] = value
 
 # -------------------------------------------------------------------
 # LATENCY TRACKER
@@ -248,7 +260,7 @@ async def _rewrite_call(
 
             async with _cache_lock:
                 if CACHE_ENABLED:
-                    _cache[key] = output
+                    _cache_put(key, output)
             return output
     finally:
         if close_client:

@@ -5,6 +5,8 @@
 import os
 import uuid
 import hashlib
+import asyncio
+import aiofiles
 from datetime import datetime
 from fastapi import UploadFile, HTTPException
 from sqlalchemy.ext.asyncio import async_sessionmaker
@@ -63,8 +65,18 @@ def _safe_uuid(value):
 
 
 def _write_log(message: str):
+    """Append a log line. Offloaded to thread to avoid blocking the event loop."""
+    line = f"{datetime.now().isoformat()} | {message}\n"
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _write_log_sync, line)
+    except RuntimeError:
+        _write_log_sync(line)
+
+
+def _write_log_sync(line: str):
     with open(LOG_PATH, "a", encoding="utf-8") as f:
-        f.write(f"{datetime.now().isoformat()} | {message}\n")
+        f.write(line)
 
 
 def _validate_file_extension(file_name: str):
@@ -104,8 +116,8 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
 
         content = await file.read()
         temp_path = f"{saved_path}.tmp"
-        with open(temp_path, "wb") as tmpf:
-            tmpf.write(content)
+        async with aiofiles.open(temp_path, "wb") as tmpf:
+            await tmpf.write(content)
 
         file_hash = _compute_file_hash(temp_path)
         _write_log(f"[HASH] {original_file_name} → {file_hash}")

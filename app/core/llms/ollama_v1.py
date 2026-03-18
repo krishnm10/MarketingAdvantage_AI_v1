@@ -132,15 +132,42 @@ class OllamaLLM(BaseLLM):
         temperature: float = 0.3,
         max_tokens: int = 1024,
     ) -> AsyncGenerator[str, None]:
-        """Yield text chunks from Ollama streaming response."""
+        """Yield text chunks from Ollama streaming response.
+
+        The Ollama Python SDK is synchronous, so we offload the blocking
+        iterator to a thread via asyncio.to_thread to avoid starving the
+        event loop under concurrent requests.
+        """
+        import asyncio
+        import queue as _queue
+
         messages = self._build_messages(prompt, system_prompt)
-        for chunk in self._client.chat(
-            model=self._model,
-            messages=messages,
-            stream=True,
-            options={"temperature": temperature, "num_predict": max_tokens},
-            keep_alive=self._keep_alive,
-        ):
-            delta = chunk.get("message", {}).get("content", "")
-            if delta:
-                yield delta
+        q: _queue.Queue[Optional[str]] = _queue.Queue()
+
+        def _sync_stream() -> None:
+            try:
+                for chunk in self._client.chat(
+                    model=self._model,
+                    messages=messages,
+                    stream=True,
+                    options={"temperature": temperature, "num_predict": max_tokens},
+                    keep_alive=self._keep_alive,
+                ):
+                    delta = chunk.get("message", {}).get("content", "")
+                    if delta:
+                        q.put(delta)
+            finally:
+                q.put(None)  # sentinel
+
+        task = asyncio.get_running_loop().run_in_executor(None, _sync_stream)
+        while True:
+            try:
+                item = await asyncio.to_thread(q.get, timeout=0.5)
+            except Exception:
+                if task.done():
+                    break
+                continue
+            if item is None:
+                break
+            yield item
+        await task  # propagate any exception

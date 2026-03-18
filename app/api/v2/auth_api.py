@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import timedelta
@@ -56,6 +57,32 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": user["username"],
+        "role": user["role"],
+    }
+
+
+# -----------------------------------------------------------
+# OAUTH2 TOKEN ENDPOINT (for Swagger Authorize button)
+# Accepts application/x-www-form-urlencoded as required by OAuth2 spec
+# -----------------------------------------------------------
+@router.post("/token", response_model=TokenResponse, include_in_schema=False)
+async def get_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    OAuth2-compatible token endpoint used by Swagger's Authorize dialog.
+    Accepts form data (username/password) and returns a JWT.
+    """
+    user = USERS_DB.get(form_data.username)
+    if not user or user["password"] != form_data.password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    token = create_access_token(
+        data={"sub": user["username"], "role": user["role"]},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
     return {
         "access_token": token,
         "token_type": "bearer",
