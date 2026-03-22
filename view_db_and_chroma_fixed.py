@@ -5,15 +5,18 @@
 import os
 import sys
 import json
+from dotenv import load_dotenv
+load_dotenv()
+
 from sqlalchemy import create_engine, text, inspect
 import chromadb
 from chromadb.config import Settings
 from typing import Any, Dict, List
 
 # ---------- CONFIG ----------
-DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. 'postgresql://user:pass@host/db'
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
-CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "ingested_content")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:Mahadeva%40123@localhost/marketing_advantage")  # e.g. 'postgresql://user:pass@host/db'
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./pluggable_db")
+CHROMA_COLLECTION = os.getenv("MAI_COLLECTION", os.getenv("CHROMA_COLLECTION", "ingested_content_dedup"))
 
 SAMPLE_LIMIT = int(os.getenv("SAMPLE_LIMIT", "5"))
 RECENT_GCI_LIMIT = int(os.getenv("RECENT_GCI_LIMIT", "100"))

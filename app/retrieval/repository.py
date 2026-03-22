@@ -298,7 +298,7 @@ class RetrievalRepository:
                     port=chroma_port,
                     ssl=use_ssl,
                     api_key=api_key,
-                    persist_directory=os.getenv("CHROMA_PATH", "./chroma_db") if not chroma_host else None,
+                    persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db") if not chroma_host else None,
                 )
             elif db_type == "pinecone":
                 from app.core.vectordb.pinecone_v1 import PineconeVectorDB

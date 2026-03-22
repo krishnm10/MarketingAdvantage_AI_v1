@@ -34,7 +34,7 @@ def _make_chroma_client():
             settings=Settings(anonymized_telemetry=False),
         )
     return chromadb.PersistentClient(
-        path=os.getenv("CHROMA_PATH", "./chroma_db"),
+        path=os.getenv("CHROMA_PATH", "./pluggable_db"),
         settings=Settings(anonymized_telemetry=False),
     )
 

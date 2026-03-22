@@ -1,11 +1,14 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import chromadb
 from sqlalchemy import create_engine, text
 from chromadb.config import Settings
 
 DATABASE_URL = os.getenv("DATABASE_URL","postgresql://postgres:Mahadeva%40123@localhost/marketing_advantage")
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
-COLLECTION_NAME = os.getenv("CHROMA_COLLECTION", "ingested_content_local")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./pluggable_db")
+COLLECTION_NAME = os.getenv("MAI_COLLECTION", os.getenv("CHROMA_COLLECTION", "ingested_content_dedup"))
 
 LIMIT = 200   # how many recent GCI rows to inspect
 BATCH = 32

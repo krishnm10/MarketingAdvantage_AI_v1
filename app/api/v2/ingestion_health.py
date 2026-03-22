@@ -154,7 +154,7 @@ async def _check_chroma() -> dict:
     try:
         import chromadb
         from chromadb.config import Settings
-        chroma_path = os.getenv("CHROMA_PATH") or "./chroma_db"
+        chroma_path = os.getenv("CHROMA_PATH") or "./pluggable_db"
         client = chromadb.PersistentClient(
             path=chroma_path,
             settings=Settings(anonymized_telemetry=False),

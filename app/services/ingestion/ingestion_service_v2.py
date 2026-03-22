@@ -398,7 +398,7 @@ def _build_config_from_env(
             type=VectorDBType.CHROMA,
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
             chroma=ChromaConfig(
-                persist_directory=os.getenv("CHROMA_PATH", "./chroma_db") if not chroma_host else None,
+                persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db") if not chroma_host else None,
                 host=chroma_host,
                 port=int(chroma_port),
                 ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),

@@ -257,15 +257,35 @@ class ChromaVectorDB(BaseVectorDB):
         updated   = len(doc_ids) - inserted
 
         try:
+            count_before = col.count()
+
             col.upsert(
                 ids=doc_ids,
                 embeddings=embeddings,
                 documents=texts,
                 metadatas=safe_metas,
             )
+
+            # ── POST-UPSERT VERIFICATION ────────────────────────────
+            # ChromaDB PersistentClient writes to SQLite WAL on upsert.
+            # Verify the count changed to catch silent write failures
+            # (e.g. WAL lock contention, disk-full, or segment corruption).
+            count_after = col.count()
+            expected_min = count_before + inserted  # at minimum, new records added
+
+            if inserted > 0 and count_after < expected_min:
+                logger.warning(
+                    "[ChromaVectorDB] batch_upsert VERIFICATION WARNING on '%s': "
+                    "count %d → %d (expected ≥ %d). "
+                    "%d vectors may not have persisted.",
+                    collection, count_before, count_after, expected_min,
+                    expected_min - count_after,
+                )
+
             logger.info(
-                "[ChromaVectorDB] batch_upsert '%s': +%d new, ~%d updated",
-                collection, inserted, updated,
+                "[ChromaVectorDB] batch_upsert '%s': +%d new, ~%d updated "
+                "(count %d → %d)",
+                collection, inserted, updated, count_before, count_after,
             )
             return BatchUpsertResult(inserted=inserted, updated=updated)
 

@@ -4,7 +4,7 @@ Extracted from retrieve_cli.py for reusability across CLI and API
 
 Supports BOTH remote (HttpClient) and local (PersistentClient) modes:
   - Remote: set CHROMA_HOST / CHROMA_PORT in .env
-  - Local:  leave CHROMA_HOST empty → uses CHROMA_PATH (default ./chroma_db)
+  - Local:  leave CHROMA_HOST empty → uses CHROMA_PATH (default ./pluggable_db)
 """
 
 import os
@@ -19,7 +19,7 @@ from app.utils.logger import log_debug, log_info, log_warning
 # CONFIGURATION
 # =========================================================
 
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_db")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./pluggable_db")
 COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
 
 _CHROMA_CLIENT = None

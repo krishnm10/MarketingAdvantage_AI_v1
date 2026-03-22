@@ -41,6 +41,13 @@ def _run(coro):
 
     Fix: dispose the async engine's pool after every task so that the next
     task creates fresh connections on its own fresh loop.
+
+    PIPELINE CACHE: The ingestion pipeline (including ChromaDB PersistentClient)
+    is cached via @lru_cache.  When multiple processes (FastAPI + Celery) share
+    the same ChromaDB persist_directory, the in-memory HNSW index can become
+    stale.  Clearing the cache after each task ensures each task starts with a
+    fresh ChromaDB client that reads the latest on-disk state, preventing
+    silent data loss from concurrent-writer segment overwrites.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -51,6 +58,15 @@ def _run(coro):
         try:
             from app.db.session_v2 import async_engine
             loop.run_until_complete(async_engine.dispose())
+        except Exception:
+            pass
+        # Release cached pipelines so ChromaDB PersistentClients are
+        # properly closed and their WAL state is flushed to disk.
+        try:
+            from app.services.ingestion.ingestion_service_v2 import (
+                _get_pipeline_for_client,
+            )
+            _get_pipeline_for_client.cache_clear()
         except Exception:
             pass
         loop.close()
