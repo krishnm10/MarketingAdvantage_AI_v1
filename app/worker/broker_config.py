@@ -47,6 +47,12 @@ import os
 import logging
 from typing import Any
 
+from dotenv import load_dotenv
+
+# Load .env so that CLI-launched workers (celery -A app.worker ...) pick up
+# the same env vars that FastAPI reads via pydantic BaseSettings.
+load_dotenv()
+
 logger = logging.getLogger("marketing_advantage_ai")
 
 

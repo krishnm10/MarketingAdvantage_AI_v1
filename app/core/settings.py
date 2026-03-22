@@ -148,6 +148,24 @@ class AppSettings(BaseSettings):
 
     # Upstash (redis or kafka)
     upstash_broker_type: str = Field(default="redis", alias="UPSTASH_BROKER_TYPE")
+
+    # ── Celery Worker Configuration ───────────────────────────────────────────
+    # Pool type: solo (safe on Windows), prefork (default Linux/Mac), threads, gevent, eventlet
+    celery_worker_pool: str = Field(default="solo", alias="CELERY_WORKER_POOL")
+    celery_worker_concurrency: int = Field(default=4, alias="CELERY_WORKER_CONCURRENCY")
+    celery_worker_loglevel: str = Field(default="INFO", alias="CELERY_WORKER_LOGLEVEL")
+    celery_worker_queues: str = Field(default="ingestion,validation", alias="CELERY_WORKER_QUEUES")
+    celery_worker_max_tasks_per_child: int = Field(default=0, alias="CELERY_WORKER_MAX_TASKS_PER_CHILD")
+    celery_worker_prefetch_multiplier: int = Field(default=1, alias="CELERY_WORKER_PREFETCH_MULTIPLIER")
+    celery_task_soft_time_limit: int = Field(default=0, alias="CELERY_TASK_SOFT_TIME_LIMIT")
+    celery_task_hard_time_limit: int = Field(default=0, alias="CELERY_TASK_HARD_TIME_LIMIT")
+    celery_task_max_retries: int = Field(default=3, alias="CELERY_TASK_MAX_RETRIES")
+    celery_task_retry_delay: int = Field(default=60, alias="CELERY_TASK_RETRY_DELAY")
+    celery_result_expires: int = Field(default=86400, alias="CELERY_RESULT_EXPIRES")
+    celery_worker_disable_heartbeat: bool = Field(default=True, alias="CELERY_WORKER_DISABLE_HEARTBEAT")
+    celery_worker_disable_gossip: bool = Field(default=True, alias="CELERY_WORKER_DISABLE_GOSSIP")
+    celery_worker_disable_mingle: bool = Field(default=True, alias="CELERY_WORKER_DISABLE_MINGLE")
+
     # ── PHANTOM Hardware Tuning ───────────────────────────────────────────────
     phantom_embed_batch_size: str = Field(default="", alias="PHANTOM_EMBED_BATCH_SIZE")
     phantom_upsert_batch_size: str = Field(default="", alias="PHANTOM_UPSERT_BATCH_SIZE")

@@ -30,12 +30,29 @@ from app.worker.celery_app import celery_app
 
 
 def _run(coro):
-    """Run an async coroutine in a fresh event loop (Celery workers are sync)."""
+    """
+    Run an async coroutine in a fresh event loop (Celery workers are sync).
+
+    IMPORTANT: asyncpg connections inside SQLAlchemy's pool are bound to the
+    event loop that created them.  When we close the loop at the end of one
+    task, those connections become zombies — the next task gets a new loop but
+    the pool hands out connections from the dead loop, causing:
+        'NoneType' object has no attribute 'send'
+
+    Fix: dispose the async engine's pool after every task so that the next
+    task creates fresh connections on its own fresh loop.
+    """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(coro)
     finally:
+        # Drain asyncpg pool so stale connections don't poison the next task
+        try:
+            from app.db.session_v2 import async_engine
+            loop.run_until_complete(async_engine.dispose())
+        except Exception:
+            pass
         loop.close()
 
 

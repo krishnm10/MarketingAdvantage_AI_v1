@@ -390,6 +390,29 @@ const SECTIONS: ConfigSection[] = [
       { key: "UPSTASH_BROKER_TYPE", label: "Upstash Mode", type: "select", options: ["redis", "kafka"] },
     ],
   },
+  {
+    category: "taskqueue",
+    title: "Celery — Worker Configuration",
+    description: "Worker pool, concurrency, prefetch, time limits, retries & heartbeat settings",
+    icon: SettingsIcon,
+    gradient: "from-orange-600 to-amber-700 shadow-orange-600/20",
+    keys: [
+      { key: "CELERY_WORKER_POOL", label: "Pool Type", type: "select", options: ["solo", "prefork", "threads", "gevent", "eventlet"] },
+      { key: "CELERY_WORKER_CONCURRENCY", label: "Concurrency", type: "number" },
+      { key: "CELERY_WORKER_LOGLEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] },
+      { key: "CELERY_WORKER_QUEUES", label: "Queues (comma-sep)", placeholder: "ingestion,validation" },
+      { key: "CELERY_WORKER_PREFETCH_MULTIPLIER", label: "Prefetch Multiplier", type: "number" },
+      { key: "CELERY_WORKER_MAX_TASKS_PER_CHILD", label: "Max Tasks/Child (0=∞)", type: "number" },
+      { key: "CELERY_TASK_SOFT_TIME_LIMIT", label: "Soft Time Limit (s, 0=off)", type: "number" },
+      { key: "CELERY_TASK_HARD_TIME_LIMIT", label: "Hard Time Limit (s, 0=off)", type: "number" },
+      { key: "CELERY_TASK_MAX_RETRIES", label: "Max Retries", type: "number" },
+      { key: "CELERY_TASK_RETRY_DELAY", label: "Retry Delay (s)", type: "number" },
+      { key: "CELERY_RESULT_EXPIRES", label: "Result Expiry (s)", type: "number" },
+      { key: "CELERY_WORKER_DISABLE_HEARTBEAT", label: "Disable Heartbeat", type: "boolean" },
+      { key: "CELERY_WORKER_DISABLE_GOSSIP", label: "Disable Gossip", type: "boolean" },
+      { key: "CELERY_WORKER_DISABLE_MINGLE", label: "Disable Mingle", type: "boolean" },
+    ],
+  },
 
   /* ────────────────── INTEGRATIONS ────────────────── */
   {
