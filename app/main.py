@@ -22,7 +22,21 @@
 #   ✅ PHANTOM Protocol Phase 0 — hardware profiler + config bridge (Step 5)
 #   ✅ /health now includes phantom hardware section
 #   ✅ GET /phantom/stats endpoint (PHANTOM runtime diagnostics)
+#   ✅ uvloop event loop accelerator (Linux/Mac; silently skipped on Windows)
+#   ✅ Sentry SDK error tracking (gated on SENTRY_DSN env var)
+#   ✅ slowapi rate limiting (200/minute default, env-configurable)
 # =============================================================================
+
+# ─────────────────────────────────────────────────────────────────────────────
+# uvloop — must be installed before the event loop is created.
+# Provides a 2-4x faster asyncio event loop on Linux/Mac.
+# Silently skipped on Windows (not supported server-side; fine for dev).
+# ─────────────────────────────────────────────────────────────────────────────
+try:
+    import uvloop
+    uvloop.install()  # Sets uvloop as the default asyncio event loop policy
+except ImportError:
+    pass  # Not available on this platform — standard asyncio loop used
 
 import asyncio
 import logging
@@ -31,8 +45,23 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List
 
-from fastapi import FastAPI
+try:
+    import sentry_sdk
+    _sentry_available = True
+except ImportError:
+    sentry_sdk = None  # type: ignore[assignment]
+    _sentry_available = False
+
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+    _slowapi_available = True
+except ImportError:
+    _slowapi_available = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging — replace all print() with structured logger
@@ -43,6 +72,59 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("marketing_advantage_ai")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sentry SDK  — Error tracking + performance monitoring
+# Activated only when SENTRY_DSN is set in the environment.
+# Safe no-op when the variable is missing (dev / test environments).
+# ─────────────────────────────────────────────────────────────────────────────
+_sentry_dsn = os.getenv("SENTRY_DSN", "").strip()
+if _sentry_available and _sentry_dsn:
+    sentry_sdk.init(
+        dsn=_sentry_dsn,
+        environment=os.getenv("ENVIRONMENT", "production"),
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        send_default_pii=False,          # GDPR / privacy compliance
+        attach_stacktrace=True,
+        integrations=[
+            sentry_sdk.integrations.fastapi.FastApiIntegration(
+                transaction_style="endpoint"
+            ),
+            sentry_sdk.integrations.starlette.StarletteIntegration(
+                transaction_style="endpoint"
+            ),
+            sentry_sdk.integrations.sqlalchemy.SqlalchemyIntegration(),
+            sentry_sdk.integrations.logging.LoggingIntegration(
+                level=logging.WARNING,    # breadcrumbs from WARNING+
+                event_level=logging.ERROR,  # send event on ERROR+
+            ),
+        ],
+    )
+    logger.info("[Sentry] Error tracking enabled (env=%s)", os.getenv("ENVIRONMENT", "production"))
+elif not _sentry_available:
+    logger.warning("[Sentry] sentry-sdk not installed — run: pip install sentry-sdk[fastapi]")
+else:
+    logger.info("[Sentry] SENTRY_DSN not set — error tracking disabled (dev mode)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rate Limiter (slowapi)
+# Default: 200 requests/minute per IP — override via RATE_LIMIT_DEFAULT env var.
+# Storage: in-memory by default; set REDIS_URL=redis://... for distributed.
+# ─────────────────────────────────────────────────────────────────────────────
+_rate_limit_default = os.getenv("RATE_LIMIT_DEFAULT", "200/minute")
+_redis_url = os.getenv("REDIS_URL", "memory://")
+
+if _slowapi_available:
+    limiter = Limiter(
+        key_func=get_remote_address,
+        default_limits=[_rate_limit_default],
+        storage_uri=_redis_url,
+    )
+else:
+    limiter = None  # type: ignore[assignment]
+    logger.warning("[RateLimit] slowapi not installed — rate limiting disabled")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -355,6 +437,11 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+# ── Rate limiter — attach to app state and register 429 handler ──────────────
+app.state.limiter = limiter
+if _slowapi_available and limiter is not None:
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
 # =============================================================================

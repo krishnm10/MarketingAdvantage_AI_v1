@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
-from jose import jwt, JWTError
+from authlib.jose import jwt
+from authlib.jose.errors import JoseError
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -32,8 +33,9 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None):
     expire = datetime.now(timezone.utc) + (
         expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    to_encode.update({"exp": int(expire.timestamp())})
+    token = jwt.encode({"alg": ALGORITHM}, to_encode, SECRET_KEY)
+    return token.decode("utf-8") if isinstance(token, bytes) else token
 
 
 # -----------------------------------------------------------
@@ -44,7 +46,8 @@ def verify_access_token(token: str):
     Verify JWT and return decoded payload if valid.
     """
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
+        claims = jwt.decode(token, SECRET_KEY)
+        claims.validate()
+        return dict(claims)
+    except JoseError:
         return None

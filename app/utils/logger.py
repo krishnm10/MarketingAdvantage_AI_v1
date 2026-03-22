@@ -12,7 +12,40 @@ LOG_DIR = "logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 
 # ----------------------------------
-# LOG FORMATTER
+# LOG FORMAT MODE
+# ----------------------------------
+# Set LOG_FORMAT=json in production for structured JSON lines consumed by
+# Datadog / Splunk / CloudWatch / any log aggregator.
+# Default ("text") keeps the existing colorized console format unchanged.
+
+_LOG_FORMAT_MODE = os.getenv("LOG_FORMAT", "text").lower()
+
+# ----------------------------------
+# STRUCTLOG JSON CONFIGURATION
+# (activated when LOG_FORMAT=json)
+# ----------------------------------
+
+if _LOG_FORMAT_MODE == "json":
+    import structlog
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.ExceptionRenderer(),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        context_class=dict,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=True,
+    )
+
+# ----------------------------------
+# LOG FORMATTER  (text mode)
 # ----------------------------------
 
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
@@ -31,11 +64,15 @@ file_handler = RotatingFileHandler(
     backupCount=5,
     encoding="utf-8"
 )
-file_handler.setFormatter(formatter)
+# In JSON mode use plain formatter for file so each line is a JSON object
+if _LOG_FORMAT_MODE == "json":
+    file_handler.setFormatter(logging.Formatter("%(message)s"))
+else:
+    file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.INFO)
 
 # ----------------------------------
-# CONSOLE HANDLER (Colorized)
+# CONSOLE HANDLER (Colorized / JSON)
 # ----------------------------------
 
 class ColorFormatter(logging.Formatter):
@@ -54,7 +91,10 @@ class ColorFormatter(logging.Formatter):
         return f"{color}{message}{self.RESET}"
 
 console_handler = logging.StreamHandler()
-console_handler.setFormatter(ColorFormatter(LOG_FORMAT, DATE_FORMAT))
+if _LOG_FORMAT_MODE == "json":
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+else:
+    console_handler.setFormatter(ColorFormatter(LOG_FORMAT, DATE_FORMAT))
 console_handler.setLevel(logging.DEBUG)
 
 # ----------------------------------

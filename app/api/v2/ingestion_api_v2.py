@@ -117,6 +117,24 @@ async def ingest_external(
         if not ingestion_settings.ENABLE_LLM_NORMALIZATION:
             log_info("[ingestion_api_v2] ⚙️ LLM normalization disabled — proceeding without LLM rewrite.")
 
+        # ── Celery: queue in background; fall back to inline if broker is down ──
+        # Only attempted when CELERY_ENABLED=true in .env.
+        try:
+            from app.worker.broker_config import is_celery_enabled
+            if is_celery_enabled():
+                from app.worker.tasks import run_external_ingestion_task
+                task = run_external_ingestion_task.delay(source_type, source_url, business_id)
+                log_info(f"[ingestion_api_v2] Queued Celery task task_id={task.id} for {source_url}")
+                return {
+                    "status": "queued",
+                    "task_id": task.id,
+                    "source_type": source_type,
+                    "source_url": source_url,
+                    "LLM_ENABLED": ingestion_settings.ENABLE_LLM_NORMALIZATION,
+                }
+        except Exception:
+            pass  # Celery / broker unavailable — fall through to inline
+
         response = await route_external_ingestion(
             source_type=source_type,
             source_url=source_url,

@@ -12,7 +12,7 @@ import {
   Shield,
   Globe,
   Image,
-  Search,
+  Search as SearchIcon,
   Settings as SettingsIcon,
   RefreshCw,
   CheckCircle2,
@@ -26,19 +26,14 @@ import {
   Loader2,
   AlertTriangle,
   Undo2,
+  Layers,
+  Activity,
+  Network,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 
 /* ─── Types ─── */
-interface ConfigSection {
-  title: string;
-  description: string;
-  icon: any;
-  gradient: string;
-  keys: ConfigKey[];
-}
-
 interface ConfigKey {
   key: string;
   label: string;
@@ -48,9 +43,39 @@ interface ConfigKey {
   placeholder?: string;
 }
 
+interface ConfigSection {
+  title: string;
+  description: string;
+  icon: any;
+  gradient: string;
+  category: string;
+  keys: ConfigKey[];
+}
+
+interface Category {
+  id: string;
+  label: string;
+  icon: any;
+  color: string;
+}
+
+/* ─── Categories ─── */
+const CATEGORIES: Category[] = [
+  { id: "all",           label: "All",              icon: SettingsIcon, color: "text-slate-600" },
+  { id: "pipeline",      label: "Pipeline",         icon: Zap,          color: "text-primary-600" },
+  { id: "vectordb",      label: "Vector Databases",  icon: Database,     color: "text-violet-600" },
+  { id: "ai",            label: "AI Providers",      icon: Brain,        color: "text-emerald-600" },
+  { id: "taskqueue",     label: "Task Queue",        icon: Layers,       color: "text-orange-600" },
+  { id: "integrations",  label: "Integrations",      icon: Network,      color: "text-indigo-600" },
+  { id: "observability", label: "Observability",     icon: Activity,     color: "text-cyan-600" },
+  { id: "security",      label: "Security & App",    icon: Shield,       color: "text-red-600" },
+];
+
 /* ─── Section definitions (metadata only — values come from backend) ─── */
 const SECTIONS: ConfigSection[] = [
+  /* ────────────────── PIPELINE ────────────────── */
   {
+    category: "pipeline",
     title: "Pluggable Pipeline — Global Defaults",
     description: "Core pipeline configuration driving the entire platform",
     icon: Zap,
@@ -64,6 +89,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "pipeline",
     title: "Ingestion & Deduplication",
     description: "Control batch ingestion and dedup layers from the .env configuration",
     icon: SettingsIcon,
@@ -85,15 +111,22 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
-    title: "Database",
-    description: "Primary PostgreSQL database connection",
-    icon: Database,
-    gradient: "from-blue-500 to-blue-700 shadow-blue-600/20",
+    category: "pipeline",
+    title: "PHANTOM Hardware Tuning",
+    description: "High-performance tuning for embedding, upsert, and bloom filter",
+    icon: Zap,
+    gradient: "from-purple-500 to-purple-700 shadow-purple-600/20",
     keys: [
-      { key: "DATABASE_URL", label: "Connection String", sensitive: true },
+      { key: "PHANTOM_EMBED_BATCH_SIZE", label: "Embed Batch Size", type: "number" },
+      { key: "PHANTOM_UPSERT_BATCH_SIZE", label: "Upsert Batch Size", type: "number" },
+      { key: "PHANTOM_INGEST_WORKERS", label: "Ingest Workers", type: "number" },
+      { key: "PHANTOM_BLOOM_CAPACITY", label: "Bloom Filter Capacity", type: "number" },
     ],
   },
+
+  /* ────────────────── VECTOR DATABASES ────────────────── */
   {
+    category: "vectordb",
     title: "ChromaDB",
     description: "ChromaDB vector store — local path or remote server",
     icon: HardDrive,
@@ -110,6 +143,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "vectordb",
     title: "Qdrant",
     description: "Qdrant vector database for embeddings",
     icon: Database,
@@ -125,6 +159,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "vectordb",
     title: "Milvus",
     description: "Milvus vector database (optional)",
     icon: Database,
@@ -140,6 +175,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "vectordb",
     title: "Pinecone",
     description: "Pinecone managed vector database (optional)",
     icon: Database,
@@ -158,6 +194,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "vectordb",
     title: "Weaviate",
     description: "Weaviate vector database (optional)",
     icon: Database,
@@ -174,6 +211,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "vectordb",
     title: "Redis Stack",
     description: "Redis vector database — local, remote, or Redis Cloud",
     icon: Database,
@@ -190,7 +228,10 @@ const SECTIONS: ConfigSection[] = [
       { key: "REDIS_PREFIX", label: "Key Prefix" },
     ],
   },
+
+  /* ────────────────── AI PROVIDERS ────────────────── */
   {
+    category: "ai",
     title: "Ollama — Local LLM",
     description: "Self-hosted LLM via Ollama",
     icon: Server,
@@ -202,6 +243,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "HuggingFace — Embeddings",
     description: "HuggingFace sentence transformer embeddings",
     icon: Brain,
@@ -215,6 +257,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "OpenAI",
     description: "OpenAI API for embeddings and LLM",
     icon: Brain,
@@ -226,6 +269,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "Groq",
     description: "Groq cloud inference",
     icon: Zap,
@@ -236,6 +280,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "Anthropic",
     description: "Anthropic Claude models",
     icon: Brain,
@@ -246,6 +291,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "Google Gemini",
     description: "Google Gemini AI models",
     icon: Brain,
@@ -256,6 +302,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "ai",
     title: "Cohere",
     description: "Cohere embeddings & reranking",
     icon: Brain,
@@ -265,10 +312,91 @@ const SECTIONS: ConfigSection[] = [
       { key: "COHERE_EMBED_MODEL", label: "Embed Model" },
     ],
   },
+
+  /* ────────────────── TASK QUEUE & BROKERS ────────────────── */
   {
-    title: "Web Search",
+    category: "taskqueue",
+    title: "Celery — Master Switch",
+    description: "Enable/disable distributed task queue and select message broker",
+    icon: Layers,
+    gradient: "from-orange-500 to-orange-700 shadow-orange-600/20",
+    keys: [
+      { key: "CELERY_ENABLED", label: "Enable Celery", type: "boolean" },
+      { key: "CELERY_BROKER", label: "Broker Type", type: "select", options: [
+        "redis", "rabbitmq", "sqs", "kafka", "redpanda", "warpstream",
+        "nats", "pulsar", "kinesis", "pubsub", "eventhubs", "upstash",
+        "redis_streams", "tinybird", "glassflow", "streamnative", "aiven",
+      ]},
+      { key: "CELERY_BROKER_URL", label: "Broker URL Override", placeholder: "Leave empty to auto-detect from broker type" },
+      { key: "CELERY_RESULT_BACKEND", label: "Result Backend Override", placeholder: "Leave empty for default", sensitive: true },
+    ],
+  },
+  {
+    category: "taskqueue",
+    title: "Broker — Redis",
+    description: "Redis broker connection (default). Also used for redis_streams",
+    icon: Database,
+    gradient: "from-red-500 to-red-600 shadow-red-600/20",
+    keys: [
+      { key: "CELERY_REDIS_URL", label: "Redis URL", type: "url", placeholder: "redis://localhost:6379/0", sensitive: true },
+    ],
+  },
+  {
+    category: "taskqueue",
+    title: "Broker — RabbitMQ",
+    description: "AMQP broker — RabbitMQ, CloudAMQP, Amazon MQ",
+    icon: Network,
+    gradient: "from-amber-500 to-amber-700 shadow-amber-600/20",
+    keys: [
+      { key: "RABBITMQ_URL", label: "AMQP URL", type: "url", placeholder: "amqp://guest:guest@localhost:5672//", sensitive: true },
+    ],
+  },
+  {
+    category: "taskqueue",
+    title: "Broker — Kafka & Kafka-Compatible",
+    description: "Apache Kafka, Redpanda, WarpStream, Aiven, Confluent, EventHubs, Tinybird, GlassFlow",
+    icon: Layers,
+    gradient: "from-slate-600 to-slate-800 shadow-slate-700/20",
+    keys: [
+      { key: "KAFKA_BOOTSTRAP_SERVERS", label: "Bootstrap Servers", placeholder: "localhost:9092" },
+      { key: "KAFKA_SECURITY_PROTOCOL", label: "Security Protocol", type: "select", options: ["PLAINTEXT", "SASL_PLAINTEXT", "SASL_SSL", "SSL"] },
+      { key: "KAFKA_SASL_MECHANISM", label: "SASL Mechanism", type: "select", options: ["", "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512"] },
+      { key: "KAFKA_SASL_USERNAME", label: "SASL Username" },
+      { key: "KAFKA_SASL_PASSWORD", label: "SASL Password", sensitive: true },
+    ],
+  },
+  {
+    category: "taskqueue",
+    title: "Broker — NATS & Pulsar",
+    description: "NATS JetStream and Apache Pulsar / StreamNative connections",
+    icon: Network,
+    gradient: "from-indigo-500 to-indigo-700 shadow-indigo-600/20",
+    keys: [
+      { key: "NATS_URL", label: "NATS URL", type: "url", placeholder: "nats://localhost:4222" },
+      { key: "PULSAR_URL", label: "Pulsar URL", type: "url", placeholder: "pulsar://localhost:6650" },
+    ],
+  },
+  {
+    category: "taskqueue",
+    title: "Broker — AWS / GCP / Upstash",
+    description: "Amazon SQS, Google Pub/Sub, and Upstash managed brokers",
+    icon: Globe,
+    gradient: "from-sky-500 to-sky-700 shadow-sky-600/20",
+    keys: [
+      { key: "SQS_REGION", label: "SQS Region", placeholder: "us-east-1" },
+      { key: "SQS_QUEUE_PREFIX", label: "SQS Queue Prefix", placeholder: "mai-" },
+      { key: "GOOGLE_CLOUD_PROJECT", label: "GCP Project ID" },
+      { key: "PUBSUB_SUBSCRIPTION_PREFIX", label: "Pub/Sub Prefix", placeholder: "mai-" },
+      { key: "UPSTASH_BROKER_TYPE", label: "Upstash Mode", type: "select", options: ["redis", "kafka"] },
+    ],
+  },
+
+  /* ────────────────── INTEGRATIONS ────────────────── */
+  {
+    category: "integrations",
+    title: "Web Search (Serper)",
     description: "Serper API for web search augmentation",
-    icon: Search,
+    icon: SearchIcon,
     gradient: "from-indigo-500 to-indigo-700 shadow-indigo-600/20",
     keys: [
       { key: "SERPER_API_KEY", label: "API Key", sensitive: true },
@@ -277,6 +405,7 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
+    category: "integrations",
     title: "AI Image Generation",
     description: "Image generation models",
     icon: Image,
@@ -286,7 +415,55 @@ const SECTIONS: ConfigSection[] = [
       { key: "DEEPAI_API_KEY", label: "API Key", sensitive: true },
     ],
   },
+
+  /* ────────────────── OBSERVABILITY ────────────────── */
   {
+    category: "observability",
+    title: "Sentry — Error Tracking",
+    description: "Sentry SDK for error tracking and performance monitoring",
+    icon: Activity,
+    gradient: "from-purple-500 to-purple-700 shadow-purple-600/20",
+    keys: [
+      { key: "SENTRY_DSN", label: "DSN", sensitive: true, placeholder: "https://key@sentry.io/project" },
+      { key: "ENVIRONMENT", label: "Environment", type: "select", options: ["development", "staging", "production"] },
+      { key: "SENTRY_TRACES_SAMPLE_RATE", label: "Traces Sample Rate", type: "number", placeholder: "0.1" },
+    ],
+  },
+  {
+    category: "observability",
+    title: "Structured Logging",
+    description: "Log format and level — use JSON for production log aggregators",
+    icon: Activity,
+    gradient: "from-cyan-500 to-cyan-700 shadow-cyan-600/20",
+    keys: [
+      { key: "LOG_FORMAT", label: "Log Format", type: "select", options: ["text", "json"] },
+      { key: "LOG_LEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] },
+    ],
+  },
+  {
+    category: "observability",
+    title: "Rate Limiting",
+    description: "slowapi rate limiter — protects endpoints from abuse",
+    icon: Shield,
+    gradient: "from-rose-500 to-rose-700 shadow-rose-600/20",
+    keys: [
+      { key: "RATE_LIMIT_DEFAULT", label: "Default Limit", placeholder: "200/minute" },
+    ],
+  },
+
+  /* ────────────────── SECURITY & APP ────────────────── */
+  {
+    category: "security",
+    title: "Database",
+    description: "Primary PostgreSQL database connection",
+    icon: Database,
+    gradient: "from-blue-500 to-blue-700 shadow-blue-600/20",
+    keys: [
+      { key: "DATABASE_URL", label: "Connection String", sensitive: true },
+    ],
+  },
+  {
+    category: "security",
     title: "Authentication & Security",
     description: "JWT configuration and access control",
     icon: Shield,
@@ -298,15 +475,18 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
   {
-    title: "Frontend",
-    description: "Frontend API connection",
+    category: "security",
+    title: "CORS & Frontend",
+    description: "CORS origins and frontend API connection",
     icon: Globe,
     gradient: "from-sky-500 to-sky-700 shadow-sky-600/20",
     keys: [
-      { key: "VITE_API_URL", label: "API URL", type: "url" },
+      { key: "CORS_ORIGINS", label: "Allowed Origins", placeholder: "* or comma-separated URLs" },
+      { key: "VITE_API_URL", label: "Frontend API URL", type: "url" },
     ],
   },
   {
+    category: "security",
     title: "Validation Scheduler",
     description: "Background validation workers and intervals",
     icon: Clock,
@@ -430,9 +610,9 @@ function ConfigField({
             value === "true" ? "bg-emerald-50 text-emerald-700" : "bg-slate-100 text-slate-500"
           )}>{value || "—"}</span>
         ) : keyDef.type === "url" ? (
-          <span className="rounded-lg bg-blue-50 px-3 py-1 text-xs font-mono text-blue-700">{displayValue}</span>
+          <span className="rounded-lg bg-blue-50 px-3 py-1 text-xs font-mono text-blue-700 max-w-[280px] truncate">{displayValue}</span>
         ) : (
-          <span className="rounded-lg bg-slate-100 px-3 py-1 text-xs font-mono text-slate-600">{displayValue}</span>
+          <span className="rounded-lg bg-slate-100 px-3 py-1 text-xs font-mono text-slate-600 max-w-[280px] truncate">{displayValue}</span>
         )}
         {keyDef.sensitive && (
           <button
@@ -466,6 +646,7 @@ function SectionCard({
   onEditChange,
   onRevealKey,
   originalConfig,
+  highlight,
 }: {
   section: ConfigSection;
   config: Record<string, string>;
@@ -474,24 +655,30 @@ function SectionCard({
   onEditChange: (key: string, val: string) => void;
   onRevealKey: (key: string) => void;
   originalConfig: Record<string, string>;
+  highlight?: boolean;
 }) {
   const changedCount = editing
     ? section.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length
     : 0;
 
   return (
-    <div className="rounded-xl border border-slate-200/60 bg-white shadow-card hover:shadow-card-hover transition-shadow duration-300">
+    <div className={cn(
+      "rounded-xl border bg-white shadow-card hover:shadow-card-hover transition-all duration-300",
+      highlight
+        ? "border-primary-300 ring-2 ring-primary-100"
+        : "border-slate-200/60"
+    )}>
       {/* Header */}
       <div className="flex items-center gap-3 border-b border-slate-100 px-6 py-4">
         <div className={cn("flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br shadow-lg", section.gradient)}>
           <section.icon className="h-4 w-4 text-white" />
         </div>
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <h2 className="text-sm font-semibold text-slate-900">{section.title}</h2>
-          <p className="text-xs text-slate-400">{section.description}</p>
+          <p className="text-xs text-slate-400 truncate">{section.description}</p>
         </div>
         {editing && changedCount > 0 && (
-          <span className="text-[10px] font-bold text-amber-600 bg-amber-100 rounded-full px-2 py-0.5">
+          <span className="text-[10px] font-bold text-amber-600 bg-amber-100 rounded-full px-2 py-0.5 flex-shrink-0">
             {changedCount} changed
           </span>
         )}
@@ -531,6 +718,10 @@ export default function SettingsPage() {
   const [lastRefreshStr, setLastRefreshStr] = useState("");
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
+  /* ── Category & search state ── */
+  const [activeCategory, setActiveCategory] = useState("all");
+  const [searchQuery, setSearchQuery] = useState("");
+
   /* ── Fetch config from backend ── */
   const fetchConfig = useCallback(async () => {
     setLoading(true);
@@ -564,6 +755,48 @@ export default function SettingsPage() {
   }, [editDraft, originalConfig]);
 
   const hasChanges = changedKeys.length > 0;
+
+  /* ── Filter sections by category + search ── */
+  const filteredSections = useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    return SECTIONS.filter((section) => {
+      // Category filter
+      if (activeCategory !== "all" && section.category !== activeCategory) return false;
+      // Search filter — match section title, description, or any key/label
+      if (q) {
+        const inTitle = section.title.toLowerCase().includes(q);
+        const inDesc = section.description.toLowerCase().includes(q);
+        const inKeys = section.keys.some(
+          (k) => k.key.toLowerCase().includes(q) || k.label.toLowerCase().includes(q)
+        );
+        if (!inTitle && !inDesc && !inKeys) return false;
+      }
+      return true;
+    });
+  }, [activeCategory, searchQuery]);
+
+  /* ── Count per category (for badges) ── */
+  const categoryCounts = useMemo(() => {
+    const counts: Record<string, number> = { all: SECTIONS.length };
+    for (const s of SECTIONS) {
+      counts[s.category] = (counts[s.category] || 0) + 1;
+    }
+    return counts;
+  }, []);
+
+  /* ── Changed keys per category (for edit badges) ── */
+  const categoryChangedCounts = useMemo(() => {
+    if (!editing) return {};
+    const counts: Record<string, number> = {};
+    for (const s of SECTIONS) {
+      const c = s.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length;
+      if (c > 0) {
+        counts[s.category] = (counts[s.category] || 0) + c;
+        counts["all"] = (counts["all"] || 0) + c;
+      }
+    }
+    return counts;
+  }, [editing, editDraft, originalConfig]);
 
   /* ── Handlers ── */
   const handleEditChange = (key: string, val: string) => {
@@ -612,10 +845,12 @@ export default function SettingsPage() {
     }
   };
 
-  /* ── Summary cards (live from fetched config) ── */
+  /* ── Summary values ── */
   const vectorDb = config["MAI_VECTORDB"] || "—";
   const embedder = config["MAI_EMBEDDER"] || "—";
   const llm = config["MAI_LLM"] || "—";
+  const celeryOn = config["CELERY_ENABLED"] === "true";
+  const celeryBroker = config["CELERY_BROKER"] || "redis";
   const workersActive = [
     config["ENABLE_VALIDATION"],
     config["ENABLE_CONFLICT"],
@@ -630,11 +865,11 @@ export default function SettingsPage() {
   }, [toast]);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       {/* ── Toast notification ── */}
       {toast && (
         <div className={cn(
-          "fixed top-4 right-4 z-50 flex items-center gap-3 rounded-xl border px-5 py-3 shadow-lg",
+          "fixed top-4 right-4 z-50 flex items-center gap-3 rounded-xl border px-5 py-3 shadow-lg animate-in slide-in-from-right",
           toast.type === "success"
             ? "border-emerald-200 bg-emerald-50 text-emerald-800"
             : "border-red-200 bg-red-50 text-red-800"
@@ -737,30 +972,110 @@ export default function SettingsPage() {
 
       {/* ── Quick Summary ── */}
       {!loading && (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
-          <div className="rounded-xl border border-slate-200/60 bg-white p-4 shadow-card text-center">
-            <p className="text-2xl font-bold text-primary-600 capitalize">{vectorDb}</p>
-            <p className="text-xs text-slate-400 mt-1">Vector DB</p>
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className="text-lg font-bold text-primary-600 capitalize">{vectorDb}</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Vector DB</p>
           </div>
-          <div className="rounded-xl border border-slate-200/60 bg-white p-4 shadow-card text-center">
-            <p className="text-2xl font-bold text-blue-600 capitalize">{embedder}</p>
-            <p className="text-xs text-slate-400 mt-1">Embedder</p>
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className="text-lg font-bold text-blue-600 capitalize">{embedder}</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Embedder</p>
           </div>
-          <div className="rounded-xl border border-slate-200/60 bg-white p-4 shadow-card text-center">
-            <p className="text-2xl font-bold text-amber-600 capitalize">{llm}</p>
-            <p className="text-xs text-slate-400 mt-1">LLM Provider</p>
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className="text-lg font-bold text-amber-600 capitalize">{llm}</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">LLM Provider</p>
           </div>
-          <div className="rounded-xl border border-slate-200/60 bg-white p-4 shadow-card text-center">
-            <p className="text-2xl font-bold text-emerald-600">{workersActive} Active</p>
-            <p className="text-xs text-slate-400 mt-1">Workers</p>
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className={cn("text-lg font-bold capitalize", celeryOn ? "text-emerald-600" : "text-slate-400")}>
+              {celeryOn ? celeryBroker : "Off"}
+            </p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Task Queue</p>
+          </div>
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className="text-lg font-bold text-emerald-600">{workersActive}</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Workers Active</p>
+          </div>
+          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
+            <p className={cn("text-lg font-bold", config["SENTRY_DSN"] ? "text-purple-600" : "text-slate-400")}>
+              {config["SENTRY_DSN"] ? "On" : "Off"}
+            </p>
+            <p className="text-[11px] text-slate-400 mt-0.5">Sentry</p>
           </div>
         </div>
       )}
 
-      {/* ── Config Sections Grid ── */}
+      {/* ── Category Tabs + Search ── */}
       {!loading && (
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          {SECTIONS.map((section) => (
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          {/* Tabs */}
+          <div className="flex flex-wrap gap-1.5">
+            {CATEGORIES.map((cat) => {
+              const isActive = activeCategory === cat.id;
+              const changedInCat = categoryChangedCounts[cat.id] || 0;
+              return (
+                <button
+                  key={cat.id}
+                  onClick={() => setActiveCategory(cat.id)}
+                  className={cn(
+                    "relative inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium transition-all",
+                    isActive
+                      ? "bg-slate-900 text-white shadow-md"
+                      : "bg-white text-slate-600 border border-slate-200 hover:bg-slate-50 hover:border-slate-300"
+                  )}
+                >
+                  <cat.icon className="h-3.5 w-3.5" />
+                  {cat.label}
+                  <span className={cn(
+                    "rounded-full px-1.5 py-0.5 text-[10px] font-bold leading-none",
+                    isActive ? "bg-white/20 text-white" : "bg-slate-100 text-slate-500"
+                  )}>
+                    {categoryCounts[cat.id] || 0}
+                  </span>
+                  {editing && changedInCat > 0 && (
+                    <span className="absolute -top-1.5 -right-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[9px] font-bold text-white">
+                      {changedInCat}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Search */}
+          <div className="relative">
+            <SearchIcon className="absolute left-3 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search settings…"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-full sm:w-64 rounded-lg border border-slate-200 bg-white pl-9 pr-8 py-1.5 text-xs text-slate-700 placeholder:text-slate-400 focus:border-primary-400 focus:ring-1 focus:ring-primary-400 outline-none transition-colors"
+            />
+            {searchQuery && (
+              <button
+                onClick={() => setSearchQuery("")}
+                className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── No results message ── */}
+      {!loading && filteredSections.length === 0 && (
+        <div className="text-center py-16">
+          <SearchIcon className="h-10 w-10 text-slate-300 mx-auto mb-3" />
+          <p className="text-sm font-medium text-slate-500">No settings found</p>
+          <p className="text-xs text-slate-400 mt-1">Try a different search term or category</p>
+        </div>
+      )}
+
+      {/* ── Config Sections Grid ── */}
+      {!loading && filteredSections.length > 0 && (
+        <div className="grid grid-cols-1 gap-5 lg:grid-cols-2">
+          {filteredSections.map((section) => (
             <SectionCard
               key={section.title}
               section={section}
@@ -770,6 +1085,7 @@ export default function SettingsPage() {
               onEditChange={handleEditChange}
               onRevealKey={handleRevealKey}
               originalConfig={originalConfig}
+              highlight={!!searchQuery && searchQuery.length > 1}
             />
           ))}
         </div>

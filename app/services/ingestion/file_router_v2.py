@@ -145,9 +145,7 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         os.rename(temp_path, saved_path)
         _write_log(f"[SAVED] {original_file_name} ({file_hash}) → {saved_path}")
 
-        parsed_output = await parser_func(saved_path)
-        _write_log(f"[PARSED] {original_file_name} using {parser_func.__name__}")
-
+        # Create the DB record FIRST so the Celery task can update it by file_id.
         file_id = str(uuid.uuid4())
 
         async with async_session() as db:
@@ -173,9 +171,33 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             )
             await db.commit()
 
+        # ── Celery: offload parse + embed to a background worker ──────────────
+        # Only attempted when CELERY_ENABLED=true in .env.
+        # Falls back transparently to inline (blocking) processing when Celery /
+        # broker is not running, so the server continues to work without a broker.
+        try:
+            from app.worker.broker_config import is_celery_enabled
+            if is_celery_enabled():
+                from app.worker.tasks import run_ingestion_pipeline
+                task = run_ingestion_pipeline.delay(file_id, saved_path, file_ext)
+                _write_log(f"[QUEUED] {original_file_name} → task_id={task.id}")
+                log_info(f"[file_router_v2] Queued Celery task task_id={task.id} for {original_file_name}")
+                return {
+                    "file_id": file_id,
+                    "status": "queued",
+                    "task_id": task.id,
+                    "path": saved_path,
+                    "hash": file_hash,
+                }
+        except Exception:
+            pass  # Celery / broker unavailable — fall through to inline
+
+        # ── Inline fallback (no Celery / broker not running) ──────────────────
+        parsed_output = await parser_func(saved_path)
+        _write_log(f"[PARSED] {original_file_name} using {parser_func.__name__}")
         await IngestionServiceV2.ingest_parsed_output(file_id, parsed_output)
         _write_log(f"[INGESTED] {original_file_name} successfully processed.")
-        log_info(f"[file_router_v2] ✅ Ingestion complete for {original_file_name}")
+        log_info(f"[file_router_v2] ✅ Ingestion complete (inline) for {original_file_name}")
 
         return {"file_id": file_id, "status": "ingested", "path": saved_path, "hash": file_hash}
 

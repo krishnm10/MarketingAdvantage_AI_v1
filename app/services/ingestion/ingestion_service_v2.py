@@ -137,21 +137,6 @@ def _resolve_embed_parallelism(embedder_kind: Optional[str]) -> int:
 
     return 4
 
-# ── Concurrent embed semaphore ────────────────────────────────────────
-# Limits parallel embed+upsert batches inside embed_and_store().
-# Tune via HF_EMBED_CONCURRENCY in .env (default 4).
-# Local ST/Ollama: 4 → fills your 8-core SSD machine without thrashing.
-# HF API mode:     4 → 4 concurrent POSTs without hitting rate limits.
-_EMBED_CONCURRENCY: int = _safe_env_int("HF_EMBED_CONCURRENCY", 4)
-_EMBED_SEMAPHORE: Optional[asyncio.Semaphore] = None  # lazy — safe at import
-
-def _get_embed_semaphore() -> asyncio.Semaphore:
-    global _EMBED_SEMAPHORE
-    if _EMBED_SEMAPHORE is None:
-        _EMBED_SEMAPHORE = asyncio.Semaphore(_EMBED_CONCURRENCY)
-    return _EMBED_SEMAPHORE
-
-
 _COLLECTION_COUNT_CACHE: Dict[str, Any] = {
     "count":        0,
     "last_updated": None,
@@ -2226,6 +2211,8 @@ class IngestionServiceV2:
             # concurrent encode() calls from multiple threads on the same object.
             # If we run 4 parallel batches, some futures can hang and file status
             # never reaches "processed". Keep batch processing serial for HF.
+            # Keep this semaphore local to the active coroutine so it is scoped
+            # to the current running event loop and cannot leak across reloads/tests.
             batch_parallelism = _resolve_embed_parallelism(embedder_kind)
             batch_semaphore = asyncio.Semaphore(max(1, int(batch_parallelism)))
             log_info(
