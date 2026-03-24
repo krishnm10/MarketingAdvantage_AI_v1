@@ -48,6 +48,12 @@ interface HealthResponse {
   vectordbs: Record<string, ServiceEntry>;
   embedders: Record<string, ServiceEntry>;
   llms: Record<string, ServiceEntry>;
+  infrastructure?: {
+    celery_enabled: boolean;
+    broker_type: string;
+    broker: ServiceEntry;
+    worker?: ServiceEntry;
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -80,6 +86,20 @@ const LLM_META: Record<string, { label: string; icon: any; gradient: string }> =
   groq:      { label: "Groq",             icon: Zap,            gradient: "from-lime-500 to-lime-700" },
   anthropic: { label: "Anthropic Claude",  icon: MessageSquare,  gradient: "from-orange-500 to-orange-700" },
   gemini:    { label: "Google Gemini",     icon: Brain,          gradient: "from-blue-500 to-blue-700" },
+};
+
+const BROKER_META: Record<string, { label: string; icon: any; gradient: string }> = {
+  redis:      { label: "Redis",           icon: Database,  gradient: "from-red-500 to-red-700" },
+  rabbitmq:   { label: "RabbitMQ",        icon: Activity,  gradient: "from-orange-500 to-orange-700" },
+  kafka:      { label: "Kafka",           icon: Layers,    gradient: "from-slate-700 to-slate-900" },
+  redpanda:   { label: "Redpanda",        icon: Layers,    gradient: "from-rose-500 to-rose-700" },
+  sqs:        { label: "Amazon SQS",      icon: Cloud,     gradient: "from-amber-500 to-amber-700" },
+  nats:       { label: "NATS",            icon: Zap,       gradient: "from-blue-500 to-blue-700" },
+  pulsar:     { label: "Pulsar",          icon: Zap,       gradient: "from-indigo-500 to-indigo-700" },
+  pubsub:     { label: "GCP Pub/Sub",     icon: Cloud,     gradient: "from-blue-500 to-blue-700" },
+  eventhubs:  { label: "Azure Event Hubs", icon: Cloud,    gradient: "from-sky-500 to-sky-700" },
+  upstash:    { label: "Upstash",         icon: Cloud,     gradient: "from-emerald-500 to-emerald-700" },
+  none:       { label: "Disabled",        icon: Server,    gradient: "from-slate-400 to-slate-600" },
 };
 
 /* ------------------------------------------------------------------ */
@@ -214,11 +234,14 @@ export default function HealthStatus() {
   const [healthScope, setHealthScope] = useState<"active" | "all">("active");
   const [backendReachable, setBackendReachable] = useState(false);
   const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [celeryWorker, setCeleryWorker] = useState<ServiceEntry | null>(null);
   const [loading, setLoading] = useState(true);
   const [lastCheckStr, setLastCheckStr] = useState<string>("");
 
   const checkHealth = useCallback((scope: "active" | "all" = healthScope) => {
     setLoading(true);
+    setCeleryWorker(null);
+
     apiClient
       .get("/api/v2/ingestion/health", { params: { scope } })
       .then((res) => {
@@ -233,6 +256,12 @@ export default function HealthStatus() {
         setLoading(false);
         setLastCheckStr(new Date().toLocaleTimeString());
       });
+
+    // Celery worker check (separate because it can be slow)
+    apiClient
+      .get("/api/v2/ingestion/health/celery")
+      .then((res) => setCeleryWorker(res.data?.worker ?? null))
+      .catch(() => setCeleryWorker(null));
   }, [healthScope]);
 
   useEffect(() => {
@@ -287,12 +316,24 @@ export default function HealthStatus() {
     total: visibleLlmEntries.length || (health ? 1 : 0),
   };
 
+  /* Infrastructure (broker + worker) */
+  const infra = health?.infrastructure;
+  const brokerEntry = infra?.broker ?? null;
+  const brokerType = infra?.broker_type ?? "none";
+  const celeryEnabled = infra?.celery_enabled ?? false;
+
+  const infraOnline =
+    (brokerEntry?.status === "online" ? 1 : 0) +
+    (celeryWorker?.status === "online" ? 1 : 0);
+  const infraTotal = celeryEnabled ? 2 : 0;
+
   /* Total for current scope */
   const totalOnline =
     countOnline(health?.databases).online +
     visibleVectorCount.online +
     visibleEmbedderCount.online +
     visibleLlmCount.online +
+    infraOnline +
     (backendReachable ? 1 : 0); /* FastAPI itself */
 
   const totalServices =
@@ -300,6 +341,7 @@ export default function HealthStatus() {
     visibleVectorCount.total +
     visibleEmbedderCount.total +
     visibleLlmCount.total +
+    infraTotal +
     1; /* FastAPI itself */
 
   return (
@@ -513,6 +555,56 @@ export default function HealthStatus() {
               ))}
         </div>
       </div>
+
+      {/* ── Infrastructure (Celery + Broker) ──────────────────────── */}
+      {celeryEnabled && (
+        <div>
+          <SectionHeader
+            icon={Activity}
+            title="Infrastructure"
+            count={{ online: infraOnline, total: infraTotal }}
+            activeLabel={brokerType !== "none" ? brokerType : undefined}
+          />
+          <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-6">
+            {/* Broker card */}
+            <ServiceCard
+              name="broker"
+              entry={brokerEntry ?? undefined}
+              meta={BROKER_META[brokerType] ?? BROKER_META["redis"]}
+              isActive={true}
+              loading={loading && !brokerEntry}
+            />
+            {/* Celery Worker card */}
+            <div
+              className={cn(
+                "rounded-xl border bg-white p-4 shadow-card transition-all relative",
+                celeryWorker?.status === "online"
+                  ? "border-primary-300 ring-2 ring-primary-100"
+                  : "border-slate-200/60"
+              )}
+            >
+              {celeryWorker?.status === "online" && (
+                <span className="absolute -top-2 right-3 rounded-full bg-primary-500 px-2 py-0.5 text-[10px] font-bold text-white uppercase tracking-wider shadow">
+                  Active
+                </span>
+              )}
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 shadow-lg">
+                  <Cpu className="h-4 w-4 text-white" />
+                </div>
+                <StatusBadge
+                  status={celeryWorker?.status}
+                  loading={!celeryWorker && loading}
+                />
+              </div>
+              <p className="text-sm font-medium text-slate-700">Celery Worker</p>
+              <p className="text-xs text-slate-400 mt-1 truncate" title={celeryWorker?.message || ""}>
+                {!celeryWorker ? "Checking…" : celeryWorker.message || "—"}
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Active Configuration Summary ─────────────────────────── */}
       {health && (

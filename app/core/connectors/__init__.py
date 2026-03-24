@@ -10,6 +10,7 @@ from app.core.connectors.base import BaseConnector, ConnectorResult
 from app.core.connectors.web_connector import WebConnector
 from app.core.connectors.rss_connector import RSSConnector
 from app.core.connectors.api_connector import APIConnector
+from app.core.connectors.kafka_connector import KafkaConnector
 
 __all__ = [
     "BaseConnector",
@@ -17,4 +18,5 @@ __all__ = [
     "WebConnector",
     "RSSConnector",
     "APIConnector",
+    "KafkaConnector",
 ]

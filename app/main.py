@@ -147,6 +147,11 @@ from app.api.v2.retrieve_api            import router as retrieve_router
 from app.api.v2.rag_api import router as rag_router
 
 # ─────────────────────────────────────────────────────────────────────────────
+# New Kafka Management Router (NEW — additive only)
+# ─────────────────────────────────────────────────────────────────────────────
+from app.api.v2.kafka_api import router as kafka_router
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Existing Services (ALL PRESERVED)
 # ─────────────────────────────────────────────────────────────────────────────
 from app.services.ingestion.watcher_ingestor_v2 import start_watcher_background
@@ -365,6 +370,35 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  PHANTOM will use safe CPU defaults — ingestion still works")
 
     # ─────────────────────────────────────────────────────────────────
+    # STEP 6: Kafka Event Streaming (NEW)
+    #
+    # When KAFKA_EVENTS_ENABLED=true, initializes the Kafka producer
+    # and ensures all MAI topics exist on the Kafka cluster.
+    # Non-fatal — if Kafka is unreachable, the app still starts normally.
+    # ─────────────────────────────────────────────────────────────────
+    logger.info("\n[Startup] STEP 6: Kafka Event Streaming...")
+    try:
+        from app.services.kafka import kafka_service
+        if kafka_service.enabled:
+            topic_results = await kafka_service.ensure_topics()
+            created = sum(1 for v in topic_results.values() if v == "created")
+            existing = sum(1 for v in topic_results.values() if v == "exists")
+            errors = sum(1 for v in topic_results.values() if v.startswith("error"))
+            logger.info("✅ Kafka Event Streaming ready:")
+            logger.info("   • Topics: %d created, %d existing, %d errors", created, existing, errors)
+            logger.info("   • Bootstrap: %s", os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092"))
+            logger.info("   • Compression: %s", os.getenv("KAFKA_COMPRESSION_TYPE", "lz4"))
+            logger.info("   • Idempotence: %s", os.getenv("KAFKA_ENABLE_IDEMPOTENCE", "true"))
+            logger.info("   • Endpoints: /api/v2/kafka/health, /api/v2/kafka/topics")
+        else:
+            logger.info("   Kafka events disabled (KAFKA_EVENTS_ENABLED!=true)")
+    except ImportError:
+        logger.info("   confluent-kafka not installed — Kafka events unavailable")
+    except Exception as e:
+        logger.error("❌ Kafka Startup Failed: %s", e)
+        logger.warning("⚠️  Kafka events unavailable — ingestion still works via Celery/inline")
+
+    # ─────────────────────────────────────────────────────────────────
     # STARTUP COMPLETE
     # ─────────────────────────────────────────────────────────────────
     logger.info("\n" + "=" * 70)
@@ -389,6 +423,14 @@ async def lifespan(app: FastAPI):
     logger.info("")
     logger.info("⚡ PHANTOM endpoints (Phase 0):")
     logger.info("   GET  /phantom/stats               → Hardware profile + tuning params")
+    logger.info("")
+    logger.info("🔌 Kafka endpoints:")
+    logger.info("   GET  /api/v2/kafka/health          → Kafka cluster health")
+    logger.info("   GET  /api/v2/kafka/topics          → List Kafka topics")
+    logger.info("   POST /api/v2/kafka/topics/ensure   → Create MAI topics")
+    logger.info("   POST /api/v2/kafka/produce          → Publish test message")
+    logger.info("   GET  /api/v2/kafka/config          → Current Kafka config")
+    logger.info("   GET  /api/v2/kafka/stats           → Producer statistics")
     logger.info("=" * 70 + "\n")
 
     yield  # ═══════════════════ App runs here ═══════════════════════
@@ -415,6 +457,16 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Pipeline caches cleared")
     except Exception as e:
         logger.error("❌ Error clearing pipeline caches: %s", e)
+
+    # Shutdown Kafka producer (NEW — flush pending events)
+    try:
+        from app.services.kafka import kafka_service
+        if kafka_service.enabled and kafka_service._started:
+            logger.info("[Shutdown] Flushing Kafka producer...")
+            await kafka_service.shutdown()
+            logger.info("✅ Kafka producer shut down gracefully")
+    except Exception as e:
+        logger.error("❌ Error shutting down Kafka: %s", e)
 
     logger.info("\n" + "=" * 70)
     logger.info("✅ Shutdown complete. Goodbye!")
@@ -480,6 +532,7 @@ app.include_router(ingestion_health_router,    tags=["Health"])
 app.include_router(ingestion_ws_router,        tags=["WebSocket"])
 app.include_router(config_router,              tags=["Configuration"])
 app.include_router(retrieve_router,            tags=["Retrieval"])
+app.include_router(kafka_router,               tags=["Kafka"])
 
 # ── New pluggable RAG router (EXISTING — preserved) ─────────────────────────
 app.include_router(

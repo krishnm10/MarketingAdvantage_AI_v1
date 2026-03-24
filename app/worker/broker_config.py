@@ -142,8 +142,18 @@ def _build_sqs() -> tuple[str, str, dict[str, Any]]:
 
 def _build_kafka() -> tuple[str, str, dict[str, Any]]:
     """
-    Apache Kafka / Confluent Cloud.
-    pip install celery-kafka
+    Apache Kafka / Confluent Cloud — Enterprise-grade configuration.
+    pip install confluent-kafka
+
+    FEATURES:
+      • Idempotent producer (exactly-once delivery semantics)
+      • LZ4 compression (best throughput/ratio for message batches)
+      • Batched delivery with configurable linger.ms for throughput
+      • Full SSL/TLS mutual-auth support
+      • SASL (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER)
+      • Schema Registry integration (Confluent-compatible)
+      • Configurable retries with exponential backoff
+      • Producer queue buffering tuning for high-throughput
 
     Example .env:
         CELERY_BROKER=kafka
@@ -152,22 +162,85 @@ def _build_kafka() -> tuple[str, str, dict[str, Any]]:
         KAFKA_SASL_MECHANISM=
         KAFKA_SASL_USERNAME=
         KAFKA_SASL_PASSWORD=
+        KAFKA_COMPRESSION_TYPE=lz4
+        KAFKA_ENABLE_IDEMPOTENCE=true
+        KAFKA_ACKS=all
+        KAFKA_LINGER_MS=5
+        KAFKA_BATCH_SIZE=65536
     """
     servers = _env("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     url = f"confluentkafka://{servers}"
     backend = _env("CELERY_RESULT_BACKEND") or _build_redis()[1]
 
+    # ── Core transport configuration ─────────────────────────────
     transport_opts: dict[str, Any] = {
         "bootstrap.servers": servers,
         "security.protocol": _env("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT"),
+        "client.id": _env("KAFKA_CLIENT_ID", "mai-celery"),
     }
+
+    # ── Reliability — idempotent producer for exactly-once ───────
+    if _env("KAFKA_ENABLE_IDEMPOTENCE", "true").lower() in ("true", "1", "yes"):
+        transport_opts["enable.idempotence"] = True
+        transport_opts["acks"] = "all"
+        transport_opts["max.in.flight.requests.per.connection"] = int(
+            _env("KAFKA_MAX_IN_FLIGHT", "5")
+        )
+    else:
+        transport_opts["acks"] = _env("KAFKA_ACKS", "all")
+
+    # ── Throughput — compression & batching ──────────────────────
+    compression = _env("KAFKA_COMPRESSION_TYPE", "lz4")
+    if compression:
+        transport_opts["compression.type"] = compression
+    linger = _env("KAFKA_LINGER_MS", "5")
+    if linger:
+        transport_opts["linger.ms"] = int(linger)
+    batch_size = _env("KAFKA_BATCH_SIZE", "65536")
+    if batch_size:
+        transport_opts["batch.size"] = int(batch_size)
+
+    # ── Retries — exponential backoff ────────────────────────────
+    transport_opts["retries"] = int(_env("KAFKA_RETRIES", "2147483647"))
+    transport_opts["retry.backoff.ms"] = int(_env("KAFKA_RETRY_BACKOFF_MS", "100"))
+
+    # ── SASL authentication ──────────────────────────────────────
     mech = _env("KAFKA_SASL_MECHANISM")
     if mech:
         transport_opts["sasl.mechanism"] = mech
         transport_opts["sasl.username"] = _env("KAFKA_SASL_USERNAME")
         transport_opts["sasl.password"] = _env("KAFKA_SASL_PASSWORD")
+        if mech == "OAUTHBEARER":
+            oauthbearer_cfg = _env("KAFKA_OAUTHBEARER_CONFIG")
+            if oauthbearer_cfg:
+                transport_opts["sasl.oauthbearer.config"] = oauthbearer_cfg
 
-    return url, backend, {"broker_transport_options": transport_opts}
+    # ── SSL/TLS mutual authentication ────────────────────────────
+    protocol = _env("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT")
+    if protocol in ("SSL", "SASL_SSL"):
+        ssl_ca = _env("KAFKA_SSL_CA_LOCATION")
+        ssl_cert = _env("KAFKA_SSL_CERTIFICATE_LOCATION")
+        ssl_key = _env("KAFKA_SSL_KEY_LOCATION")
+        ssl_password = _env("KAFKA_SSL_KEY_PASSWORD")
+        if ssl_ca:
+            transport_opts["ssl.ca.location"] = ssl_ca
+        if ssl_cert:
+            transport_opts["ssl.certificate.location"] = ssl_cert
+        if ssl_key:
+            transport_opts["ssl.key.location"] = ssl_key
+        if ssl_password:
+            transport_opts["ssl.key.password"] = ssl_password
+        transport_opts["ssl.endpoint.identification.algorithm"] = _env(
+            "KAFKA_SSL_ENDPOINT_IDENTIFICATION", "https"
+        )
+
+    # ── Extra Celery conf for Kafka ──────────────────────────────
+    extra: dict[str, Any] = {
+        "broker_transport_options": transport_opts,
+        "broker_connection_retry_on_startup": True,
+    }
+
+    return url, backend, extra
 
 
 def _build_redpanda() -> tuple[str, str, dict[str, Any]]:

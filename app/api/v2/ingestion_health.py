@@ -1,5 +1,5 @@
 # ============================================================
-# app/api/v2/ingestion_health.py  —  Comprehensive System Health
+# app/api/v2/ingestion_health.py  —  Comprehensive System Health (v2)
 #
 # IMPORTANT: This file must NEVER import gRPC-based VDB client
 # libraries (pymilvus, qdrant-client, weaviate-client) because
@@ -539,6 +539,11 @@ async def ingestion_health(
             tasks[f"llm__{name}"] = fn()
             seen.add(fn)
 
+    # ── Celery broker + worker health (sync, run in executor) ──────
+    loop = asyncio.get_event_loop()
+    tasks["infra__broker"] = loop.run_in_executor(None, _check_celery_broker_sync)
+    worker_future = loop.run_in_executor(None, _check_celery_worker_sync)
+
     # ── execute with a hard overall timeout ──────────────────────────
     keys = list(tasks.keys())
     try:
@@ -591,6 +596,39 @@ async def ingestion_health(
     ]
     all_ok = all(s.get("status") == "online" for s in active_entries if s)
 
+    # ── Infrastructure (Celery + broker + Kafka events) ────────────
+    from app.worker.broker_config import is_celery_enabled
+    broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+    try:
+        worker_result = await asyncio.wait_for(worker_future, timeout=5)
+    except asyncio.TimeoutError:
+        worker_result = _fail("Worker check timed out")
+
+    # Kafka event streaming health (independent of Celery broker)
+    kafka_events_status = _skip("KAFKA_EVENTS_ENABLED is not true")
+    kafka_events_enabled = os.getenv("KAFKA_EVENTS_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    if kafka_events_enabled:
+        try:
+            from app.services.kafka import kafka_service
+            kafka_events_status = await asyncio.wait_for(
+                kafka_service.health_check(), timeout=8
+            )
+        except asyncio.TimeoutError:
+            kafka_events_status = _fail("Kafka health check timed out")
+        except Exception as e:
+            kafka_events_status = _fail(str(e))
+
+    infrastructure = {
+        "celery_enabled": is_celery_enabled(),
+        "broker_type": broker_name if is_celery_enabled() else "none",
+        "broker": flat.get("infra__broker", _skip("Not checked")),
+        "worker": worker_result,
+        "kafka_events": {
+            "enabled": kafka_events_enabled,
+            **( kafka_events_status if isinstance(kafka_events_status, dict) else {"status": "unknown"}),
+        },
+    }
+
     return {
         "status": "ok" if all_ok else "degraded",
         "scope": mode,
@@ -600,4 +638,211 @@ async def ingestion_health(
         "vectordbs": vectordbs,
         "embedders": embedders,
         "llms":      llms,
+        "infrastructure": infrastructure,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  6. PIPELINE CONFIG — returns active .env selections for the frontend
+# ══════════════════════════════════════════════════════════════════════
+
+@router.get("/pipeline-config")
+async def pipeline_config():
+    """
+    Returns the active pipeline configuration from .env.
+    Used by the frontend Pipeline page to render the Data Flow dynamically.
+    """
+    from app.worker.broker_config import is_celery_enabled
+    broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+
+    return {
+        "vectordb":  os.getenv("MAI_VECTORDB", "chroma").lower(),
+        "embedder":  os.getenv("MAI_EMBEDDER", "ollama").lower(),
+        "llm":       os.getenv("MAI_LLM", "ollama").lower(),
+        "reranker":  os.getenv("MAI_RERANKER", "none").lower(),
+        "broker":    broker_name if is_celery_enabled() else "none",
+        "celery_enabled": is_celery_enabled(),
+        "kafka_events_enabled": os.getenv("KAFKA_EVENTS_ENABLED", "false").strip().lower() in ("true", "1", "yes"),
+        "kafka_bootstrap_servers": os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092") if os.getenv("KAFKA_EVENTS_ENABLED", "false").strip().lower() in ("true", "1", "yes") else None,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  7. CELERY & BROKER HEALTH
+# ══════════════════════════════════════════════════════════════════════
+
+def _redis_host_port() -> tuple:
+    """Extract Redis host and port from env vars, parsing the URL if set."""
+    redis_url = os.getenv("CELERY_REDIS_URL", "") or os.getenv("REDIS_URL", "")
+    if redis_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(redis_url)
+        return parsed.hostname or "localhost", parsed.port or 6379
+    return os.getenv("CELERY_REDIS_HOST", "localhost"), int(os.getenv("CELERY_REDIS_PORT", "6379"))
+
+
+def _check_celery_broker_sync() -> dict:
+    """Check the message broker used by Celery (Redis, RabbitMQ, etc.).
+    Synchronous — intended to be called via run_in_executor."""
+    from app.worker.broker_config import is_celery_enabled
+    if not is_celery_enabled():
+        return _skip("Celery disabled (CELERY_ENABLED!=true)")
+
+    broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+
+    if broker_name in ("redis", "redis_streams", "upstash"):
+        host, port = _redis_host_port()
+        addr = f"{host}:{port}"
+        # Fast TCP pre-check to avoid long OS-level SYN timeout on unreachable hosts
+        if not _tcp_reachable(host, port, 3):
+            return _fail(f"{broker_name} | {addr} unreachable")
+        redis_url = os.getenv("CELERY_REDIS_URL", "") or os.getenv("REDIS_URL", "")
+        try:
+            import redis as redis_lib
+            if redis_url:
+                client = redis_lib.Redis.from_url(redis_url, socket_timeout=_T, socket_connect_timeout=3)
+            else:
+                client = redis_lib.Redis(host=host, port=port, socket_timeout=_T, socket_connect_timeout=3)
+            pong = client.ping()
+            client.close()
+            return _ok(f"{broker_name} | {addr}") if pong else _fail("Ping failed")
+        except Exception as e:
+            return _fail(f"{broker_name}: {e}")
+
+    elif broker_name == "rabbitmq":
+        host = os.getenv("RABBITMQ_HOST", "localhost")
+        port = int(os.getenv("RABBITMQ_PORT", "5672"))
+        reachable = _tcp_reachable(host, port, 3)
+        return _ok(f"RabbitMQ | {host}:{port}") if reachable else _fail(f"Cannot reach {host}:{port}")
+
+    elif broker_name in ("kafka", "redpanda", "warpstream", "aiven"):
+        servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
+        # Parse multiple bootstrap servers — probe the first one
+        first_server = servers.split(",")[0].strip()
+        host, _, port_str = first_server.partition(":")
+        port = int(port_str) if port_str else 9092
+        reachable = _tcp_reachable(host, port, 3)
+        if not reachable:
+            return _fail(f"Cannot reach {servers}")
+
+        # Deep health check — query broker metadata if confluent_kafka is available
+        try:
+            from confluent_kafka.admin import AdminClient
+            import time as _time
+            admin_config = {
+                "bootstrap.servers": servers,
+                "client.id": "mai-health-check",
+            }
+            protocol = os.getenv("KAFKA_SECURITY_PROTOCOL", "PLAINTEXT").strip()
+            if protocol != "PLAINTEXT":
+                admin_config["security.protocol"] = protocol
+            mech = os.getenv("KAFKA_SASL_MECHANISM", "").strip()
+            if mech:
+                admin_config["sasl.mechanism"] = mech
+                admin_config["sasl.username"] = os.getenv("KAFKA_SASL_USERNAME", "").strip()
+                admin_config["sasl.password"] = os.getenv("KAFKA_SASL_PASSWORD", "").strip()
+            if protocol in ("SSL", "SASL_SSL"):
+                ssl_ca = os.getenv("KAFKA_SSL_CA_LOCATION", "").strip()
+                if ssl_ca:
+                    admin_config["ssl.ca.location"] = ssl_ca
+
+            start = _time.monotonic()
+            admin = AdminClient(admin_config)
+            metadata = admin.list_topics(timeout=5)
+            latency_ms = (_time.monotonic() - start) * 1000
+
+            broker_count = len(metadata.brokers)
+            topic_count = len([t for t in metadata.topics if not t.startswith("_")])
+            cluster_id = metadata.cluster_id or "unknown"
+
+            return _ok(
+                f"{broker_name} | {servers} | "
+                f"{broker_count} broker(s) | "
+                f"{topic_count} topic(s) | "
+                f"cluster={cluster_id} | "
+                f"{latency_ms:.0f}ms"
+            )
+        except ImportError:
+            # confluent_kafka not installed — fall back to TCP-only check
+            return _ok(f"{broker_name} | {servers} (TCP reachable)")
+        except Exception as e:
+            # Metadata query failed but TCP was OK
+            return _ok(f"{broker_name} | {servers} (TCP OK, metadata error: {str(e)[:100]})")
+
+    elif broker_name == "sqs":
+        return _ok("SQS | AWS managed")
+
+    elif broker_name == "pubsub":
+        return _ok("Pub/Sub | GCP managed")
+
+    elif broker_name == "eventhubs":
+        return _ok("Event Hubs | Azure managed")
+
+    else:
+        # Generic TCP check for unknown brokers
+        return _ok(f"{broker_name} | configured")
+
+
+def _check_celery_worker_sync() -> dict:
+    """
+    Check if a Celery worker is connected by inspecting the broker's
+    Celery-internal control exchange. Uses Celery's ping() with a short timeout.
+    This is intentionally synchronous — Celery's inspector API is blocking.
+    """
+    from app.worker.broker_config import is_celery_enabled
+    if not is_celery_enabled():
+        return _skip("Celery disabled (CELERY_ENABLED!=true)")
+
+    # Fast pre-check: if broker host is unreachable, skip the slow Celery inspect
+    broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+    if broker_name in ("redis", "redis_streams", "upstash"):
+        host, port = _redis_host_port()
+        if not _tcp_reachable(host, port, 3):
+            return _fail(f"Broker ({host}:{port}) unreachable — cannot inspect workers")
+    elif broker_name == "rabbitmq":
+        host = os.getenv("RABBITMQ_HOST", "localhost")
+        port = int(os.getenv("RABBITMQ_PORT", "5672"))
+        if not _tcp_reachable(host, port, 3):
+            return _fail(f"Broker ({host}:{port}) unreachable — cannot inspect workers")
+
+    try:
+        from app.worker.celery_app import celery_app
+        inspector = celery_app.control.inspect(timeout=3)
+        ping_result = inspector.ping()
+        if ping_result:
+            worker_names = list(ping_result.keys())
+            return _ok(f"{len(worker_names)} worker(s) | {', '.join(worker_names)}")
+        return _fail("No workers responding")
+    except Exception as e:
+        return _fail(f"Inspect failed: {e}")
+
+
+@router.get("/health/celery")
+async def celery_health():
+    """
+    Standalone Celery + broker health endpoint.
+    Also included in the main /health response.
+    """
+    loop = asyncio.get_event_loop()
+    broker_future = loop.run_in_executor(None, _check_celery_broker_sync)
+    worker_future = loop.run_in_executor(None, _check_celery_worker_sync)
+
+    try:
+        broker_result = await asyncio.wait_for(broker_future, timeout=8)
+    except asyncio.TimeoutError:
+        broker_result = _fail("Broker check timed out")
+
+    try:
+        worker_result = await asyncio.wait_for(worker_future, timeout=8)
+    except asyncio.TimeoutError:
+        worker_result = _fail("Worker check timed out")
+
+    from app.worker.broker_config import is_celery_enabled
+    broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+
+    return {
+        "celery_enabled": is_celery_enabled(),
+        "broker_type": broker_name if is_celery_enabled() else "none",
+        "broker": broker_result,
+        "worker": worker_result,
     }
