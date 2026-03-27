@@ -128,6 +128,8 @@ _VALID_CHUNKING_STRATEGIES = {
     "smart_check",
     "recursive_overlap",
     "rust",
+    "structure_aware",
+    "document_aware",
 }
 
 

@@ -1,7 +1,7 @@
 import asyncio
 import os
 
-from app.services.ingestion.chunking_registry import (
+from app.core.chunking_stratagies.chunking_registry import (
     clear_chunker_cache,
     get_chunker,
     list_chunking_strategies,

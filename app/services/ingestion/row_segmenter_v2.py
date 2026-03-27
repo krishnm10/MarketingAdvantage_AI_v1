@@ -21,7 +21,7 @@ import pandas as pd
 
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info
-from app.services.ingestion.segmenter_v2 import make_chunk_dict
+from app.core.chunking_stratagies.segmenter_v2 import make_chunk_dict
 
 # Rows processed per iteration batch.
 # 500 rows × ~1.2 KB/chunk = ~600 KB peak per batch — safe for all server configs.

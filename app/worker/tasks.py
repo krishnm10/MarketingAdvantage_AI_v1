@@ -26,7 +26,17 @@
 # =============================================================================
 
 import asyncio
-from app.worker.celery_app import celery_app
+
+from app.worker.broker_config import is_celery_enabled
+
+# Guard: only import the real Celery app when Celery is enabled.
+# When disabled, this module should never be imported (all call-sites
+# check is_celery_enabled() first), but if it is, the task functions
+# below will be plain functions rather than Celery task objects.
+if is_celery_enabled():
+    from app.worker.celery_app import celery_app
+else:
+    celery_app = None  # type: ignore[assignment]
 
 
 def _run(coro):
@@ -73,120 +83,122 @@ def _run(coro):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# INGESTION TASKS
+# TASK DEFINITIONS — only registered when Celery is enabled.
+# When CELERY_ENABLED=false, this entire block is skipped and no task objects
+# are created.  All call-sites already guard `from app.worker.tasks import ...`
+# behind an `is_celery_enabled()` check, so these symbols are never needed
+# when Celery is off.
 # ─────────────────────────────────────────────────────────────────────────────
 
-@celery_app.task(
-    bind=True,
-    name="tasks.run_ingestion_pipeline",
-    max_retries=3,
-    default_retry_delay=60,
-    queue="ingestion",
-)
-def run_ingestion_pipeline(self, file_id: str, saved_path: str, file_ext: str):
-    """
-    Parse a file that has already been saved to disk and ingest it.
+if celery_app is not None:
 
-    Arguments:
-        file_id     — UUID string matching the IngestedFileV2 row already created.
-        saved_path  — Absolute or relative path to the saved file on disk.
-        file_ext    — Lowercase extension including dot, e.g. ".pdf".
-    """
-    from app.services.ingestion.file_router_v2 import PARSER_MAP
-    from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
-    from app.utils.logger import log_info, log_warning
+    # ── INGESTION TASKS ──────────────────────────────────────────────────────
 
-    try:
-        parser_func = PARSER_MAP.get(file_ext)
-        if parser_func is None:
-            raise ValueError(f"No parser registered for extension: {file_ext}")
+    @celery_app.task(
+        bind=True,
+        name="tasks.run_ingestion_pipeline",
+        max_retries=3,
+        default_retry_delay=60,
+        queue="ingestion",
+    )
+    def run_ingestion_pipeline(self, file_id: str, saved_path: str, file_ext: str):
+        """
+        Parse a file that has already been saved to disk and ingest it.
 
-        log_info(f"[celery/ingestion] Parsing file_id={file_id}  ext={file_ext}")
-        parsed_output = _run(parser_func(saved_path))
+        Arguments:
+            file_id     — UUID string matching the IngestedFileV2 row already created.
+            saved_path  — Absolute or relative path to the saved file on disk.
+            file_ext    — Lowercase extension including dot, e.g. ".pdf".
+        """
+        from app.services.ingestion.file_router_v2 import PARSER_MAP
+        from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
+        from app.utils.logger import log_info, log_warning
 
-        log_info(f"[celery/ingestion] Running ingestion pipeline for file_id={file_id}")
-        _run(IngestionServiceV2.ingest_parsed_output(file_id, parsed_output))
+        try:
+            parser_func = PARSER_MAP.get(file_ext)
+            if parser_func is None:
+                raise ValueError(f"No parser registered for extension: {file_ext}")
 
-        log_info(f"[celery/ingestion] ✅ Done — file_id={file_id}")
-        return {"status": "ingested", "file_id": file_id}
+            log_info(f"[celery/ingestion] Parsing file_id={file_id}  ext={file_ext}")
+            parsed_output = _run(parser_func(saved_path))
 
-    except Exception as exc:
-        log_warning(f"[celery/ingestion] Task failed for file_id={file_id}: {exc}")
-        raise self.retry(exc=exc)
+            log_info(f"[celery/ingestion] Running ingestion pipeline for file_id={file_id}")
+            _run(IngestionServiceV2.ingest_parsed_output(file_id, parsed_output))
 
+            log_info(f"[celery/ingestion] ✅ Done — file_id={file_id}")
+            return {"status": "ingested", "file_id": file_id}
 
-@celery_app.task(
-    bind=True,
-    name="tasks.run_external_ingestion_task",
-    max_retries=3,
-    default_retry_delay=120,
-    queue="ingestion",
-)
-def run_external_ingestion_task(
-    self,
-    source_type: str,
-    source_url: str,
-    business_id,            # str | None — kept untyped for JSON serialisation
-):
-    """
-    Fetch and ingest an external source (web page, RSS feed, or API endpoint).
+        except Exception as exc:
+            log_warning(f"[celery/ingestion] Task failed for file_id={file_id}: {exc}")
+            raise self.retry(exc=exc)
 
-    Arguments:
-        source_type  — "web", "rss", or "api"
-        source_url   — URL to fetch
-        business_id  — Optional tenant UUID string (or None)
-    """
-    from app.services.ingestion.file_router_v2 import route_external_ingestion
-    from app.utils.logger import log_info, log_warning
+    @celery_app.task(
+        bind=True,
+        name="tasks.run_external_ingestion_task",
+        max_retries=3,
+        default_retry_delay=120,
+        queue="ingestion",
+    )
+    def run_external_ingestion_task(
+        self,
+        source_type: str,
+        source_url: str,
+        business_id,            # str | None — kept untyped for JSON serialisation
+    ):
+        """
+        Fetch and ingest an external source (web page, RSS feed, or API endpoint).
 
-    try:
-        log_info(f"[celery/external] Ingesting {source_type.upper()} → {source_url}")
-        result = _run(
-            route_external_ingestion(
-                source_type=source_type,
-                source_url=source_url,
-                business_id=business_id,
+        Arguments:
+            source_type  — "web", "rss", or "api"
+            source_url   — URL to fetch
+            business_id  — Optional tenant UUID string (or None)
+        """
+        from app.services.ingestion.file_router_v2 import route_external_ingestion
+        from app.utils.logger import log_info, log_warning
+
+        try:
+            log_info(f"[celery/external] Ingesting {source_type.upper()} → {source_url}")
+            result = _run(
+                route_external_ingestion(
+                    source_type=source_type,
+                    source_url=source_url,
+                    business_id=business_id,
+                )
             )
-        )
-        log_info(f"[celery/external] ✅ Done — {source_url}")
-        return result
-    except Exception as exc:
-        log_warning(f"[celery/external] Task failed for {source_url}: {exc}")
-        raise self.retry(exc=exc)
+            log_info(f"[celery/external] ✅ Done — {source_url}")
+            return result
+        except Exception as exc:
+            log_warning(f"[celery/external] Task failed for {source_url}: {exc}")
+            raise self.retry(exc=exc)
 
+    # ── VALIDATION TASKS (driven by Celery Beat) ─────────────────────────────
 
-# ─────────────────────────────────────────────────────────────────────────────
-# VALIDATION TASKS  (driven by Celery Beat — replaces the internal asyncio loop)
-# ─────────────────────────────────────────────────────────────────────────────
+    @celery_app.task(
+        name="tasks.run_agentic_validation",
+        queue="validation",
+        ignore_result=True,
+    )
+    def run_agentic_validation():
+        """Run one batch of agentic validation (equivalent to the scheduler worker)."""
+        from scripts.run_agentic_validation import run_validation
+        _run(run_validation())
 
-@celery_app.task(
-    name="tasks.run_agentic_validation",
-    queue="validation",
-    ignore_result=True,
-)
-def run_agentic_validation():
-    """Run one batch of agentic validation (equivalent to the scheduler worker)."""
-    from scripts.run_agentic_validation import run_validation
-    _run(run_validation())
+    @celery_app.task(
+        name="tasks.run_conflict_detection",
+        queue="validation",
+        ignore_result=True,
+    )
+    def run_conflict_detection():
+        """Run one batch of conflict detection."""
+        from scripts.run_conflict_detection import run_conflict_detection as _detect
+        _run(_detect())
 
-
-@celery_app.task(
-    name="tasks.run_conflict_detection",
-    queue="validation",
-    ignore_result=True,
-)
-def run_conflict_detection():
-    """Run one batch of conflict detection."""
-    from scripts.run_conflict_detection import run_conflict_detection as _detect
-    _run(_detect())
-
-
-@celery_app.task(
-    name="tasks.run_temporal_revalidation",
-    queue="validation",
-    ignore_result=True,
-)
-def run_temporal_revalidation():
-    """Run one batch of temporal revalidation."""
-    from scripts.run_temporal_revalidation import run_temporal_revalidation as _revalidate
-    _run(_revalidate())
+    @celery_app.task(
+        name="tasks.run_temporal_revalidation",
+        queue="validation",
+        ignore_result=True,
+    )
+    def run_temporal_revalidation():
+        """Run one batch of temporal revalidation."""
+        from scripts.run_temporal_revalidation import run_temporal_revalidation as _revalidate
+        _run(_revalidate())

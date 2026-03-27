@@ -97,7 +97,7 @@ const SECTIONS: ConfigSection[] = [
     keys: [
       { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number" },
       { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number" },
-      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust"] },
+      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware"] },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean" },

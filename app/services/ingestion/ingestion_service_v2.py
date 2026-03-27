@@ -27,7 +27,7 @@ from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 from app.services.ingestion.parsers_router_v2 import ParserRouterV2
 from app.services.ingestion.row_segmenter_v2 import parse_dataframe_rows
-from app.services.ingestion.chunking_registry import (
+from app.core.chunking_stratagies.chunking_registry import (
     clear_chunker_cache,
     get_chunker,
     list_chunking_strategies,
