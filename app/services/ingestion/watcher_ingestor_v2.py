@@ -35,7 +35,18 @@ VIDEO_EXTENSIONS = (
     ".m4v",
 )
 
-MEDIA_EXTENSIONS = AUDIO_EXTENSIONS + VIDEO_EXTENSIONS  # ✨ Combined!
+IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".tiff",
+    ".svg",
+)
+
+MEDIA_EXTENSIONS = AUDIO_EXTENSIONS + VIDEO_EXTENSIONS + IMAGE_EXTENSIONS  # ✨ Combined!
 
 # Optional broadcast import for live UI updates
 try:
@@ -113,6 +124,10 @@ async def _process_new_file(file_path: str):
             media_kind = "video"
             emoji = "🎬"
             media_type_label = "video"
+        elif ext in IMAGE_EXTENSIONS:
+            media_kind = "image"
+            emoji = "🖼️"
+            media_type_label = "image"
         else:
             media_kind = "audio"  # Fallback
             emoji = "🎵"

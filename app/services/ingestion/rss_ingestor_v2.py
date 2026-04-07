@@ -2,14 +2,20 @@
 # rss_ingestor_v2.py — RSS Feed Ingestor (Production-Ready)
 # Fully aligned with ingestion_v2 architecture and GlobalContentIndexV2
 # Unified global/local LLM normalization toggle + stable dedup hashes
+# Now includes image extraction from feed entries for visual pipeline
 # =============================================
 
 import asyncio
 import feedparser
 import hashlib
+import os
+import re
 import pandas as pd
 from datetime import datetime
+from urllib.parse import urljoin, urlparse
 from typing import Dict, Any, List, Optional
+
+import httpx
 
 from app.utils.logger import log_info, log_warning
 from app.utils.text_cleaner_v2 import clean_text
@@ -68,6 +74,9 @@ def extract_feed_entries(feed: feedparser.FeedParserDict) -> List[Dict[str, Any]
         # ✅ Stable semantic hash for deduplication
         semantic_hash = hashlib.sha256(cleaned_text.encode("utf-8")).hexdigest()
 
+        # ✅ Extract image URLs from feed entry
+        image_urls = _extract_entry_image_urls(entry, summary)
+
         cleaned_entries.append(
             {
                 "title": title,
@@ -77,11 +86,134 @@ def extract_feed_entries(feed: feedparser.FeedParserDict) -> List[Dict[str, Any]
                 "link": link,
                 "published": published,
                 "raw_text": combined_text,
+                "image_urls": image_urls,
             }
         )
 
     log_info(f"[rss_ingestor_v2] Extracted {len(cleaned_entries)} feed entries.")
     return cleaned_entries
+
+
+# -------------------------------------------------------------------
+# IMAGE EXTRACTION FROM RSS ENTRIES
+# -------------------------------------------------------------------
+_ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+_MIN_IMAGE_SIZE = 5_000  # Skip images < 5 KB
+_MAX_IMAGES_PER_FEED = 30
+
+
+def _extract_entry_image_urls(entry, summary_html: str) -> List[str]:
+    """
+    Extract image URLs from an RSS entry using multiple strategies:
+    1. media:content / media:thumbnail tags
+    2. enclosure tags with image MIME types
+    3. <img> tags in the summary/description HTML
+    """
+    urls = []
+
+    # Strategy 1: media:content / media:thumbnail
+    media_content = entry.get("media_content", [])
+    for mc in media_content:
+        url = mc.get("url", "")
+        medium = mc.get("medium", "")
+        mtype = mc.get("type", "")
+        if url and (medium == "image" or "image" in mtype):
+            urls.append(url)
+
+    media_thumb = entry.get("media_thumbnail", [])
+    for mt in media_thumb:
+        url = mt.get("url", "")
+        if url:
+            urls.append(url)
+
+    # Strategy 2: enclosures
+    enclosures = entry.get("enclosures", [])
+    for enc in enclosures:
+        url = enc.get("href", enc.get("url", ""))
+        etype = enc.get("type", "")
+        if url and "image" in etype:
+            urls.append(url)
+
+    # Strategy 3: <img> tags in summary HTML
+    if summary_html:
+        from bs4 import BeautifulSoup
+        try:
+            soup = BeautifulSoup(summary_html, "html.parser")
+            for img in soup.find_all("img", src=True):
+                src = img["src"].strip()
+                if src and not src.startswith("data:"):
+                    urls.append(src)
+        except Exception:
+            pass
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            unique.append(u)
+    return unique
+
+
+async def download_feed_images(
+    entries: List[Dict[str, Any]],
+    max_total: int = _MAX_IMAGES_PER_FEED,
+) -> List[Dict[str, Any]]:
+    """
+    Download images referenced in feed entries.
+
+    Returns list of dicts with keys: bytes, ext, src, alt
+    Compatible with DocumentVisualInterceptorV1._extract_web_visuals()
+    """
+    all_urls = []
+    for entry in entries:
+        for url in entry.get("image_urls", []):
+            if len(all_urls) >= max_total:
+                break
+            all_urls.append((url, entry.get("title", "")))
+
+    if not all_urls:
+        return []
+
+    log_info(f"[rss_ingestor_v2] Downloading {len(all_urls)} images from feed entries...")
+
+    images: List[Dict[str, Any]] = []
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/121.0 Safari/537.36"
+        )
+    }
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for url, alt in all_urls:
+            try:
+                resp = await client.get(url, headers=headers)
+                resp.raise_for_status()
+
+                content_bytes = resp.content
+                if len(content_bytes) < _MIN_IMAGE_SIZE:
+                    continue
+
+                parsed = urlparse(url)
+                ext = os.path.splitext(parsed.path)[1].lower().lstrip(".")
+                if not ext or ext not in {"jpg", "jpeg", "png", "gif", "webp", "bmp"}:
+                    ext = "png"
+
+                images.append({
+                    "bytes": content_bytes,
+                    "ext": ext,
+                    "src": url,
+                    "alt": alt,
+                })
+            except Exception as e:
+                log_warning(f"[rss_ingestor_v2] Image download failed: {url}: {e}")
+                continue
+
+    log_info(f"[rss_ingestor_v2] Downloaded {len(images)} feed images")
+    return images
 
 
 # -------------------------------------------------------------------
@@ -142,6 +274,15 @@ async def parse_rss(
         log_info("[rss_ingestor_v2] LLM normalization skipped (disabled).")
 
     # ----------------------------------------------------------------
+    # ✅ Download images from feed entries (for visual pipeline)
+    # ----------------------------------------------------------------
+    images: List[Dict[str, Any]] = []
+    try:
+        images = await download_feed_images(entries)
+    except Exception as e:
+        log_warning(f"[rss_ingestor_v2] Image download failed (non-fatal): {e}")
+
+    # ----------------------------------------------------------------
     # ✅ Continue with segmentation
     # ----------------------------------------------------------------
     df = pd.DataFrame(entries)
@@ -168,11 +309,13 @@ async def parse_rss(
     # ----------------------------------------------------------------
     return {
         "chunks": chunks,
+        "images": images,  # ✅ For visual pipeline (DocumentVisualInterceptorV1)
         "source_type": "rss",
         "metadata": {
             "url": source_url,
             "entry_count": len(entries),
-            "parser": "rss_v2 (feedparser + cleaner + LLM optional)",
+            "image_count": len(images),
+            "parser": "rss_v2 (feedparser + cleaner + LLM optional + images)",
             "retrieved_at": datetime.utcnow().isoformat(),
             "llm_normalization": is_llm_enabled(),
             "file_name": source_url,

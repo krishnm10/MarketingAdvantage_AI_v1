@@ -56,6 +56,28 @@ def remove_control_chars(text: str) -> str:
     return re.sub(r"[\x00-\x1F\x7F]", " ", text)
 
 # -------------------------------------------------------------------
+# CID CHARACTER RESOLUTION (from PDF font encodings)
+# -------------------------------------------------------------------
+_CID_UNICODE_MAP = {
+    133: "\u2026", 145: "\u2018", 146: "\u2019", 147: "\u201C",
+    148: "\u201D", 149: "\u2022", 150: "\u2013", 151: "\u2014",
+    160: "\u00A0", 169: "\u00A9", 174: "\u00AE", 176: "\u00B0",
+    188: "\u00BC", 189: "\u00BD", 190: "\u00BE",
+    210: "\u2013", 211: "\u2014", 212: "\u201C", 213: "\u201D",
+}
+_CID_PATTERN = re.compile(r"\(cid:(\d+)\)")
+
+
+def resolve_cid_characters(text: str) -> str:
+    """Replace (cid:NNN) placeholders with their Unicode equivalents."""
+    if "(cid:" not in text:
+        return text
+    def _replace(match):
+        cid = int(match.group(1))
+        return _CID_UNICODE_MAP.get(cid, "\uFFFD")
+    return _CID_PATTERN.sub(_replace, text)
+
+# -------------------------------------------------------------------
 # SPECIAL SYMBOL CLEANUP
 # -------------------------------------------------------------------
 def remove_special_symbols(text: str) -> str:
@@ -90,6 +112,7 @@ def clean_text(text: Optional[str]) -> str:
 
     text = strip_html(text)
     text = normalize_unicode(text)
+    text = resolve_cid_characters(text)
     text = remove_emojis(text)
     text = remove_urls(text)
     text = remove_control_chars(text)

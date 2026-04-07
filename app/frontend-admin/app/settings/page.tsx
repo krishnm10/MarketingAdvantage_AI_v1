@@ -313,6 +313,54 @@ const SECTIONS: ConfigSection[] = [
     ],
   },
 
+  /* ────────────────── MULTIMODAL VISION ENCODER ────────────────── */
+  {
+    category: "ai",
+    title: "Vision Encoder — Profile & Models",
+    description: "Multimodal vision encoder for image, chart, and document understanding",
+    icon: Image,
+    gradient: "from-rose-500 to-rose-700 shadow-rose-600/20",
+    keys: [
+      { key: "AI_PROFILE", label: "AI Execution Profile", type: "select", options: ["cpu", "gpu", "api", "dist"] },
+      { key: "VISION_MODEL_CPU", label: "CPU Vision Model", type: "select", options: [
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        "vikhyatk/moondream2",
+        "openai/clip-vit-large-patch14",
+      ]},
+      { key: "VISION_MODEL_GPU", label: "GPU Vision Model", type: "select", options: [
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        "Qwen/Qwen2.5-VL-72B-Instruct",
+        "lmms-lab/llava-onevision-qwen2-7b-ov-hf",
+        "OpenGVLab/InternVL3-8B",
+      ]},
+      { key: "VISION_API_PROVIDER", label: "API Vision Provider", type: "select", options: ["openai", "anthropic", "google"] },
+      { key: "VISION_API_MODEL", label: "API Vision Model", type: "select", options: [
+        "gpt-4o",
+        "gpt-4-vision-preview",
+        "claude-3-5-sonnet-20241022",
+        "claude-3-7-sonnet-20250219",
+        "gemini-2.0-flash",
+        "gemini-1.5-pro",
+      ]},
+    ],
+  },
+  {
+    category: "ai",
+    title: "Vision Encoder — GPU & Performance",
+    description: "Quantization, attention, pixel budget, and batch processing controls",
+    icon: Zap,
+    gradient: "from-fuchsia-500 to-fuchsia-700 shadow-fuchsia-600/20",
+    keys: [
+      { key: "VISION_QUANTIZE", label: "GPU Quantization", type: "select", options: ["none", "4bit", "8bit"] },
+      { key: "VISION_FLASH_ATTENTION", label: "Flash Attention 2", type: "boolean" },
+      { key: "VISION_MAX_PIXELS", label: "Max Pixels (GPU/API)", type: "number", placeholder: "1003520" },
+      { key: "VISION_MIN_PIXELS", label: "Min Pixels", type: "number", placeholder: "200704" },
+      { key: "VISION_BATCH_SIZE_CPU", label: "CPU Batch Size", type: "number", placeholder: "1" },
+      { key: "VISION_BATCH_SIZE_GPU", label: "GPU Batch Size", type: "number", placeholder: "4" },
+      { key: "VIDEO_VISION_FRAMES", label: "Video Frame Sample Count", type: "number", placeholder: "8" },
+    ],
+  },
+
   /* ────────────────── TASK QUEUE & BROKERS ────────────────── */
   {
     category: "taskqueue",

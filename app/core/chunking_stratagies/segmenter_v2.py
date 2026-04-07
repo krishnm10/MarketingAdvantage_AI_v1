@@ -55,7 +55,11 @@ from app.services.ingestion.deduplication_engine_v2 import create_normalized_has
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info, log_warning
 from app.core.chunking_stratagies.chunk_quality_scorer import score_chunk_quality
-from app.core.chunking_stratagies.text_preprocessor import is_noise_chunk, preprocess_document_text
+from app.core.chunking_stratagies.text_preprocessor import (
+    classify_chunk_noise,
+    is_noise_chunk,
+    preprocess_document_text,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,12 +142,111 @@ _KW_HORIZON: Dict[str, tuple] = {
     "historical": ("was", "last year", "previous"),
 }
 _KW_REGULATED: tuple = ("gdpr", "hipaa", "sox", "regulation")
+_MEANINGLESS_METADATA_TERMS: tuple = (
+    "approved by",
+    "approval status",
+    "approval done",
+    "approvals was done",
+    "system log",
+    "audit trail",
+    "conversation id",
+    "great, approvals",
+)
+_HEADER_FOOTER_BLEED_TERMS: tuple = (
+    "all rights reserved",
+    "confidential",
+    "internal use only",
+    "for internal circulation",
+    "page ",
+)
+_WEATHER_TERMS: tuple = ("weather", "climate", "rainfall", "temperature", "humidity")
+_PRICE_TABLE_TERMS: tuple = ("table", "price", "prices", "import", "forecast", "chart")
+_ENCODING_ARTIFACT_MARKERS: tuple = ("Â", "Ã", "â€", "â€™", "â€œ", "â€", "�")
+_ABRUPT_START_TERMS: tuple = (
+    "and",
+    "or",
+    "but",
+    "because",
+    "however",
+    "therefore",
+    "additionally",
+)
 _PRIMARY_SOURCE_TYPES: frozenset = frozenset({"pdf", "docx", "csv", "xls", "xlsx"})
+
+
+def _compute_sentiment_bucket(text_lower: str, raw_text: str = "") -> tuple[str, float]:
+    """
+    Data quality auditor signal.
+
+    Uses structural/logical integrity checks (not emotional tone):
+      - negative (0.90-1.00): chunk integrity failure
+      - positive (0.90-1.00): clean, high-integrity chunk
+      - neutral (0.55): uncertain edge cases
+    """
+    if not text_lower.strip():
+        return "neutral", 0.50
+
+    text = raw_text if isinstance(raw_text, str) and raw_text.strip() else text_lower
+    norm = text_lower.lower()
+    tokens = len(text_lower.split())
+
+    severity = 0.0
+
+    # 1) Low information density + OCR/table/junk structure detectors.
+    is_noise, noise_type, noise_conf = classify_chunk_noise(text_lower, tokens=tokens)
+    if is_noise:
+        severity += max(0.65, noise_conf)
+    if tokens < 8:
+        severity += 0.80
+
+    # 2) Encoding artifacts (mojibake / charset mismatch).
+    if any(mark in text for mark in _ENCODING_ARTIFACT_MARKERS):
+        severity += 0.75
+
+    # 3) Broken structure: abrupt starts / hard sentence breaks.
+    first_word = text_lower.strip().split()[0] if tokens else ""
+    if first_word in _ABRUPT_START_TERMS:
+        severity += 0.45
+    if tokens >= 12 and not text_lower.strip().endswith((".", "!", "?", ";", ":")):
+        severity += 0.35
+
+    # 4) Metadata/system breadcrumb contamination.
+    if any(term in norm for term in _MEANINGLESS_METADATA_TERMS):
+        severity += 0.70
+
+    # 5) Header/footer bleed inside content.
+    if any(term in norm for term in _HEADER_FOOTER_BLEED_TERMS):
+        if re.search(r"\bpage\s+\d+\s*(?:of\s+\d+)?\b", norm) or "confidential" in norm:
+            severity += 0.60
+
+    # 6) Concatenation / smashed token hints from OCR/PDF extraction.
+    if re.search(r"\b[a-z]{5,}[A-Z][a-zA-Z]{3,}\b", text):
+        severity += 0.50
+    if re.search(r"\b[a-z]{22,}\b", text_lower):
+        severity += 0.40
+
+    # 7) Logical mismatch heuristic: price/table intent vs weather-topic body.
+    has_price_intent = any(term in norm for term in _PRICE_TABLE_TERMS)
+    has_weather_topic = any(term in norm for term in _WEATHER_TERMS)
+    if has_price_intent and has_weather_topic and "weather pattern" in norm:
+        severity += 0.65
+
+    severity = min(1.0, severity)
+    if severity >= 0.65:
+        confidence = min(1.0, 0.90 + (severity - 0.65) * 0.28)
+        return "negative", round(float(confidence), 4)
+
+    if not is_noise and noise_type == "clean":
+        confidence = 0.92 if severity < 0.20 else 0.90
+        return "positive", round(float(confidence), 4)
+
+    return "neutral", 0.55
 
 
 def build_reasoning_ingestion_metadata(
     *,
-    text_lower: str,          # FIX-B2-4: accept pre-lowercased text — zero re-allocation
+    text_lower: str,
+    raw_text: str,
     source_type: str,
     semantic_hash: str,
 ) -> Dict[str, Any]:
@@ -162,23 +265,29 @@ def build_reasoning_ingestion_metadata(
     time_horizon      = "timeless"
     is_regulated      = False
 
+    text_lower_norm = text_lower.lower()
+
     # One scan covers signal_type + business_function + time_horizon + regulated
     for label, keywords in _KW_SIGNAL.items():
-        if any(k in text_lower for k in keywords):
+        if any(k in text_lower_norm for k in keywords):
             signal_type = label
             break
 
     for label, keywords in _KW_FUNCTION.items():
-        if any(k in text_lower for k in keywords):
+        if any(k in text_lower_norm for k in keywords):
             business_function = label
             break
 
     for label, keywords in _KW_HORIZON.items():
-        if any(k in text_lower for k in keywords):
+        if any(k in text_lower_norm for k in keywords):
             time_horizon = label
             break
 
-    is_regulated = any(k in text_lower for k in _KW_REGULATED)
+    is_regulated = any(k in text_lower_norm for k in _KW_REGULATED)
+    sentiment_bucket, sentiment_confidence = _compute_sentiment_bucket(
+        text_lower_norm,
+        raw_text=raw_text,
+    )
 
     # Granularity is O(1) — pure length check, no string scan
     text_len = len(text_lower)
@@ -200,6 +309,8 @@ def build_reasoning_ingestion_metadata(
         ),
         "extraction_confidence":  0.90,
         "granularity":            granularity,
+        "sentiment_bucket":       sentiment_bucket,
+        "sentiment_confidence":   sentiment_confidence,
         "data_lineage_id":        semantic_hash,
         "potentially_regulated":  is_regulated,
         "extraction_timestamp":   datetime.utcnow().isoformat() + "Z",
@@ -273,7 +384,8 @@ def make_chunk_dict(
     # FIX-B2-4: pass cleaned directly — clean_text() returns lowercase,
     # build_reasoning_ingestion_metadata now accepts text_lower directly.
     reasoning = build_reasoning_ingestion_metadata(
-        text_lower=cleaned,                   # ← zero re-allocation
+        text_lower=cleaned,
+        raw_text=text,
         source_type=source_type or "unknown",
         semantic_hash=semantic_hash,
     )
@@ -528,3 +640,5 @@ def _build_chunk_dicts_sync(
         if c:
             result.append(c)
     return result
+
+

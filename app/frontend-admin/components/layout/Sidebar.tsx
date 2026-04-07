@@ -15,6 +15,7 @@ import {
   Search,
   ChevronLeft,
   ChevronRight,
+  Eye,
 } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
@@ -54,6 +55,7 @@ const NAV_SECTIONS = [
     items: [
       { href: "/settings/pipeline", label: "Pipeline", icon: Zap },
       { href: "/settings/databases", label: "Databases", icon: Database },
+      { href: "/settings/vision-encoder", label: "Vision Encoder", icon: Eye },
     ],
   },
 ];

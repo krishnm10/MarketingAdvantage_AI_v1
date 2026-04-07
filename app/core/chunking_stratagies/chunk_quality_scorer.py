@@ -356,16 +356,39 @@ def _detect_ocr_garble(words: list) -> bool:
     return (single / len(words)) > 0.35
 
 
+def _is_numeric_token_scorer(word: str) -> bool:
+    """Numeric detector used by quality scorer hard penalties."""
+    w = word.strip("(),%$*")
+    if not w:
+        return False
+    if w.replace(",", "").replace(".", "").isdigit():
+        return True
+    if re.match(r"^\d{4}[-\u2013]\d{2,4}$", w):
+        return True
+    if re.match(r"^\d[\d,]*\.?\d*$", w):
+        return True
+    if re.match(r"^\d+\.?\d*%$", word.strip()):
+        return True
+    return False
+
+
 def _detect_chart_dump(words: list) -> bool:
-    """True if >55% of tokens are numeric-looking."""
+    """True if >45% of tokens are numeric-looking."""
     if len(words) < 5:
         return False
-    numeric = sum(
-        1 for w in words
-        if w.strip('(),%$').replace(',', '').replace('.', '').replace('-', '').isdigit()
-        or re.match(r'^\d{4}[-–]\d{2,4}$', w.strip('(),%$')) is not None
-    )
-    return (numeric / len(words)) > 0.55
+    numeric = sum(1 for w in words if _is_numeric_token_scorer(w))
+    return (numeric / len(words)) > 0.45
+
+
+def _detect_percentage_repetition(words: list) -> bool:
+    """
+    True if >40% of tokens are percentage labels.
+    Catches OCR axis text like: 35% 35% 35% 36% 36%
+    """
+    if len(words) < 6:
+        return False
+    pct_count = sum(1 for w in words if re.match(r"^\d{1,3}(?:\.\d+)?%$", w.strip()))
+    return (pct_count / len(words)) > 0.40
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -416,6 +439,8 @@ def score_chunk_quality(text: str, tokens: int) -> float:
     # ── Hard penalty caps ─────────────────────────────────────────────────
     if _detect_ocr_garble(words):
         raw = min(raw, _OCR_GARBLE_CAP)
+    elif _detect_percentage_repetition(words):
+        raw = min(raw, _CHART_DUMP_CAP)
     elif _detect_chart_dump(words):
         raw = min(raw, _CHART_DUMP_CAP)
 
@@ -459,6 +484,8 @@ def score_chunk_quality_detailed(text: str, tokens: int) -> Dict[str, Any]:
 
     if _detect_ocr_garble(words):
         raw = min(raw, _OCR_GARBLE_CAP)
+    elif _detect_percentage_repetition(words):
+        raw = min(raw, _CHART_DUMP_CAP)
     elif _detect_chart_dump(words):
         raw = min(raw, _CHART_DUMP_CAP)
 
@@ -474,5 +501,6 @@ def score_chunk_quality_detailed(text: str, tokens: int) -> Dict[str, Any]:
         "information_density": round(s_info, 4),
         "retrieval_fitness":   round(s_retrieval, 4),
         "ocr_garble_detected": _detect_ocr_garble(words),
+        "percentage_repetition_detected": _detect_percentage_repetition(words),
         "chart_dump_detected": _detect_chart_dump(words),
     }

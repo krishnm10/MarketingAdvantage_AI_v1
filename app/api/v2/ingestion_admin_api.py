@@ -112,13 +112,21 @@ async def list_file_chunks(
         {
             "id":                  str(chunk.id),
             "chunk_index":         chunk.chunk_index,
+            "page_number":         chunk.page_number,
+            "parent_chunk_id":     str(chunk.parent_chunk_id) if chunk.parent_chunk_id else None,
             "text":                chunk.text,
             "cleaned_text":        chunk.cleaned_text,
+            "tokens":              chunk.tokens,
+            "source_type":         chunk.source_type,
             "semantic_hash":       chunk.semantic_hash,
             "confidence":          chunk.confidence,
             "is_duplicate":        chunk.is_duplicate,
+            "duplicate_of":        str(chunk.duplicate_of) if chunk.duplicate_of else None,
+            "similarity_score":    chunk.similarity_score,
             "global_content_id":   str(chunk.global_content_id) if chunk.global_content_id else None,
             "gci_occurrence_count": gci.occurrence_count if gci else None,
+            "meta_data":           chunk.meta_data or {},
+            "reasoning_ingestion": chunk.reasoning_ingestion or {},
             "created_at":          chunk.created_at,
         }
         for chunk, gci in rows
@@ -180,10 +188,11 @@ async def update_chunk(
     })
 
     # ── 4. Update GCI ─────────────────────────────────────────────
-    gci = await db.get(GlobalContentIndexV2, chunk.global_content_id)
-    if not gci:
-        raise HTTPException(status_code=404, detail="GlobalContentIndex not found")
-    gci.cleaned_text = final_text
+    gci = None
+    if chunk.global_content_id:
+        gci = await db.get(GlobalContentIndexV2, chunk.global_content_id)
+        if gci:
+            gci.cleaned_text = final_text
 
     # ── 5. Re-embed + upsert via pluggable pipeline ───────────────
     # ✅ PERMANENT FIX:
@@ -209,7 +218,7 @@ async def update_chunk(
         None,
         lambda: vectordb.upsert(
             collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            doc_id=gci.semantic_hash,
+            doc_id=(gci.semantic_hash if gci else chunk.semantic_hash),
             embedding=vector,
             text=final_text,
             metadata={
@@ -228,10 +237,11 @@ async def update_chunk(
         after_value=final_text,
         meta_data={
             "llm_mode":      payload.llm_mode,
-            "semantic_hash": gci.semantic_hash,
+            "semantic_hash": gci.semantic_hash if gci else chunk.semantic_hash,
             "edited_by":     user["sub"],
             "vectordb_kind": vectordb.kind,
             "embedder_kind": embedder.kind,
+            "gci_linked":    bool(gci),
         },
     )
     db.add(audit)
@@ -240,7 +250,8 @@ async def update_chunk(
     return {
         "status":        "updated",
         "chunk_id":      chunk_id,
-        "semantic_hash": gci.semantic_hash,
+        "semantic_hash": gci.semantic_hash if gci else chunk.semantic_hash,
+        "gci_linked":    bool(gci),
         "llm_mode":      payload.llm_mode,
         "vectordb_used": vectordb.kind,
         "embedder_used": embedder.kind,

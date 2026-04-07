@@ -23,6 +23,7 @@ from app.services.ingestion.xml_parser_v2 import parse_xml
 
 
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
+from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
 from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.session_v2 import async_engine
 from app.utils.logger import log_info, log_warning
@@ -50,9 +51,29 @@ PARSER_MAP = {
     ".xls":  parse_excel,
     ".csv":  parse_csv,
     ".txt":  parse_text,
+    ".md":   parse_text,
+    ".markdown": parse_text,
     ".json": parse_json,
     ".xml":  parse_xml,
 }
+
+# -----------------------------------------------------------
+# MEDIA EXTENSION → KIND MAP (images, audio, video)
+# -----------------------------------------------------------
+MEDIA_EXT_MAP = {
+    # Images
+    ".jpg": "image", ".jpeg": "image", ".png": "image", ".gif": "image",
+    ".bmp": "image", ".webp": "image", ".tiff": "image", ".svg": "image",
+    # Audio
+    ".mp3": "audio", ".wav": "audio", ".flac": "audio", ".ogg": "audio",
+    ".aac": "audio", ".m4a": "audio", ".wma": "audio", ".opus": "audio",
+    # Video
+    ".mp4": "video", ".avi": "video", ".mov": "video", ".mkv": "video",
+    ".webm": "video", ".flv": "video", ".wmv": "video", ".m4v": "video",
+}
+
+MEDIA_UPLOAD_DIR = os.path.join("static", "uploads", "media")
+os.makedirs(MEDIA_UPLOAD_DIR, exist_ok=True)
 
 # -----------------------------------------------------------
 # UTILITIES
@@ -81,7 +102,7 @@ def _write_log_sync(line: str):
 
 def _validate_file_extension(file_name: str):
     _, ext = os.path.splitext(file_name.lower())
-    if ext not in PARSER_MAP:
+    if ext not in PARSER_MAP and ext not in MEDIA_EXT_MAP:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {ext}")
     return ext
 
@@ -102,6 +123,11 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
     try:
         original_file_name = file.filename
         file_ext = _validate_file_extension(original_file_name)
+
+        # ── Media files (image/audio/video) → route through MediaIngestionHookV1 ──
+        if file_ext in MEDIA_EXT_MAP:
+            return await _route_media_ingestion(file, file_ext, business_id)
+
         parser_func = PARSER_MAP[file_ext]
 
         # -----------------------
@@ -201,10 +227,66 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
 
         return {"file_id": file_id, "status": "ingested", "path": saved_path, "hash": file_hash}
 
+    except HTTPException:
+        raise
     except Exception as e:
         log_warning(f"[file_router_v2] Ingestion failed: {e}")
         _write_log(f"[FAILED] {getattr(file, 'filename', 'unknown')}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------------------------------------------
+# MEDIA FILE ROUTING (image / audio / video → MediaIngestionHookV1)
+# -----------------------------------------------------------
+async def _route_media_ingestion(file: UploadFile, file_ext: str, business_id: str = None):
+    """Route image/audio/video uploads through the media ingestion pipeline."""
+    original_file_name = file.filename
+    media_kind = MEDIA_EXT_MAP[file_ext]
+
+    safe_name = Path(original_file_name).name
+    safe_stem = Path(safe_name).stem
+    safe_suffix = Path(safe_name).suffix or file_ext
+    unique_suffix = uuid.uuid4().hex
+    saved_file_name = f"{safe_stem}_{unique_suffix}{safe_suffix}"
+    saved_path = os.path.join(MEDIA_UPLOAD_DIR, saved_file_name)
+
+    # Resolve to absolute and verify stays inside upload dir
+    abs_upload_dir = os.path.realpath(MEDIA_UPLOAD_DIR)
+    abs_file_path = os.path.realpath(saved_path)
+    if not abs_file_path.startswith(abs_upload_dir + os.sep):
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    content = await file.read()
+    async with aiofiles.open(abs_file_path, "wb") as f:
+        await f.write(content)
+
+    file_id = str(uuid.uuid4())
+    safe_business_id = str(uuid.UUID(business_id)) if business_id and _safe_uuid(business_id) else str(uuid.uuid4())
+
+    log_info(f"[file_router_v2] Routing {media_kind} file: {original_file_name}")
+    _write_log(f"[MEDIA_ROUTE] {original_file_name} → {media_kind}")
+
+    result = await MediaIngestionHookV1().handle(
+        file_id=file_id,
+        file_path=abs_file_path,
+        file_type=media_kind,
+        parsed_output={},
+        business_id=safe_business_id,
+        media_kind=media_kind,
+    )
+
+    status = result.get("status", "success")
+    _write_log(f"[MEDIA_INGESTED] {original_file_name} → {status}")
+    log_info(f"[file_router_v2] ✅ Media ingestion complete for {original_file_name} ({status})")
+
+    return {
+        "file_id": file_id,
+        "file_name": original_file_name,
+        "media_kind": media_kind,
+        "status": status,
+        "path": abs_file_path,
+        **{k: v for k, v in result.items() if k != "status"},
+    }
 
 
 # -----------------------------------------------------------

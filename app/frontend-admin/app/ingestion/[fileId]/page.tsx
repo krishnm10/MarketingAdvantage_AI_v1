@@ -3,21 +3,31 @@
 import { useEffect, useState, type ComponentType } from "react";
 import { useParams } from "next/navigation";
 import Button from "@/components/ui/Button";
+import Modal from "@/components/ui/Modal";
 import apiClient from "@/lib/apiClient";
 import { cn } from "@/lib/utils";
 import { useFormatDate } from "@/lib/useHydrated";
-import { AlertTriangle, ArrowLeft, FileText, Hash, Info, Layers3, Link2, Loader2, SearchCheck, Sparkles } from "lucide-react";
+import { useAuth } from "@/lib/useAuth";
+import { AlertTriangle, ArrowLeft, FileText, Hash, Info, Layers3, Link2, Loader2, Pencil, Save, SearchCheck, Sparkles } from "lucide-react";
 
 interface Chunk {
   id: string;
   chunk_index: number;
+  page_number?: number | null;
+  parent_chunk_id?: string | null;
   text: string;
   cleaned_text: string;
+  tokens?: number;
+  source_type?: string | null;
   semantic_hash: string;
   confidence: number;
   is_duplicate: boolean;
+  duplicate_of?: string | null;
+  similarity_score?: number | null;
   global_content_id: string | null;
   gci_occurrence_count: number | null;
+  meta_data?: Record<string, any>;
+  reasoning_ingestion?: Record<string, any>;
 }
 
 interface FileDetails {
@@ -88,9 +98,16 @@ function matchingSemanticsText(layer: DisplayRow["layer"], reference: string, du
 
 export default function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
+  const { role } = useAuth();
+  const canEditChunks = role === "admin" || role === "editor";
   const [file, setFile] = useState<FileDetails | null>(null);
   const [chunks, setChunks] = useState<Chunk[]>([]);
   const [loading, setLoading] = useState(true);
+  const [editingChunk, setEditingChunk] = useState<Chunk | null>(null);
+  const [draftText, setDraftText] = useState("");
+  const [llmMode, setLlmMode] = useState<"" | "factual" | "creative">("");
+  const [savingChunk, setSavingChunk] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const { formatDateTime } = useFormatDate();
 
   useEffect(() => {
@@ -110,6 +127,62 @@ export default function FileDetailPage() {
       }
     })();
   }, [fileId]);
+
+  function openEditor(chunk: Chunk) {
+    setEditingChunk(chunk);
+    setDraftText(chunk.cleaned_text || chunk.text || "");
+    setLlmMode("");
+    setSaveMessage(null);
+  }
+
+  function closeEditor() {
+    if (savingChunk) return;
+    setEditingChunk(null);
+    setDraftText("");
+    setLlmMode("");
+    setSaveMessage(null);
+  }
+
+  async function saveChunkEdit() {
+    if (!editingChunk) return;
+    const nextText = draftText.trim();
+    if (!nextText) {
+      setSaveMessage("Chunk text cannot be empty.");
+      return;
+    }
+
+    setSavingChunk(true);
+    setSaveMessage(null);
+    try {
+      await apiClient.put(`/api/v2/ingestion-admin/chunks/${editingChunk.id}`, {
+        cleaned_text: nextText,
+        llm_mode: llmMode || null,
+      });
+
+      setChunks((prev) =>
+        prev.map((c) =>
+          c.id === editingChunk.id
+            ? {
+                ...c,
+                cleaned_text: nextText,
+                meta_data: {
+                  ...(c.meta_data || {}),
+                  manually_edited: true,
+                  llm_mode: llmMode || null,
+                },
+              }
+            : c
+        )
+      );
+      setSaveMessage("Chunk saved and re-embedded.");
+      setTimeout(() => closeEditor(), 700);
+    } catch (err: any) {
+      const detail = err?.response?.data?.detail;
+      setSaveMessage(typeof detail === "string" ? detail : "Failed to save chunk.");
+    } finally {
+      setSavingChunk(false);
+    }
+  }
 
   const sortedChunks = [...chunks].sort((a, b) => a.chunk_index - b.chunk_index);
   const groups = new Map<string, Chunk[]>();
@@ -571,6 +644,186 @@ export default function FileDetailPage() {
       </div>
 
       <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+          <div>
+            <h2 className="text-lg font-semibold text-slate-900">Chunk Governance Console</h2>
+            <p className="mt-1 text-sm text-slate-600">
+              Operational governance view with page lineage, structural parent links, sentiment signals, and controlled edit actions.
+            </p>
+          </div>
+          <div className="text-sm text-slate-500">
+            {canEditChunks ? "Edit enabled for your role" : "Read-only role"}
+          </div>
+        </div>
+        <div className="mt-5 overflow-x-auto rounded-2xl border border-slate-200">
+          <table className="min-w-full divide-y divide-slate-200 text-sm">
+            <thead className="bg-slate-50">
+              <tr>
+                {["Chunk", "Page", "Resolution", "Parent", "Child", "Section", "Strategy", "Quality", "Sentiment", "Duplicate", "Governance", "Actions"].map((header) => (
+                  <th key={header} className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">{header}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {sortedChunks.map((chunk) => {
+                const meta = chunk.meta_data || {};
+                const reasoning = chunk.reasoning_ingestion || {};
+                const sectionTitle = reasoning.section_context || reasoning.section_title || meta.section_title || "";
+                const sentimentBucket = reasoning.sentiment_bucket || "neutral";
+                const sentimentConfidence = Number(reasoning.sentiment_confidence ?? 0.5);
+                const qualityScore = Number(reasoning.chunk_quality_score ?? 0);
+                const strategy = reasoning.chunking_strategy || "semantic";
+
+                // Infer resolution from available data
+                const rawResolution = reasoning.chunk_resolution
+                  || (chunk.parent_chunk_id ? "child" : null)
+                  || (reasoning.child_chunk_ids ? "parent" : null);
+                const resolution = rawResolution || "flat";
+
+                // Infer quality gate from score when not explicitly set
+                const qualityGate = reasoning.quality_gate_action
+                  || (qualityScore > 0 ? (qualityScore >= 0.35 ? "passed" : "flagged") : "—");
+
+                const hasGist = Boolean(reasoning.document_gist);
+                const overlapMode = reasoning.overlap_mode || null;
+                const boundaryCoherence = reasoning.boundary_coherence != null ? Number(reasoning.boundary_coherence) : null;
+
+                // Infer content type for display
+                const contentType = reasoning.content_type || reasoning.granularity || "";
+
+                // Child chunk IDs for parent chunks
+                const childIds: string[] = reasoning.child_chunk_ids || [];
+                return (
+                  <tr key={`gov-${chunk.id}`} className="align-top hover:bg-slate-50">
+                    <td className="px-4 py-3 font-medium text-slate-800">#{chunk.chunk_index}</td>
+                    <td className="px-4 py-3 text-slate-700">{chunk.page_number ?? "—"}</td>
+                    <td className="px-4 py-3">
+                      <span className={cn(
+                        "rounded-full border px-2 py-0.5 text-[11px] font-semibold",
+                        resolution === "child" && "border-sky-200 bg-sky-100 text-sky-800",
+                        resolution === "parent" && "border-violet-200 bg-violet-100 text-violet-800",
+                        resolution === "standalone" && "border-slate-200 bg-slate-100 text-slate-700",
+                        resolution === "flat" && "border-slate-200 bg-slate-100 text-slate-500"
+                      )}>
+                        {resolution}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-slate-600">
+                      {shortId(chunk.parent_chunk_id ?? reasoning.parent_chunk_id)}
+                    </td>
+                    <td className="px-4 py-3 font-mono text-xs text-slate-600">
+                      {childIds.length > 0
+                        ? <div className="flex flex-col gap-0.5">{childIds.slice(0, 3).map((cid: string) => <span key={cid}>{shortId(cid)}</span>)}{childIds.length > 3 && <span className="text-slate-400">+{childIds.length - 3} more</span>}</div>
+                        : <span className="text-slate-400">—</span>}
+                    </td>
+                    <td className="px-4 py-3 text-slate-700">
+                      {sectionTitle
+                        ? truncate(String(sectionTitle), 42)
+                        : contentType
+                          ? <span className="text-xs text-slate-400">{contentType}</span>
+                          : <span className="text-xs text-slate-400">—</span>}
+                    </td>
+                    <td className="px-4 py-3">
+                      <span className={cn(
+                        "rounded-full border px-2 py-0.5 text-[11px] font-semibold",
+                        strategy === "elite_v2" && "border-violet-200 bg-violet-100 text-violet-800",
+                        strategy === "elite" && "border-indigo-200 bg-indigo-100 text-indigo-800",
+                        (strategy.startsWith("structure") || strategy.startsWith("smart") || strategy.startsWith("rust") || strategy.startsWith("overlap") || strategy.startsWith("recursive")) && "border-sky-200 bg-sky-100 text-sky-800",
+                        strategy === "semantic" && "border-slate-200 bg-slate-100 text-slate-600"
+                      )}>
+                        {strategy}
+                      </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex flex-col gap-1">
+                        <div className="flex items-center gap-1.5">
+                          <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-200">
+                            <div
+                              className={cn(
+                                "h-full rounded-full",
+                                qualityScore >= 0.7 && "bg-emerald-500",
+                                qualityScore >= 0.4 && qualityScore < 0.7 && "bg-amber-500",
+                                qualityScore < 0.4 && "bg-rose-500"
+                              )}
+                              style={{ width: `${Math.round(qualityScore * 100)}%` }}
+                            />
+                          </div>
+                          <span className="font-mono text-[11px] text-slate-500">
+                            {qualityScore > 0 ? `${(qualityScore * 100).toFixed(0)}%` : "—"}
+                          </span>
+                        </div>
+                        <span className={cn(
+                          "w-fit rounded-full border px-1.5 py-0.5 text-[10px] font-semibold",
+                          qualityGate === "passed" && "border-emerald-200 bg-emerald-50 text-emerald-700",
+                          qualityGate === "flagged" && "border-rose-200 bg-rose-50 text-rose-700",
+                          qualityGate === "—" && "border-slate-200 bg-slate-50 text-slate-400"
+                        )}>
+                          {qualityGate}
+                        </span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      <div className="flex items-center gap-2">
+                        <span className={cn(
+                          "rounded-full border px-2 py-0.5 text-[11px] font-semibold",
+                          sentimentBucket === "positive" && "border-emerald-200 bg-emerald-100 text-emerald-800",
+                          sentimentBucket === "negative" && "border-rose-200 bg-rose-100 text-rose-800",
+                          sentimentBucket !== "positive" && sentimentBucket !== "negative" && "border-slate-200 bg-slate-100 text-slate-700"
+                        )}>
+                          {String(sentimentBucket)}
+                        </span>
+                        <span className="font-mono text-xs text-slate-500">{(sentimentConfidence * 100).toFixed(0)}%</span>
+                      </div>
+                    </td>
+                    <td className="px-4 py-3">
+                      {chunk.is_duplicate ? (
+                        <span className="rounded-full border border-rose-200 bg-rose-100 px-2 py-0.5 text-[11px] font-semibold text-rose-700">Duplicate</span>
+                      ) : (
+                        <span className="rounded-full border border-emerald-200 bg-emerald-100 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">Unique</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-xs text-slate-600">
+                      <div>type: {chunk.source_type || "—"}</div>
+                      <div>tokens: {chunk.tokens ?? "—"}</div>
+                      {hasGist && (
+                        <div className="mt-0.5 flex items-center gap-1 text-violet-600">
+                          <Sparkles className="h-3 w-3" />
+                          <span>gist</span>
+                        </div>
+                      )}
+                      {overlapMode && (
+                        <div className={cn(
+                          "mt-0.5",
+                          overlapMode === "dynamic" && "text-amber-600",
+                          overlapMode === "skipped_high_coherence" && "text-emerald-600"
+                        )}>
+                          overlap: {overlapMode === "skipped_high_coherence" ? "skipped" : overlapMode}
+                          {boundaryCoherence != null && ` (${(boundaryCoherence * 100).toFixed(0)}%)`}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-4 py-3">
+                      {canEditChunks ? (
+                        <button
+                          onClick={() => openEditor(chunk)}
+                          className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                          Edit
+                        </button>
+                      ) : (
+                        <span className="text-xs text-slate-400">Read-only</span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="rounded-3xl border border-slate-200 bg-white p-6 shadow-sm">
         <h2 className="text-lg font-semibold text-slate-900">Chunk Reference View</h2>
         <p className="mt-1 text-sm text-slate-600">
           Real chunks returned by the current admin API. This is the raw review surface for checking duplicate text, semantic hashes, and GCI references.
@@ -639,6 +892,53 @@ export default function FileDetailPage() {
           </table>
         </div>
       </div>
+
+      <Modal
+        open={Boolean(editingChunk)}
+        onClose={closeEditor}
+        title={editingChunk ? `Edit Chunk #${editingChunk.chunk_index}` : "Edit Chunk"}
+      >
+        <div className="space-y-4">
+          <div className="text-xs text-slate-500">
+            Chunk ID: <span className="font-mono">{editingChunk?.id}</span>
+          </div>
+          <textarea
+            rows={10}
+            value={draftText}
+            onChange={(e) => setDraftText(e.target.value)}
+            className="w-full rounded-lg border border-slate-300 p-3 text-sm text-slate-800 outline-none focus:border-primary-500"
+          />
+          <div>
+            <label className="mb-1 block text-xs font-semibold uppercase tracking-[0.15em] text-slate-500">Normalization Mode</label>
+            <select
+              value={llmMode}
+              onChange={(e) => setLlmMode(e.target.value as "" | "factual" | "creative")}
+              className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-700 outline-none focus:border-primary-500"
+            >
+              <option value="">None</option>
+              <option value="factual">Factual</option>
+              <option value="creative">Creative</option>
+            </select>
+          </div>
+          {saveMessage && (
+            <div className={cn(
+              "rounded-md px-3 py-2 text-sm",
+              saveMessage.toLowerCase().includes("failed") || saveMessage.toLowerCase().includes("empty")
+                ? "bg-rose-50 text-rose-700"
+                : "bg-emerald-50 text-emerald-700"
+            )}>
+              {saveMessage}
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            <Button variant="outline" onClick={closeEditor} disabled={savingChunk}>Cancel</Button>
+            <Button onClick={saveChunkEdit} loading={savingChunk} className="flex items-center gap-2">
+              <Save className="h-4 w-4" />
+              Save Chunk
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }

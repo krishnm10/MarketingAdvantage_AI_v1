@@ -47,6 +47,8 @@ class IngestedContentV2(Base):
     # CHUNK INFO
     # -----------------------------------------------------------
     chunk_index = Column(Integer, nullable=False)
+    page_number = Column(Integer, nullable=True)
+    parent_chunk_id = Column(UUID(as_uuid=True), nullable=True)
     text = Column(Text, nullable=False)
     cleaned_text = Column(Text, nullable=False)
     tokens = Column(Integer, nullable=False)

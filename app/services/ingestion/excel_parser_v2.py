@@ -2,11 +2,13 @@
 # excel_parser_v2.py — Multi-Sheet Excel Parser (Production-Ready)
 # Now includes unified LLM toggle control (local + global)
 # Fully aligned with ingestion_v2 pipeline and row_segmenter_v2
+# Supports embedded image extraction via DocumentVisualInterceptorV1
 # =============================================
 
 import pandas as pd
 import asyncio
 import os
+import re as _re
 import time
 from typing import Dict, Any, List, Optional
 
@@ -23,9 +25,37 @@ from app.config.ingestion_settings import ENABLE_LLM_NORMALIZATION  # ✅ Global
 # None  → Inherit from global flag
 LOCAL_LLM_TOGGLE = None
 
+# -------------------------------------------------------------------
+# Visual interception toggle (embedded images in Excel)
+# -------------------------------------------------------------------
+LOCAL_VISUAL_INTERCEPT_TOGGLE = True
+VISUAL_INTERCEPT_TIMEOUT_SEC = 60
+MAX_VISUAL_EXPLANATIONS = 24
+
 def is_llm_enabled() -> bool:
     """Returns the effective LLM toggle for this parser."""
     return ENABLE_LLM_NORMALIZATION if LOCAL_LLM_TOGGLE is None else LOCAL_LLM_TOGGLE
+
+
+# -------------------------------------------------------------------
+# CID CHARACTER RESOLUTION
+# -------------------------------------------------------------------
+_CID_UNICODE_MAP = {
+    133: "\u2026", 145: "\u2018", 146: "\u2019", 147: "\u201C",
+    148: "\u201D", 149: "\u2022", 150: "\u2013", 151: "\u2014",
+    160: "\u00A0", 169: "\u00A9", 174: "\u00AE", 176: "\u00B0",
+    188: "\u00BC", 189: "\u00BD", 190: "\u00BE",
+    210: "\u2013", 211: "\u2014", 212: "\u201C", 213: "\u201D",
+}
+_CID_PATTERN = _re.compile(r"\(cid:(\d+)\)")
+
+
+def resolve_cid_characters(text: str) -> str:
+    """Replace (cid:NNN) placeholders with their Unicode equivalents."""
+    def _replace(match):
+        cid = int(match.group(1))
+        return _CID_UNICODE_MAP.get(cid, "\uFFFD")
+    return _CID_PATTERN.sub(_replace, text)
 
 
 # -------------------------------------------------------------------
@@ -159,6 +189,54 @@ async def parse_excel(
     if not all_chunks:
         raise ValueError(f"[excel_parser_v2] No valid chunks extracted from {file_path}")
 
+    # ✅ Step 3b: CID character resolution on chunk texts
+    for chunk in all_chunks:
+        text = chunk.get("text", "")
+        if text and _CID_PATTERN.search(text):
+            chunk["text"] = resolve_cid_characters(text)
+
+    # ✅ Step 3c: Optional visual interception (embedded images, fail-open)
+    visual_texts: List[str] = []
+    if LOCAL_VISUAL_INTERCEPT_TOGGLE:
+        try:
+            from app.services.ingestion.media.document_visual_interceptor_v1 import (
+                DocumentVisualInterceptorV1,
+            )
+
+            ext = os.path.splitext(file_path)[1].lower().lstrip(".")
+            file_type = ext if ext in ("xls", "xlsx") else "xlsx"
+
+            interceptor = DocumentVisualInterceptorV1()
+            visual_texts = await asyncio.wait_for(
+                interceptor.intercept_explanations_only(
+                    file_path=file_path,
+                    parsed_output={},
+                    file_type=file_type,
+                    max_visuals=MAX_VISUAL_EXPLANATIONS,
+                ),
+                timeout=VISUAL_INTERCEPT_TIMEOUT_SEC,
+            )
+            if visual_texts:
+                log_info(
+                    f"[excel_parser_v2] Extracted {len(visual_texts)} visual explanations"
+                )
+                # Add visual explanations as additional chunks
+                for vt in visual_texts:
+                    if vt and vt.strip():
+                        all_chunks.append({
+                            "text": vt.strip(),
+                            "source_type": "excel_visual",
+                        })
+        except asyncio.TimeoutError:
+            log_warning(
+                f"[excel_parser_v2] Visual interception timed out after "
+                f"{VISUAL_INTERCEPT_TIMEOUT_SEC}s (non-fatal)"
+            )
+        except Exception as e:
+            log_warning(
+                f"[excel_parser_v2] Visual interception failed (non-fatal): {e}"
+            )
+
     # ✅ Step 4: Optional LLM normalization (batch-based)
     if is_llm_enabled():
         try:
@@ -181,10 +259,12 @@ async def parse_excel(
     return {
         "sheet_count": len(sheets),
         "chunks": all_chunks,
+        "visual_explanations": visual_texts,
         "source_type": "excel",
         "metadata": {
             "file_name": os.path.basename(file_path),
             "sheets": metadata_sheets,
             "parser": "excel_v2 (pandas/openpyxl)",
+            "visual_explanations_count": len(visual_texts),
         },
     }

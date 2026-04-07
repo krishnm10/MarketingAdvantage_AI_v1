@@ -464,9 +464,17 @@ class RAGPipeline:
             meta = chunk.get("metadata", {})
 
             # Include source metadata if available (improves LLM citations)
-            source_line = ""
-            if source := meta.get("source") or meta.get("file_name") or meta.get("url"):
-                source_line = f"  [Source: {source}]"
+            citation_parts = []
+            source = meta.get("source") or meta.get("file_name") or meta.get("url")
+            if source:
+                citation_parts.append(f"Source: {source}")
+            page_number = meta.get("page_number")
+            if isinstance(page_number, int) and page_number > 0:
+                citation_parts.append(f"Page: {page_number}")
+            section_title = meta.get("section_title")
+            if section_title:
+                citation_parts.append(f"Section: {section_title}")
+            source_line = f"  [{' | '.join(citation_parts)}]" if citation_parts else ""
 
             parts.append(f"[{i}] {text}{source_line}")
 

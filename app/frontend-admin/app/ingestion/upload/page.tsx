@@ -204,7 +204,7 @@ export default function UploadPage() {
             <div className="space-y-2">
               <Upload className="w-10 h-10 text-slate-500 mx-auto" />
               <p className="text-slate-300">Drop files here or click to browse</p>
-              <p className="text-slate-500 text-xs">Supports PDF, DOCX, TXT, CSV, JSON</p>
+              <p className="text-slate-500 text-xs">Supports PDF, DOCX, TXT, CSV, JSON, XLSX, XLS, XML, JPG, PNG, GIF, MP3, WAV, MP4</p>
             </div>
           )}
         </div>

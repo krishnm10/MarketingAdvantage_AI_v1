@@ -1,5 +1,5 @@
 # =============================================
-# text_preprocessor.py — Enterprise Document Text Pre-Processing Engine
+# text_preprocessor.py â€” Enterprise Document Text Pre-Processing Engine
 #
 # Shared pre-processing pipeline that ALL chunking strategies benefit from.
 # Called on raw extracted text BEFORE structural parsing or chunking.
@@ -7,20 +7,20 @@
 # Zero dependencies beyond stdlib. Zero DB writes. Pure functions.
 #
 # PRE-PROCESSING PIPELINE (in order):
-#   0. UNICODE_NORMALIZE   — NFKC normalization + control char stripping
-#   1. PAGE_BREAK_CLEANUP  — strip ---PAGE BREAK--- markers → double newline
-#   2. IMAGE_STUB_REMOVAL  — remove "The image is a real-world photograph" stubs
-#   3. LLM_PREFIX_STRIP    — strip LLM prompt prefixes ("The following content
+#   0. UNICODE_NORMALIZE   â€” NFKC normalization + control char stripping
+#   1. PAGE_BREAK_CLEANUP  â€” strip ---PAGE BREAK--- markers â†’ double newline
+#   2. IMAGE_STUB_REMOVAL  â€” remove "The image is a real-world photograph" stubs
+#   3. LLM_PREFIX_STRIP    â€” strip LLM prompt prefixes ("The following content
 #                            is extracted from a chart...")
-#   4. OCR_GARBLE_REMOVAL  — detect scrambled diagram OCR ("N N N O O O S A S")
-#   5. CHART_DUMP_CLEANUP  — detect raw chart axis number sequences
-#   6. HEADER_FOOTER_STRIP — remove repeated page headers/footers/page numbers
-#   7. TOC_BLEED_STRIP     — remove Table of Contents dot-leader lines
-#   8. WHITESPACE_NORMALIZE— collapse excessive whitespace/newlines
+#   4. OCR_GARBLE_REMOVAL  â€” detect scrambled diagram OCR ("N N N O O O S A S")
+#   5. CHART_DUMP_CLEANUP  â€” detect raw chart axis number sequences
+#   6. HEADER_FOOTER_STRIP â€” remove repeated page headers/footers/page numbers
+#   7. TOC_BLEED_STRIP     â€” remove Table of Contents dot-leader lines
+#   8. WHITESPACE_NORMALIZEâ€” collapse excessive whitespace/newlines
 #
 # CHUNK-LEVEL NOISE DETECTION:
-#   is_noise_chunk()       — returns True if chunk text is junk
-#   classify_chunk_noise() — returns (is_noise, noise_type, confidence)
+#   is_noise_chunk()       â€” returns True if chunk text is junk
+#   classify_chunk_noise() â€” returns (is_noise, noise_type, confidence)
 #
 # HOW TO USE:
 #   from app.core.chunking_stratagies.text_preprocessor import (
@@ -44,13 +44,13 @@ from typing import Tuple
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# COMPILED PATTERNS — one-time cost at module load
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# COMPILED PATTERNS â€” one-time cost at module load
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 # 1. Page break markers (various formats seen in production)
 _PAGE_BREAK_RE = re.compile(
-    r"[-—]{2,}\s*PAGE\s*BREAK\s*[-—]{2,}",
+    r"[-â€”]{2,}\s*PAGE\s*BREAK\s*[-â€”]{2,}",
     re.IGNORECASE,
 )
 
@@ -74,7 +74,7 @@ _LLM_PREFIX_RE = re.compile(
 )
 
 # 4. OCR garble: sequences of single chars separated by spaces
-#    e.g. "N N N O O O S A S S" — from diagram text that overlaps
+#    e.g. "N N N O O O S A S S" â€” from diagram text that overlaps
 _OCR_GARBLE_RE = re.compile(
     r"(?:^|\n)(?:[A-Z0-9]\s+){6,}[A-Z0-9]",
 )
@@ -89,8 +89,8 @@ _CHART_NUMBERS_RE = re.compile(
 #    Catches: "Page 14 of 92", "- 14 -", "Page 14 | Q3 Financials", standalone page nums
 _PAGE_NUMBER_RE = re.compile(
     r"(?:^|\n)\s*(?:"
-    r"[Pp]age\s+\d+\s*(?:of\s+\d+)?\s*(?:[|—–-]\s*[^\n]*)?"
-    r"|[-–—]\s*\d+\s*[-–—]"
+    r"[Pp]age\s+\d+\s*(?:of\s+\d+)?\s*(?:[|â€”â€“-]\s*[^\n]*)?"
+    r"|[-â€“â€”]\s*\d+\s*[-â€“â€”]"
     r"|\d+\s*[|]\s*[^\n]{0,80}"
     r")\s*(?:\n|$)",
 )
@@ -107,14 +107,26 @@ _CONTROL_CHARS_RE = re.compile(
     r"[\x00\xad\u200b\u200c\u200d\ufeff\u2028\u2029]",
 )
 
-# 9. Excessive whitespace
+# 9. Repeated percentage labels from chart axes / legends.
+_PERCENTAGE_SEQ_RE = re.compile(
+    r"(?:(?:\d{1,3}(?:\.\d+)?%)\s+){4,}\d{1,3}(?:\.\d+)?%"
+)
+
+# 10. Bare page numbers isolated between blank lines (slide footers).
+# Conservative pattern to avoid removing numbered lists in prose.
+_BARE_PAGE_NUM_RE = re.compile(
+    r"(?:^|\n\s*\n)\s*\d{1,3}\s*(?=\n\s*\n|$)",
+    re.MULTILINE,
+)
+
+# 11. Excessive whitespace
 _MULTI_NEWLINE_RE = re.compile(r"\n{4,}")
 _MULTI_SPACE_RE = re.compile(r"[ \t]{3,}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DOCUMENT-LEVEL PRE-PROCESSOR — call before chunking
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# DOCUMENT-LEVEL PRE-PROCESSOR â€” call before chunking
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def preprocess_document_text(text: str) -> str:
     """
@@ -134,8 +146,8 @@ def preprocess_document_text(text: str) -> str:
     original_len = len(text)
     modifications: list[str] = []
 
-    # 0. Unicode NFKC normalization — collapse ligatures (ﬁ→fi),
-    #    fullwidth chars (Ａ→A), and variant codepoints into canonical forms.
+    # 0. Unicode NFKC normalization â€” collapse ligatures (ï¬â†’fi),
+    #    fullwidth chars (ï¼¡â†’A), and variant codepoints into canonical forms.
     #    Without this, embeddings diverge for visually identical text.
     result = unicodedata.normalize("NFKC", text)
     if result != text:
@@ -147,7 +159,7 @@ def preprocess_document_text(text: str) -> str:
         modifications.append("CONTROL_CHARS")
     result = cleaned
 
-    # 1. Page break markers → double newline (section separator)
+    # 1. Page break markers â†’ double newline (section separator)
     result = _PAGE_BREAK_RE.sub("\n\n", result)
 
     # 2. Strip image description stubs entirely
@@ -157,7 +169,7 @@ def preprocess_document_text(text: str) -> str:
     result = _LLM_PREFIX_RE.sub("\n", result)
 
     # 4. Remove OCR garble sequences (single-char runs)
-    #    Replace with empty — these are unrecoverable without re-OCR
+    #    Replace with empty â€” these are unrecoverable without re-OCR
     result = _OCR_GARBLE_RE.sub("", result)
 
     # 5. Strip repeated page headers/footers and page numbers
@@ -170,6 +182,18 @@ def preprocess_document_text(text: str) -> str:
     cleaned = _TOC_LINE_RE.sub("\n", result)
     if cleaned != result:
         modifications.append("TOC_BLEED")
+    result = cleaned
+
+    # 6.5 Strip repeated percentage axis labels from chart OCR.
+    cleaned = _PERCENTAGE_SEQ_RE.sub(" ", result)
+    if cleaned != result:
+        modifications.append("PERCENT_SEQ")
+    result = cleaned
+
+    # 6.6 Strip isolated bare page-number footer lines.
+    cleaned = _BARE_PAGE_NUM_RE.sub("\n\n", result)
+    if cleaned != result:
+        modifications.append("BARE_PAGE_NUM")
     result = cleaned
 
     # 7. Normalize whitespace
@@ -190,9 +214,9 @@ def preprocess_document_text(text: str) -> str:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHUNK-LEVEL NOISE DETECTION — call per chunk after chunking
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# CHUNK-LEVEL NOISE DETECTION â€” call per chunk after chunking
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def is_noise_chunk(text: str, tokens: int = 0) -> bool:
     """
@@ -238,12 +262,12 @@ def classify_chunk_noise(text: str, tokens: int = 0) -> Tuple[bool, str, float]:
         (is_noise: bool, noise_type: str, confidence: float)
 
     noise_type values:
-        "clean"           — not noise
-        "too_short"       — < 8 tokens
-        "image_stub"      — OCR/vision placeholder text
-        "chart_numbers"   — raw chart axis/data dump
-        "garbled_ocr"     — scrambled diagram/overlay text
-        "number_soup"     — mostly numbers with no prose context
+        "clean"           â€” not noise
+        "too_short"       â€” < 8 tokens
+        "image_stub"      â€” OCR/vision placeholder text
+        "chart_numbers"   â€” raw chart axis/data dump
+        "garbled_ocr"     â€” scrambled diagram/overlay text
+        "number_soup"     â€” mostly numbers with no prose context
     """
     if not text or not text.strip():
         return True, "empty", 1.0
@@ -276,9 +300,9 @@ def classify_chunk_noise(text: str, tokens: int = 0) -> Tuple[bool, str, float]:
     return False, "clean", 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # INTERNAL DETECTORS
-# ─────────────────────────────────────────────────────────────────────────────
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 def _is_image_stub(text: str) -> bool:
     """Detect image-description placeholder text from OCR/vision pipelines."""
@@ -396,7 +420,7 @@ def _is_page_header_noise(text: str, tokens: int) -> bool:
     if not header_lines:
         return False
 
-    # Short chunk dominated by page headers → noise
+    # Short chunk dominated by page headers â†’ noise
     if header_lines / len(lines) > 0.50 and tokens < 30:
         return True
 
@@ -405,6 +429,10 @@ def _is_page_header_noise(text: str, tokens: int) -> bool:
 
 def _is_numeric_token(word: str) -> bool:
     """Check if a word is a number, percentage, currency, or year-range."""
+    # Percentage labels from charts: 35%, 3.7%
+    if re.match(r"^\d+(?:\.\d+)?%$", word.strip("(),.*")):
+        return True
+
     cleaned = word.strip("(),%$₹€£*")
     if not cleaned:
         return False
@@ -412,13 +440,12 @@ def _is_numeric_token(word: str) -> bool:
     if cleaned.replace(",", "").replace(".", "").isdigit():
         return True
     # Year ranges: 2018-19, 2023-24
-    if re.match(r"^\d{4}[-–]\d{2,4}$", cleaned):
+    if re.match(r"^\d{4}[-\u2013]\d{2,4}$", cleaned):
         return True
     # Decimal with commas: 1,234.56
     if re.match(r"^\d[\d,]*\.?\d*$", cleaned):
         return True
     return False
-
 
 def _has_sentence_structure(text: str) -> bool:
     """Check if text has at least one proper sentence (subject + verb pattern)."""

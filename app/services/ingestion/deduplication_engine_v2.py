@@ -51,6 +51,30 @@ from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 from app.utils.logger import log_info, log_warning
 
 
+def _build_gci_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep GCI metadata small and citation-relevant.
+    """
+    meta = chunk.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+
+    out: Dict[str, Any] = {}
+    page_number = meta.get("page_number")
+    if isinstance(page_number, int) and page_number > 0:
+        out["first_seen_page"] = page_number
+
+    section_title = meta.get("section_title")
+    if section_title:
+        out["section_title"] = str(section_title)
+
+    heading_depth = meta.get("heading_depth")
+    if isinstance(heading_depth, int):
+        out["heading_depth"] = heading_depth
+
+    return out
+
+
 def _safe_env_int(key: str, default: int, min_value: int = 1) -> int:
     raw = os.getenv(key)
     if raw is None:
@@ -657,6 +681,7 @@ async def register_unique_chunks_in_gci(
             "business_id":       business_id,
             "first_seen_file_id": file_id,
             "source_type":       source_type or chunk.get("source_type"),
+            "meta_data":         _build_gci_metadata(chunk),
             "embedding_model":   embedding_model or chunk.get("embedding_model"),
             "occurrence_count":  1,
             "created_at":        now,

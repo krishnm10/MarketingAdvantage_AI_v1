@@ -22,6 +22,8 @@ PARSER_MAP = {
     "pdf":  parse_pdf,
     "docx": parse_docx,
     "txt":  parse_text,
+    "md":   parse_text,
+    "markdown": parse_text,
     "json": parse_json,
     "csv":  parse_csv,
     "xlsx": parse_excel,

@@ -1,7 +1,14 @@
 from logging.config import fileConfig
+import os
+import sys
 from sqlalchemy import engine_from_config, pool
 from sqlalchemy import create_engine
 from alembic import context
+
+ALEMBIC_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.abspath(os.path.join(ALEMBIC_DIR, ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 from app.db.session_v2 import DATABASE_URL
 from app.db.base import Base  # Ensure Base imports all models

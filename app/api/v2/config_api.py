@@ -132,6 +132,10 @@ _VALID_CHUNKING_STRATEGIES = {
     "document_aware",
 }
 
+_VALID_AI_PROFILES = {"cpu", "gpu", "api", "dist"}
+_VALID_VISION_API_PROVIDERS = {"openai", "anthropic", "google"}
+_VALID_VISION_QUANTIZE = {"none", "4bit", "8bit"}
+
 
 def _mask(key: str, val: str) -> str:
     """Return masked value for sensitive keys."""
@@ -197,6 +201,18 @@ async def update_config(
             value = str(payload.updates[key]).strip().lower()
             if value not in _VALID_CHUNKING_STRATEGIES:
                 invalid_values[key] = value
+        if key == "AI_PROFILE":
+            value = str(payload.updates[key]).strip().lower()
+            if value not in _VALID_AI_PROFILES:
+                invalid_values[key] = value
+        if key == "VISION_API_PROVIDER":
+            value = str(payload.updates[key]).strip().lower()
+            if value not in _VALID_VISION_API_PROVIDERS:
+                invalid_values[key] = value
+        if key == "VISION_QUANTIZE":
+            value = str(payload.updates[key]).strip().lower()
+            if value not in _VALID_VISION_QUANTIZE:
+                invalid_values[key] = value
 
     if blocked:
         raise HTTPException(
@@ -204,13 +220,19 @@ async def update_config(
             detail=f"Invalid key names: {blocked}",
         )
     if invalid_values:
-        valid = ", ".join(sorted(_VALID_CHUNKING_STRATEGIES))
+        valid_hints = {
+            "CHUNKING_STRATEGY": ", ".join(sorted(_VALID_CHUNKING_STRATEGIES)),
+            "AI_PROFILE": ", ".join(sorted(_VALID_AI_PROFILES)),
+            "VISION_API_PROVIDER": ", ".join(sorted(_VALID_VISION_API_PROVIDERS)),
+            "VISION_QUANTIZE": ", ".join(sorted(_VALID_VISION_QUANTIZE)),
+        }
+        detail_parts = [f"Invalid config values: {invalid_values}."]
+        for k in invalid_values:
+            if k in valid_hints:
+                detail_parts.append(f"Valid {k}: {valid_hints[k]}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Invalid config values: {invalid_values}. "
-                f"Valid CHUNKING_STRATEGY values: {valid}"
-            ),
+            detail=" ".join(detail_parts),
         )
 
     # Read old values for audit diff BEFORE writing
@@ -287,3 +309,74 @@ async def get_raw_value(
     if key not in raw:
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found in .env")
     return {"key": key, "value": raw[key]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VISION ENCODER STATUS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_package(name: str) -> bool:
+    """Check if a Python package is importable."""
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+@router.get("/vision-status")
+async def get_vision_status(
+    user=Depends(require_role("admin")),
+):
+    """
+    Return the current Multimodal Vision Encoder status:
+    installed packages, active profile, and model info.
+    """
+    raw = _parse_env(_ENV_PATH)
+    profile = raw.get("AI_PROFILE", os.getenv("AI_PROFILE", "cpu"))
+
+    # Check key packages
+    cpu_pkgs = {
+        "transformers": _check_package("transformers"),
+        "qwen_vl_utils": _check_package("qwen_vl_utils"),
+        "torch": _check_package("torch"),
+        "moondream": _check_package("moondream"),
+    }
+    gpu_pkgs = {
+        **cpu_pkgs,
+        "bitsandbytes": _check_package("bitsandbytes"),
+        "flash_attn": _check_package("flash_attn"),
+    }
+    api_pkgs = {
+        "httpx": _check_package("httpx"),
+    }
+
+    # Determine if CUDA is available
+    cuda_available = False
+    if cpu_pkgs["torch"]:
+        try:
+            import torch
+            cuda_available = torch.cuda.is_available()
+        except Exception:
+            pass
+
+    return {
+        "ai_profile": profile,
+        "cpu_packages_installed": all([cpu_pkgs["transformers"], cpu_pkgs["torch"]]),
+        "gpu_packages_installed": all([gpu_pkgs["transformers"], gpu_pkgs["torch"]]),
+        "api_packages_installed": api_pkgs["httpx"],
+        "cuda_available": cuda_available,
+        "packages": {
+            "cpu": cpu_pkgs,
+            "gpu": gpu_pkgs,
+            "api": api_pkgs,
+        },
+        "config": {
+            "vision_model_cpu": raw.get("VISION_MODEL_CPU", os.getenv("VISION_MODEL_CPU", "Qwen/Qwen2.5-VL-3B-Instruct")),
+            "vision_model_gpu": raw.get("VISION_MODEL_GPU", os.getenv("VISION_MODEL_GPU", "Qwen/Qwen2.5-VL-7B-Instruct")),
+            "vision_api_provider": raw.get("VISION_API_PROVIDER", os.getenv("VISION_API_PROVIDER", "openai")),
+            "vision_api_model": raw.get("VISION_API_MODEL", os.getenv("VISION_API_MODEL", "gpt-4o")),
+            "vision_quantize": raw.get("VISION_QUANTIZE", os.getenv("VISION_QUANTIZE", "4bit")),
+            "vision_flash_attention": raw.get("VISION_FLASH_ATTENTION", os.getenv("VISION_FLASH_ATTENTION", "true")),
+        },
+    }

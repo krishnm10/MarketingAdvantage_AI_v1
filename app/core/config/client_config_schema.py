@@ -77,10 +77,21 @@ class RerankerType(str, Enum):
 
 
 class ChunkStrategy(str, Enum):
-    RECURSIVE   = "recursive"    # semantic recursive splitting (default)
-    FIXED       = "fixed"        # fixed token size
-    SENTENCE    = "sentence"     # sentence boundary aware
-    PARAGRAPH   = "paragraph"    # paragraph boundary aware
+    RECURSIVE          = "recursive"          # semantic recursive splitting
+    SEMANTIC           = "semantic"           # alias for recursive
+    FIXED              = "fixed"              # fixed token size
+    SENTENCE           = "sentence"           # sentence boundary aware
+    PARAGRAPH          = "paragraph"          # paragraph boundary aware
+    OVERLAP            = "overlap"            # sliding window with overlap
+    RECURSIVE_OVERLAP  = "recursive_overlap"  # recursive + overlap hybrid
+    STRUCTURE_AWARE    = "structure_aware"     # heading/section aware
+    SMART_CHECK        = "smart_check"        # ML-assisted splitting
+    RUST               = "rust"               # high-perf Rust extension
+    ELITE              = "elite"              # elite v1
+    ELITE_V2           = "elite_v2"           # elite v2 with LLM features
+    DOCUMENT_AWARE     = "document_aware"     # document structure aware
+    ENTERPRISE_V2      = "enterprise_v2"      # enterprise v2
+    ENTERPRISE_V3      = "enterprise_v3"      # enterprise v3
 
 
 class SearchMode(str, Enum):
@@ -413,9 +424,19 @@ class DeduplicationConfig(BaseModel):
     )
 
 
+def _default_chunk_strategy() -> ChunkStrategy:
+    """Read CHUNKING_STRATEGY from env so .env drives the default."""
+    import os
+    raw = os.getenv("CHUNKING_STRATEGY", "semantic").strip().lower()
+    for member in ChunkStrategy:
+        if member.value == raw:
+            return member
+    return ChunkStrategy.SEMANTIC
+
+
 class ChunkConfig(BaseModel):
     """Text chunking settings per client."""
-    strategy:     ChunkStrategy = ChunkStrategy.RECURSIVE
+    strategy:     ChunkStrategy = Field(default_factory=_default_chunk_strategy)
     chunk_size:   int           = Field(512,  description="Max tokens per chunk.")
     chunk_overlap: int          = Field(64,   description="Overlap between consecutive chunks.")
     min_chunk_len: int          = Field(30,   description="Discard chunks shorter than this.")

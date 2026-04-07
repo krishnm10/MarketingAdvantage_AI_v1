@@ -37,7 +37,9 @@ from app.services.ingestion.deduplication_engine_v2 import (
     create_normalized_hash,
     register_unique_chunks_in_gci,   # ← NEW: post-dedup GCI commit
 )
-from app.utils.logger import log_info
+from app.utils.text_cleaner_v2 import clean_text
+from app.utils.logger import log_info, log_warning
+from app.core.chunking_stratagies.text_preprocessor import preprocess_document_text
 
 # ── Pluggable pipeline factory ────────────────────────────────────────
 from app.core.pipeline_factory import pipeline_factory
@@ -187,6 +189,167 @@ def _resolve_text(payload: dict) -> str:
         return ""
 
 
+def _normalize_chunk_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ensure each chunk carries a stable metadata payload used by DB + VectorDB.
+    """
+    metadata = chunk.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    reasoning = chunk.get("reasoning_ingestion")
+    if isinstance(reasoning, dict):
+        section_title = reasoning.get("section_title")
+        if section_title and "section_title" not in metadata:
+            metadata["section_title"] = str(section_title)
+
+        section_depth = reasoning.get("section_depth")
+        if isinstance(section_depth, int):
+            metadata.setdefault("section_depth", section_depth)
+            metadata.setdefault("heading_depth", section_depth)
+
+        content_type = reasoning.get("content_type")
+        if content_type and "content_type" not in metadata:
+            metadata["content_type"] = str(content_type)
+
+    page_number = chunk.get("page_number")
+    if isinstance(page_number, int) and page_number > 0:
+        metadata["page_number"] = page_number
+
+    chunk["metadata"] = metadata
+    return metadata
+
+
+def _compute_chunk_offsets(chunks: List[Dict[str, Any]], source_text: str) -> None:
+    """
+    Best-effort offset mapping in cleaned-text space.
+    """
+    if not source_text:
+        return
+
+    cleaned_source = clean_text(source_text)
+    if not cleaned_source:
+        return
+
+    cursor = 0
+    for chunk in chunks:
+        metadata = _normalize_chunk_metadata(chunk)
+        cleaned_chunk = (chunk.get("cleaned_text") or "").strip()
+        if not cleaned_chunk:
+            continue
+
+        idx = cleaned_source.find(cleaned_chunk, cursor)
+        if idx < 0:
+            idx = cleaned_source.find(cleaned_chunk)
+        if idx < 0:
+            continue
+
+        end = idx + len(cleaned_chunk)
+        metadata["chunk_position"] = {"start_char": idx, "end_char": end}
+        cursor = end
+
+
+def _assign_page_numbers_from_page_map(
+    chunks: List[Dict[str, Any]],
+    page_map: List[Dict[str, Any]],
+) -> None:
+    """
+    Best-effort page attribution with forward cursor bias for ordered chunks.
+    """
+    if not chunks or not page_map:
+        return
+
+    cleaned_pages: List[Tuple[int, str]] = []
+    for page in page_map:
+        pno = page.get("page_number")
+        if not isinstance(pno, int) or pno <= 0:
+            continue
+        ptxt = (page.get("cleaned_text") or "").strip()
+        cleaned_pages.append((pno, ptxt))
+
+    if not cleaned_pages:
+        return
+
+    page_cursor = 0
+    max_lookahead = 3
+
+    for chunk in chunks:
+        ctext = (chunk.get("cleaned_text") or "").strip()
+        if not ctext:
+            continue
+
+        prefix = ctext[:160]
+        suffix = ctext[-160:] if len(ctext) > 160 else ctext
+
+        best_page = None
+        best_score = -1.0
+
+        start = max(0, page_cursor - 1)
+        stop = min(len(cleaned_pages), page_cursor + max_lookahead + 1)
+        for idx in range(start, stop):
+            page_no, page_text = cleaned_pages[idx]
+            if not page_text:
+                continue
+
+            score = 0.0
+            if ctext in page_text:
+                score = 1.0
+            elif prefix and prefix in page_text:
+                score = 0.9
+            elif suffix and suffix in page_text:
+                score = 0.8
+            else:
+                chunk_tokens = ctext.split()
+                page_tokens = page_text.split()
+                if chunk_tokens and page_tokens:
+                    sample = set(chunk_tokens[:24])
+                    overlap = sum(1 for t in page_tokens if t in sample)
+                    score = overlap / max(1, len(sample))
+
+            if score > best_score:
+                best_score = score
+                best_page = (idx, page_no)
+
+        if best_page and best_score >= 0.08:
+            page_cursor = max(page_cursor, best_page[0])
+            chunk["page_number"] = best_page[1]
+            _normalize_chunk_metadata(chunk)["page_number"] = best_page[1]
+
+
+def _assign_structure_parent_offsets(chunks: List[Dict[str, Any]]) -> None:
+    """
+    For structure-aware chunks, assign parent offsets per section heading.
+    The first chunk in a section acts as the parent anchor.
+    """
+    if not chunks:
+        return
+
+    parent_by_section: Dict[Tuple[str, int], int] = {}
+    for idx, chunk in enumerate(chunks):
+        reasoning = chunk.get("reasoning_ingestion")
+        if not isinstance(reasoning, dict):
+            continue
+
+        strategy = str(reasoning.get("chunking_strategy") or "").strip().lower()
+        if strategy != "structure_aware":
+            continue
+
+        section_title = str(reasoning.get("section_title") or "").strip()
+        if not section_title:
+            continue
+
+        section_depth_raw = reasoning.get("section_depth")
+        section_depth = section_depth_raw if isinstance(section_depth_raw, int) else 0
+        section_key = (section_title, section_depth)
+
+        parent_idx = parent_by_section.get(section_key)
+        if parent_idx is None:
+            parent_by_section[section_key] = idx
+            chunk["parent_row_offset"] = None
+        else:
+            chunk["parent_row_offset"] = parent_idx
+
+
 def _resolve_item_text(item: Any) -> Optional[str]:
     """
     Resolve text from a single multi-item entry (RSS, API, web, etc.).
@@ -296,7 +459,22 @@ async def _chunk_text_with_strategy(
 ) -> List[Dict[str, Any]]:
     """
     Strategy-aware chunking entrypoint.
+
+    Centralised quality gate: preprocess_document_text() runs here BEFORE
+    any strategy touches the text.  This guarantees page-break cleanup,
+    OCR garble removal, image-stub stripping, LLM prefix removal, and
+    whitespace normalisation for EVERY source type (PDF, DOCX, RSS, API,
+    Web-scrape, etc.) and EVERY chunking strategy — even ones added in
+    the future that forget to call the preprocessor themselves.
+
+    The preprocessor is idempotent, so strategies that also call it
+    internally (semantic, structure_aware, overlap, etc.) are unaffected.
     """
+    # ── Centralised pre-processing — quality & integrity gate ─────────
+    text = preprocess_document_text(text or "")
+    if not text.strip():
+        return []
+
     strategy = (strategy_override or _resolve_chunking_strategy(pipeline)).lower()
     chunker = get_chunker(strategy)
     return await chunker.chunk(
@@ -573,8 +751,13 @@ def _looks_like_visual_content(text: str) -> bool:
     """
     Heuristic detector for charts, graphs, tables, numeric-heavy visuals.
     ADDITIVE ONLY — no side effects.
+    Skips text that was already processed by VisualExplainerCPU.
     """
     if not text or not isinstance(text, str) or len(text) < 80:
+        return False
+
+    # Already has a semantic analysis section — skip re-processing
+    if "--- Semantic Analysis ---" in text:
         return False
 
     digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
@@ -608,10 +791,23 @@ async def _explain_visual_with_llm(raw_text: str) -> str:
         "Do NOT repeat axis labels, raw numbers, or dump percentages.\n\n"
         f"Content:\n{raw_text}\n\nExplanation:"
     )
+
+    # Sentinel phrases that indicate the LLM echoed the prompt instead of answering
+    _PROMPT_SENTINEL = "the following content is extracted from a chart"
+
     try:
         result = await rewrite_batch([prompt])
         if result and isinstance(result, list):
-            return result[0].strip()
+            explanation = result[0].strip()
+            # Guard: reject if the LLM echoed the prompt back
+            if not explanation:
+                return ""
+            if _PROMPT_SENTINEL in explanation.lower():
+                return ""
+            # Reject if explanation is just a short rephrasing (<30 chars)
+            if len(explanation) < 30:
+                return ""
+            return explanation
     except Exception:
         pass
     return ""
@@ -1237,6 +1433,18 @@ class IngestionServiceV2:
             file_id=str(file_id),
         )
 
+        # Normalize metadata for every chunk, then enrich offsets/page citations.
+        for ch in chunks:
+            _normalize_chunk_metadata(ch)
+
+        source_text_for_offsets = _resolve_text(parsed_payload)
+        if source_text_for_offsets:
+            _compute_chunk_offsets(chunks, source_text_for_offsets)
+
+        page_map = parsed_payload.get("page_map")
+        if isinstance(page_map, list) and page_map:
+            _assign_page_numbers_from_page_map(chunks, page_map)
+
         if not chunks:
             log_info(f"[IngestionV2] No chunks to ingest for {file_id}")
             return
@@ -1339,6 +1547,8 @@ class IngestionServiceV2:
 
                 all_chunks_for_storage.append(chunk)
 
+        _assign_structure_parent_offsets(all_chunks_for_storage)
+
         if all_chunks_for_storage:
             await IngestionServiceV2._insert_chunks(
                 db, file_id, business_id, all_chunks_for_storage
@@ -1367,6 +1577,8 @@ class IngestionServiceV2:
             )
             await IngestionServiceV2.embed_and_store(
                 file_id, business_id, file_type, chunks_to_embed,
+                file_name=file_record.file_name,
+                source_url=file_record.source_url,
                 pipeline=pipeline,   # FIX-B4: pass pre-resolved pipeline — eliminates 4th _get_pipeline()
                 db=db,               # FIX-B4: pass caller's session — eliminates redundant async_session()
                 skip_presence_check=True,
@@ -1803,7 +2015,7 @@ class IngestionServiceV2:
         FIX:
           Use sqlalchemy.text() with hardcoded column names.
           text() bypasses ORM mapper column filtering entirely.
-          All 18 columns are explicitly named — no silent drops possible.
+          All target columns are explicitly named — no silent drops possible.
           JSON fields serialized with json.dumps() + CAST(:x AS jsonb).
           CONSTRAINT GUARANTEE: pre-insert check ensures is_duplicate=True
           always has at least one of duplicate_of or similarity_score set.
@@ -1826,18 +2038,18 @@ class IngestionServiceV2:
 
 
         
-        # ── Explicit text() SQL — all 18 columns, no ORM mapper filtering ──
+        # ── Explicit text() SQL — full column list, no ORM mapper filtering ──
         from sqlalchemy import text as sa_text
         stmt = sa_text("""
             INSERT INTO ingested_content (
                 id, file_id, business_id, chunk_index,
-                text, cleaned_text, tokens, source_type,
+                text, cleaned_text, tokens, source_type, page_number, parent_chunk_id,
                 meta_data, confidence, semantic_hash, global_content_id,
                 reasoning_ingestion, is_duplicate, duplicate_of,
                 similarity_score, duplicate_percentage, created_at, updated_at
             ) VALUES (
                 :id, :file_id, :business_id, :chunk_index,
-                :text, :cleaned_text, :tokens, :source_type,
+                :text, :cleaned_text, :tokens, :source_type, :page_number, :parent_chunk_id,
                 CAST(:meta_data AS jsonb), :confidence, :semantic_hash,
                 :global_content_id,
                 CAST(:reasoning_ingestion AS jsonb), :is_duplicate,
@@ -1910,11 +2122,25 @@ class IngestionServiceV2:
                         for chunk_ref in l3_hash_to_chunks[row_hash]:
                             chunk_ref["duplicate_of"] = str(row_uuid)
 
+        row_ids = [str(uuid.uuid4()) for _ in chunks]
         all_rows: list = []   # accumulate all param dicts; sent as single executemany
         for i, c in enumerate(chunks):
             is_dup   = bool(c.get("is_duplicate", False))
             dup_of   = c.get("duplicate_of")
             sim_scr  = c.get("similarity_score")
+            metadata = c.get("metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            page_number = c.get("page_number")
+            if not isinstance(page_number, int):
+                page_number = metadata.get("page_number")
+            if not isinstance(page_number, int) or page_number <= 0:
+                page_number = None
+            parent_row_offset = c.get("parent_row_offset")
+            parent_chunk_id = None
+            if isinstance(parent_row_offset, int):
+                if 0 <= parent_row_offset < len(row_ids) and parent_row_offset != i:
+                    parent_chunk_id = row_ids[parent_row_offset]
 
             if is_dup:
                 if sim_scr is not None:
@@ -1940,6 +2166,8 @@ class IngestionServiceV2:
                     "origin_authority":      "primary_source",
                     "extraction_confidence": 0.90,
                     "granularity":           "tactical_detail",
+                    "sentiment_bucket":      "neutral",
+                    "sentiment_confidence":  0.50,
                     "data_lineage_id":       c.get("semantic_hash") or "",
                     "potentially_regulated": False,
                     "extraction_timestamp":  now.isoformat() + "Z",
@@ -1952,6 +2180,8 @@ class IngestionServiceV2:
                     "origin_authority":      "primary_source",
                     "extraction_confidence": 0.90,
                     "granularity":           "tactical_detail",
+                    "sentiment_bucket":      "neutral",
+                    "sentiment_confidence":  0.50,
                     "data_lineage_id":       c.get("semantic_hash") or "",
                     "potentially_regulated": False,
                     "extraction_timestamp":  now.isoformat() + "Z",
@@ -1960,7 +2190,7 @@ class IngestionServiceV2:
                     reasoning.setdefault(k, v)
 
             all_rows.append({
-                "id":                str(uuid.uuid4()),
+                "id":                row_ids[i],
                 "file_id":           str(file_id),
                 "business_id":       str(business_id) if business_id else None,
                 "chunk_index":       start_index + i,
@@ -1968,7 +2198,9 @@ class IngestionServiceV2:
                 "cleaned_text":      c.get("cleaned_text") or c.get("cleaned"),
                 "tokens":            int(c.get("tokens") or 0),
                 "source_type":       c.get("source_type"),
-                "meta_data":         _json.dumps(c.get("metadata") or {}),
+                "page_number":       page_number,
+                "parent_chunk_id":   parent_chunk_id,
+                "meta_data":         _json.dumps(metadata),
                 "confidence":        float(c.get("confidence") or 1.0),
                 "semantic_hash":     c.get("semantic_hash"),
                 "global_content_id": c.get("global_content_id"),
@@ -2016,6 +2248,8 @@ class IngestionServiceV2:
         business_id,
         file_type,
         chunks,
+        file_name: Optional[str] = None,
+        source_url: Optional[str] = None,
         pipeline=None,      # FIX-B4-3: accept pre-resolved pipeline from _run_pipeline
         db=None,            # FIX-B4-4: accept caller's session — no redundant pool open
         skip_presence_check: bool = False,
@@ -2230,6 +2464,8 @@ class IngestionServiceV2:
                 _file_id=file_id,
                 _business_id=business_id,
                 _file_type=file_type,
+                _file_name=file_name,
+                _source_url=source_url,
             ) -> None:
                 async with batch_semaphore:
                     b_texts = [
@@ -2242,15 +2478,38 @@ class IngestionServiceV2:
                         for c in batch
                     ]
                     b_ids  = [c.get("semantic_hash") for c in batch]
-                    b_meta = [
-                        {
-                            "file_id":       str(_file_id),
-                            "business_id":   str(_business_id) if _business_id else "",
-                            "source_type":   str(_file_type) if _file_type else "",
+                    b_meta = []
+                    for c in batch:
+                        meta = c.get("metadata")
+                        if not isinstance(meta, dict):
+                            meta = {}
+                        md = {
+                            "file_id": str(_file_id),
+                            "business_id": str(_business_id) if _business_id else "",
+                            "source_type": str(_file_type) if _file_type else "",
                             "semantic_hash": str(c.get("semantic_hash", "")),
+                            "file_name": str(_file_name) if _file_name else "",
+                            "source": str(_file_name) if _file_name else "",
+                            "url": str(_source_url) if _source_url else "",
                         }
-                        for c in batch
-                    ]
+                        page_number = meta.get("page_number")
+                        if isinstance(page_number, int) and page_number > 0:
+                            md["page_number"] = page_number
+                        section_title = meta.get("section_title")
+                        if section_title:
+                            md["section_title"] = str(section_title)
+                        heading_depth = meta.get("heading_depth")
+                        if isinstance(heading_depth, int):
+                            md["heading_depth"] = heading_depth
+                        chunk_position = meta.get("chunk_position")
+                        if isinstance(chunk_position, dict):
+                            start_char = chunk_position.get("start_char")
+                            end_char = chunk_position.get("end_char")
+                            if isinstance(start_char, int):
+                                md["chunk_start_char"] = start_char
+                            if isinstance(end_char, int):
+                                md["chunk_end_char"] = end_char
+                        b_meta.append(md)
             
                     # Embed — FIX-B4-1: explicit default captures preserved
                     b_emb: List = await _loop.run_in_executor(
