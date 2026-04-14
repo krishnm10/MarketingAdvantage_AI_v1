@@ -55,6 +55,14 @@ from app.services.ingestion.deduplication_engine_v2 import create_normalized_has
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info, log_warning
 from app.core.chunking_stratagies.chunk_quality_scorer import score_chunk_quality
+
+# Tokenization factory — resolved lazily so heavy backends (HuggingFace, spaCy)
+# are only imported when first used. Falls back to whitespace automatically.
+try:
+    from app.core.tokenization.factory import count_tokens as _factory_count_tokens
+    _USE_FACTORY_TOKENIZER = True
+except Exception:  # pragma: no cover
+    _USE_FACTORY_TOKENIZER = False
 from app.core.chunking_stratagies.text_preprocessor import (
     classify_chunk_noise,
     is_noise_chunk,
@@ -89,7 +97,19 @@ _SENTENCE_SPLITTER: re.Pattern = re.compile(r"(?<=[.!?]) +")
 # ─────────────────────────────────────────────────────────────────────────────
 
 def count_tokens(text: str) -> int:
-    """Approximate token count via whitespace split. O(N), allocation-free."""
+    """
+    Token count using the configured tokenizer backend (DEFAULT_TOKENIZER_BACKEND
+    env var: huggingface | spacy | nltk | whitespace).
+
+    All chunking strategies (semantic, recursive, overlap, recursive_overlap,
+    rust, smart_check, structure_aware, document_aware) import this function,
+    so changing DEFAULT_TOKENIZER_BACKEND in .env upgrades measurement accuracy
+    for every strategy simultaneously.
+
+    Falls back to whitespace word-split when no backend is available.
+    """
+    if _USE_FACTORY_TOKENIZER:
+        return _factory_count_tokens(text)
     return len(text.split())
 
 

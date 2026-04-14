@@ -83,6 +83,7 @@ def _ensure_default_chunkers() -> None:
     from app.core.chunking_stratagies import segmenter_structure_aware  # noqa: F401
     from app.core.chunking_stratagies import segmenter_elite_v1  # noqa: F401
     from app.core.chunking_stratagies import segmenter_elite_v2  # noqa: F401
+    from app.services.ingestion import token_chunking_service  # noqa: F401
 
     _DEFAULTS_REGISTERED = True
 

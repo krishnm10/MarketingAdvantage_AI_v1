@@ -92,6 +92,7 @@ class ChunkStrategy(str, Enum):
     DOCUMENT_AWARE     = "document_aware"     # document structure aware
     ENTERPRISE_V2      = "enterprise_v2"      # enterprise v2
     ENTERPRISE_V3      = "enterprise_v3"      # enterprise v3
+    TOKEN_AWARE        = "token_aware"        # token-count-aware chunking
 
 
 class SearchMode(str, Enum):

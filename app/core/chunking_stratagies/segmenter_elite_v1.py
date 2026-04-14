@@ -283,15 +283,31 @@ def _elite_tokenize_sentences(text: str) -> List[str]:
 # Calibrated against cl100k_base (GPT-4 / text-embedding-ada-002).
 # English prose: 1 word ≈ 1.3 tokens on average.
 # Naive len(text.split()) underestimates by ~23%.
+#
+# When a real tokenizer backend is configured (DEFAULT_TOKENIZER_BACKEND),
+# count_tokens() (imported from segmenter_v2) delegates to the factory.
+# This function now uses count_tokens() for consistency across ALL strategies,
+# falling back to the original heuristic only if count_tokens is unavailable.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _estimate_tokens(text: str) -> int:
     """
-    Token estimation calibrated for embedding models.
-    ±10% accuracy for English prose (vs ±30% for word count).
+    Token estimation — delegates to the centralised count_tokens() from
+    segmenter_v2 which respects DEFAULT_TOKENIZER_BACKEND.
+
+    When backend is 'whitespace' (default), falls back to the original
+    calibrated heuristic for ±10% accuracy (vs ±30% for naive word count).
     """
     if not text:
         return 0
+
+    # Use the centralised tokenizer (factory-backed) when available.
+    # count_tokens is already imported from segmenter_v2 at module top.
+    from app.core.chunking_stratagies.segmenter_v2 import _USE_FACTORY_TOKENIZER
+    if _USE_FACTORY_TOKENIZER:
+        return count_tokens(text)
+
+    # Fallback: original calibrated heuristic (whitespace + subword estimation)
     words = text.split()
     word_count = len(words)
     if word_count == 0:

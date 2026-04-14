@@ -97,7 +97,7 @@ const SECTIONS: ConfigSection[] = [
     keys: [
       { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number" },
       { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number" },
-      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware"] },
+      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "token_aware"] },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean" },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean" },
@@ -121,6 +121,34 @@ const SECTIONS: ConfigSection[] = [
       { key: "PHANTOM_UPSERT_BATCH_SIZE", label: "Upsert Batch Size", type: "number" },
       { key: "PHANTOM_INGEST_WORKERS", label: "Ingest Workers", type: "number" },
       { key: "PHANTOM_BLOOM_CAPACITY", label: "Bloom Filter Capacity", type: "number" },
+    ],
+  },
+
+  /* ────────────────── TOKENIZATION ENGINE ────────────────── */
+  {
+    category: "pipeline",
+    title: "Tokenization Engine",
+    description: "Token-aware chunking backend — controls how text is split into tokens for accurate chunk sizing",
+    icon: Brain,
+    gradient: "from-sky-500 to-indigo-600 shadow-sky-600/20",
+    keys: [
+      { key: "DEFAULT_TOKENIZER_BACKEND", label: "Tokenizer Backend", type: "select", options: ["whitespace", "huggingface", "spacy", "nltk"] },
+      { key: "CHUNK_SIZE", label: "Token Chunk Size", type: "number", placeholder: "512" },
+      { key: "CHUNK_OVERLAP", label: "Token Chunk Overlap", type: "number", placeholder: "64" },
+      { key: "MIN_CHUNK_TOKENS", label: "Min Chunk Tokens", type: "number", placeholder: "30" },
+      { key: "HF_TOKENIZER_MODEL", label: "HuggingFace Tokenizer Model", type: "select", options: [
+        "bert-base-multilingual-cased",
+        "ai4bharat/indic-bert",
+        "bert-base-uncased",
+        "xlm-roberta-base",
+        "google/muril-base-cased",
+      ]},
+      { key: "SPACY_MODEL", label: "spaCy Language Model", type: "select", options: [
+        "en_core_web_sm",
+        "en_core_web_lg",
+        "xx_sent_ud_sm",
+        "xx_ent_wiki_sm",
+      ]},
     ],
   },
 

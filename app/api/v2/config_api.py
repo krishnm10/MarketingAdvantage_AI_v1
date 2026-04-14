@@ -130,7 +130,10 @@ _VALID_CHUNKING_STRATEGIES = {
     "rust",
     "structure_aware",
     "document_aware",
+    "token_aware",
 }
+
+_VALID_TOKENIZER_BACKENDS = {"whitespace", "huggingface", "spacy", "nltk"}
 
 _VALID_AI_PROFILES = {"cpu", "gpu", "api", "dist"}
 _VALID_VISION_API_PROVIDERS = {"openai", "anthropic", "google"}
@@ -201,6 +204,10 @@ async def update_config(
             value = str(payload.updates[key]).strip().lower()
             if value not in _VALID_CHUNKING_STRATEGIES:
                 invalid_values[key] = value
+        if key == "DEFAULT_TOKENIZER_BACKEND":
+            value = str(payload.updates[key]).strip().lower()
+            if value not in _VALID_TOKENIZER_BACKENDS:
+                invalid_values[key] = value
         if key == "AI_PROFILE":
             value = str(payload.updates[key]).strip().lower()
             if value not in _VALID_AI_PROFILES:
@@ -222,6 +229,7 @@ async def update_config(
     if invalid_values:
         valid_hints = {
             "CHUNKING_STRATEGY": ", ".join(sorted(_VALID_CHUNKING_STRATEGIES)),
+            "DEFAULT_TOKENIZER_BACKEND": ", ".join(sorted(_VALID_TOKENIZER_BACKENDS)),
             "AI_PROFILE": ", ".join(sorted(_VALID_AI_PROFILES)),
             "VISION_API_PROVIDER": ", ".join(sorted(_VALID_VISION_API_PROVIDERS)),
             "VISION_QUANTIZE": ", ".join(sorted(_VALID_VISION_QUANTIZE)),
