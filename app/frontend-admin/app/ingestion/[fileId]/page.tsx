@@ -196,9 +196,13 @@ export default function FileDetailPage() {
     .filter(([, members]) => members.length > 1)
     .map(([semanticHash, members]) => ({ semanticHash, members: members.sort((a, b) => a.chunk_index - b.chunk_index) }))
     .sort((a, b) => b.members.length - a.members.length);
+
+  const l1RepeatIds = new Set<string>();
+  l1Groups.forEach(group => group.members.slice(1).forEach(member => l1RepeatIds.add(member.id)));
+
   const l1DuplicateCount = l1Groups.reduce((sum, group) => sum + Math.max(group.members.length - 1, 0), 0);
   const l2Duplicates = sortedChunks.filter((chunk) => chunk.is_duplicate && Boolean(chunk.global_content_id));
-  const l3Candidates = sortedChunks.filter((chunk) => chunk.is_duplicate && !chunk.global_content_id && !l1Groups.some((group) => group.members.slice(1).some((member) => member.id === chunk.id)));
+  const l3Candidates = sortedChunks.filter((chunk) => chunk.is_duplicate && !chunk.global_content_id && !l1RepeatIds.has(chunk.id));
 
   if (loading) {
     return <div className="flex justify-center gap-3 py-20 text-slate-500"><Loader2 className="h-5 w-5 animate-spin" /> Loading dedup inspector...</div>;
@@ -229,7 +233,7 @@ export default function FileDetailPage() {
     : [];
   const duplicateTableRows: DisplayRow[] = duplicateRows.length > 0
     ? duplicateRows.map((chunk) => {
-        const isL1Repeat = l1Groups.some((group) => group.members.slice(1).some((member) => member.id === chunk.id));
+        const isL1Repeat = l1RepeatIds.has(chunk.id);
         return {
           id: chunk.id,
           chunk_index: chunk.chunk_index,
@@ -254,7 +258,7 @@ export default function FileDetailPage() {
   const duplicateCoverage = file.total_chunks > 0 ? ((file.duplicate_chunks / file.total_chunks) * 100).toFixed(1) : "0.0";
   const duplicateDisplayRows: DisplayRow[] = duplicateRows.length > 0
     ? duplicateRows.map((chunk) => {
-        const isL1Repeat = l1Groups.some((group) => group.members.slice(1).some((member) => member.id === chunk.id));
+        const isL1Repeat = l1RepeatIds.has(chunk.id);
         return {
           id: chunk.id,
           chunk_index: chunk.chunk_index,
@@ -571,7 +575,7 @@ export default function FileDetailPage() {
                 </tr>
               ) : (
                 duplicateRows.map((chunk) => {
-                  const isL1Repeat = l1Groups.some((group) => group.members.slice(1).some((member) => member.id === chunk.id));
+                  const isL1Repeat = l1RepeatIds.has(chunk.id);
                   const duplicateType = isL1Repeat ? "L1 Exact Duplicate" : chunk.global_content_id ? "L2 GCI Duplicate" : "L3 Semantic Review";
                   const reference = chunk.global_content_id
                     ? `${shortId(chunk.global_content_id)} (${chunk.gci_occurrence_count ?? "n/a"})`
@@ -856,7 +860,7 @@ export default function FileDetailPage() {
             </thead>
             <tbody className="divide-y divide-slate-100">
               {sortedChunks.map((chunk) => {
-                const isL1Repeat = l1Groups.some((group) => group.members.slice(1).some((member) => member.id === chunk.id));
+                const isL1Repeat = l1RepeatIds.has(chunk.id);
                 const layer = isL1Repeat ? "L1 Exact" : chunk.is_duplicate && chunk.global_content_id ? "L2 GCI" : chunk.is_duplicate ? "L3 Review" : "Unique";
                 return (
                   <tr

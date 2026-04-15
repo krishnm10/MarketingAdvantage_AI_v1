@@ -808,8 +808,9 @@ async def _explain_visual_with_llm(raw_text: str) -> str:
             if len(explanation) < 30:
                 return ""
             return explanation
-    except Exception:
-        pass
+    except Exception as e:
+        # Log the exception to ensure visibility of LLM rate limits/timeouts
+        log_warning(f"[VisualLLM] Failed to generate visual explanation: {e}")
     return ""
 
 
@@ -2713,4 +2714,3 @@ class IngestionServiceV2:
         except Exception as e:
             log_info(f"[IngestionV2] Failed to update file status: {e}")
             await db.rollback()
-
