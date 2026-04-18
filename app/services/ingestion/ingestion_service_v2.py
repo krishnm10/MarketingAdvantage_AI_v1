@@ -13,7 +13,14 @@ import asyncio
 from collections import Counter
 from datetime import datetime
 from functools import lru_cache
+from threading import Lock as _threading_lock
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    from cachetools import TTLCache
+    _HAS_CACHETOOLS = True
+except ImportError:
+    _HAS_CACHETOOLS = False
 
 # ── FastAPI / SQLAlchemy ──────────────────────────────────────────────
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -408,7 +415,11 @@ def clear_ingestion_pipeline_cache() -> None:
     Clear ingestion-side pipeline resolver cache.
     Call this after config/env updates to avoid stale pipeline instances.
     """
-    _get_pipeline_for_client.cache_clear()
+    if _HAS_CACHETOOLS:
+        with _pipeline_cache_lock:
+            _pipeline_cache.clear()
+    else:
+        _get_pipeline_for_client.cache_clear()
     clear_chunker_cache()
     log_info("[IngestionV2] Cleared ingestion pipeline resolver cache")
 
@@ -509,46 +520,87 @@ async def _chunk_text_with_strategy(
 #   QDRANT_API_KEY         = ...
 # ============================================================
 
-@lru_cache(maxsize=16)
-def _get_pipeline_for_client(client_id: str):
-    """
-    Resolve a live AssembledPipeline for normalized client_id.
-    Config is read purely from environment variables — no JSON files.
-    Works identically in dev, staging, and production.
+# ── Pipeline-per-client cache ─────────────────────────────────────────
+# TTLCache (maxsize=128, ttl=600s) avoids pipeline rebuild storms when
+# >16 tenants hit concurrently, while still expiring stale entries.
+# Falls back to functools.lru_cache if cachetools is not installed.
+if _HAS_CACHETOOLS:
+    _pipeline_cache: TTLCache = TTLCache(maxsize=128, ttl=600)
+    _pipeline_cache_lock = _threading_lock()
 
-    PERF FIX: decorated with @lru_cache(maxsize=16).
-    Previously called 4× per file — once each in _run_pipeline,
-    _extract_chunks, _dedup_chunks, and _embed_and_store.
-    Each call re-read env vars, rebuilt config, and called
-    pipeline_factory.build() which constructs embedder + vectordb objects.
-    With cache: first call per client_id builds the pipeline,
-    subsequent calls return the cached object instantly.
-    maxsize=16 covers 16 distinct business_ids comfortably.
-    """
-    b = _business_env_prefix(client_id)
+    def _get_pipeline_for_client(client_id: str):
+        """
+        Resolve a live AssembledPipeline for normalized client_id.
+        Config is read purely from environment variables — no JSON files.
+        Works identically in dev, staging, and production.
 
-    vectordb_type = os.getenv(
-        f"MAI_{b.upper()}_VECTORDB",
-        os.getenv("MAI_VECTORDB", "chroma"),
-    ).lower()
+        Cached via TTLCache(maxsize=128, ttl=600).
+        Previously used @lru_cache(maxsize=16) which caused pipeline
+        rebuild storms with >16 concurrent tenants.
+        """
+        with _pipeline_cache_lock:
+            if client_id in _pipeline_cache:
+                return _pipeline_cache[client_id]
 
-    embedder_type = os.getenv(
-        f"MAI_{b.upper()}_EMBEDDER",
-        os.getenv("MAI_EMBEDDER", "ollama"),
-    ).lower()
+        b = _business_env_prefix(client_id)
 
-    llm_type = os.getenv(
-        f"MAI_{b.upper()}_LLM",
-        os.getenv("MAI_LLM", "ollama"),
-    ).lower()
+        vectordb_type = os.getenv(
+            f"MAI_{b.upper()}_VECTORDB",
+            os.getenv("MAI_VECTORDB", "chroma"),
+        ).lower()
 
-    config = _build_config_from_env(
-        client_id=client_id,
-        vectordb_type=vectordb_type,
-        embedder_type=embedder_type,
-        llm_type=llm_type,
-    )
-    return pipeline_factory.build(config)
+        embedder_type = os.getenv(
+            f"MAI_{b.upper()}_EMBEDDER",
+            os.getenv("MAI_EMBEDDER", "ollama"),
+        ).lower()
+
+        llm_type = os.getenv(
+            f"MAI_{b.upper()}_LLM",
+            os.getenv("MAI_LLM", "ollama"),
+        ).lower()
+
+        config = _build_config_from_env(
+            client_id=client_id,
+            vectordb_type=vectordb_type,
+            embedder_type=embedder_type,
+            llm_type=llm_type,
+        )
+        result = pipeline_factory.build(config)
+        with _pipeline_cache_lock:
+            _pipeline_cache[client_id] = result
+        return result
+
+else:
+    @lru_cache(maxsize=128)
+    def _get_pipeline_for_client(client_id: str):  # type: ignore[no-redef]
+        """
+        Resolve a live AssembledPipeline for normalized client_id.
+        Fallback: @lru_cache(maxsize=128) when cachetools is not installed.
+        """
+        b = _business_env_prefix(client_id)
+
+        vectordb_type = os.getenv(
+            f"MAI_{b.upper()}_VECTORDB",
+            os.getenv("MAI_VECTORDB", "chroma"),
+        ).lower()
+
+        embedder_type = os.getenv(
+            f"MAI_{b.upper()}_EMBEDDER",
+            os.getenv("MAI_EMBEDDER", "ollama"),
+        ).lower()
+
+        llm_type = os.getenv(
+            f"MAI_{b.upper()}_LLM",
+            os.getenv("MAI_LLM", "ollama"),
+        ).lower()
+
+        config = _build_config_from_env(
+            client_id=client_id,
+            vectordb_type=vectordb_type,
+            embedder_type=embedder_type,
+            llm_type=llm_type,
+        )
+        return pipeline_factory.build(config)
 
 
 def _get_pipeline(business_id: Optional[Any] = None):

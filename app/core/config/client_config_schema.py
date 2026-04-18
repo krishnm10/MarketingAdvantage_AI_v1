@@ -409,6 +409,10 @@ class RetrievalConfig(BaseModel):
     hybrid_alpha:         float                  = Field(
         0.7, description="Weight for semantic vs keyword. 1.0=semantic only, 0.0=keyword only."
     )
+    # HyDE — Hypothetical Document Embeddings (requires LLM to be configured)
+    enable_hyde:          bool                   = Field(
+        False, description="Generate a hypothetical answer to embed instead of the raw query."
+    )
 
 
 # ══════════════════════════════════════════════════════════════

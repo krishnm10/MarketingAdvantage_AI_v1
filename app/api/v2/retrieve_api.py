@@ -36,6 +36,10 @@ class RetrieveRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="Natural language question")
     intent: str = Field("answer", description="Retrieval intent: answer | explore | audit")
     top_k: Optional[int] = Field(None, ge=1, le=50, description="Override max results (default from policy)")
+    search_mode: str = Field("semantic", description="Search mode: semantic | hybrid | keyword")
+    enable_hyde: bool = Field(False, description="Enable HyDE query expansion (requires LLM)")
+    hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0, description="Semantic vs keyword weight (1.0=semantic, 0.0=keyword)")
+    similarity_threshold: float = Field(0.0, ge=0.0, le=1.0, description="Minimum similarity score filter")
 
 
 class SignalDetail(BaseModel):
@@ -60,6 +64,7 @@ class ResultItem(BaseModel):
 class RetrieveResponse(BaseModel):
     query: str
     intent: str
+    search_mode: str = "semantic"
     total_results: int
     total_dropped: int
     latency_ms: float
@@ -113,9 +118,41 @@ async def retrieve_query(
 
     start = time.perf_counter()
 
-    # 1. Embed query
+    # 1. Optional HyDE expansion — use LLM to generate hypothetical answer,
+    #    then embed that instead of the raw query for better retrieval.
+    embed_text = req.query
+    if req.enable_hyde:
+        try:
+            import os
+            llm_provider = os.getenv("MAI_LLM", "ollama").lower()
+            llm = None
+            if llm_provider == "ollama":
+                from app.core.llms.ollama_v1 import OllamaLLM
+                llm = OllamaLLM()
+            elif llm_provider == "openai":
+                from app.core.llms.openai_v1 import OpenAILLM
+                llm = OpenAILLM()
+            elif llm_provider == "groq":
+                from app.core.llms.groq_v1 import GroqLLM
+                llm = GroqLLM()
+
+            if llm is not None:
+                hyde_prompt = (
+                    "Write a short factual paragraph that would answer this question. "
+                    "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
+                    f"Question: {req.query}\n\nAnswer:"
+                )
+                resp = llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
+                text = (resp.text or "").strip()
+                if len(text) > 20:
+                    embed_text = text
+                    logger.info("[RetrieveAPI] HyDE: embedding hypothetical answer (%d chars)", len(text))
+        except Exception as e:
+            logger.warning("[RetrieveAPI] HyDE expansion failed, using raw query: %s", e)
+
+    # 2. Embed query
     try:
-        query_embedding = await _embed_in_thread(req.query)
+        query_embedding = await _embed_in_thread(embed_text)
     except Exception as e:
         logger.error(f"[RetrieveAPI] Embedding failed: {e}")
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
@@ -149,7 +186,57 @@ async def retrieve_query(
 
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
 
-    # 4. Build response
+    # 4. Optional hybrid/keyword re-ranking via BM25 + RRF
+    search_mode = req.search_mode.lower()
+    if search_mode in ("hybrid", "keyword") and ranked_results:
+        try:
+            from app.core.search.bm25_index import BM25Index
+            from app.core.search.rrf_fusion import reciprocal_rank_fusion
+
+            # Build BM25 index from the retrieved chunks
+            chunk_dicts = [
+                {"id": r.chunk_id, "text": r.text, "score": r.score, "metadata": {}}
+                for r in ranked_results
+            ]
+            bm25 = BM25Index()
+            bm25.build(chunk_dicts)
+            keyword_hits = bm25.search(req.query, k=len(ranked_results))
+            keyword_dicts = [
+                {"id": h.id, "text": h.text, "score": h.score, "metadata": h.metadata}
+                for h in keyword_hits
+            ]
+
+            if search_mode == "hybrid":
+                fused = reciprocal_rank_fusion(
+                    vector_hits=chunk_dicts,
+                    keyword_hits=keyword_dicts,
+                    alpha=req.hybrid_alpha,
+                    top_k=len(ranked_results),
+                )
+                # Re-order ranked_results based on RRF order
+                fused_order = {f.id: i for i, f in enumerate(fused)}
+                ranked_results.sort(
+                    key=lambda r: fused_order.get(r.chunk_id, 999)
+                )
+                logger.info(
+                    "[RetrieveAPI] Hybrid RRF applied | alpha=%.2f | %d results",
+                    req.hybrid_alpha, len(ranked_results),
+                )
+            else:
+                # keyword-only: re-order by BM25 rank
+                bm25_order = {h.id: i for i, h in enumerate(keyword_hits)}
+                ranked_results.sort(
+                    key=lambda r: bm25_order.get(r.chunk_id, 999)
+                )
+                logger.info("[RetrieveAPI] Keyword BM25 re-rank applied | %d results", len(ranked_results))
+        except Exception as e:
+            logger.warning("[RetrieveAPI] Hybrid/keyword search failed, using semantic order: %s", e)
+
+    # 5. Apply similarity_threshold filter
+    if req.similarity_threshold > 0:
+        ranked_results = [r for r in ranked_results if r.score >= req.similarity_threshold]
+
+    # 6. Build response
     results: List[ResultItem] = []
     for idx, r in enumerate(ranked_results, start=1):
         signals = None
@@ -184,6 +271,7 @@ async def retrieve_query(
     return RetrieveResponse(
         query=req.query,
         intent=req.intent,
+        search_mode=search_mode,
         total_results=len(results),
         total_dropped=len(dropped),
         latency_ms=elapsed_ms,

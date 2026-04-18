@@ -85,8 +85,13 @@ def _build_backend(backend: str) -> BaseTokenizer:
 
 
 def _default_backend() -> str:
-    """Resolve default backend from env var."""
-    return os.getenv("DEFAULT_TOKENIZER_BACKEND", "whitespace").strip().lower()
+    """Resolve default backend from env var.
+
+    Default is 'huggingface' for accurate subword tokenization.
+    Falls back to 'whitespace' automatically if HuggingFace is unavailable
+    (handled by _build_backend's graceful fallback).
+    """
+    return os.getenv("DEFAULT_TOKENIZER_BACKEND", "huggingface").strip().lower()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

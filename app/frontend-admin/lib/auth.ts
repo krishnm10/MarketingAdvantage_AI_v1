@@ -2,7 +2,7 @@ export type Role = "viewer" | "editor" | "admin";
 
 export function getToken(): string | null {
   if (typeof window === "undefined") return null;
-  return localStorage.getItem("token");
+  return localStorage.getItem("access_token");
 }
 
 export function getUserRole(): Role | null {

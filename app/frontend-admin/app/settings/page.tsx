@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
+import InfoTooltip from "@/components/ui/InfoTooltip";
 
 /* ─── Types ─── */
 interface ConfigKey {
@@ -41,6 +42,7 @@ interface ConfigKey {
   type?: "text" | "badge" | "url" | "select" | "number" | "boolean";
   options?: string[];
   placeholder?: string;
+  tooltip?: string;
 }
 
 interface ConfigSection {
@@ -81,11 +83,11 @@ const SECTIONS: ConfigSection[] = [
     icon: Zap,
     gradient: "from-primary-500 to-primary-700 shadow-primary-600/20",
     keys: [
-      { key: "MAI_VECTORDB", label: "Vector Database", type: "select", options: ["qdrant", "chroma", "pinecone", "milvus", "weaviate", "redis"] },
-      { key: "MAI_EMBEDDER", label: "Embedder Provider", type: "select", options: ["huggingface", "ollama", "openai", "cohere"] },
-      { key: "MAI_LLM", label: "LLM Provider", type: "select", options: ["ollama", "openai", "grok", "anthropic", "gemini"] },
-      { key: "MAI_COLLECTION", label: "Default Collection" },
-      { key: "MAI_VECTOR_TRANSPORT", label: "Vector Transport", type: "select", options: ["auto", "grpc", "http"] },
+      { key: "MAI_VECTORDB", label: "Vector Database", type: "select", options: ["qdrant", "chroma", "pinecone", "milvus", "weaviate", "redis"], tooltip: "Which vector database to use for storing and searching embeddings. Changing this switches the entire storage backend." },
+      { key: "MAI_EMBEDDER", label: "Embedder Provider", type: "select", options: ["huggingface", "ollama", "openai", "cohere"], tooltip: "The AI model provider used to convert text into vector embeddings. HuggingFace runs locally; others call external APIs." },
+      { key: "MAI_LLM", label: "LLM Provider", type: "select", options: ["ollama", "openai", "grok", "anthropic", "gemini"], tooltip: "The large language model provider for generating answers, summaries, and HyDE expansions. Ollama runs locally; others require API keys." },
+      { key: "MAI_COLLECTION", label: "Default Collection", tooltip: "The default vector database collection name where all embeddings are stored. Think of it like a database table name." },
+      { key: "MAI_VECTOR_TRANSPORT", label: "Vector Transport", type: "select", options: ["auto", "grpc", "http"], tooltip: "Network protocol for communicating with the vector database. gRPC is faster for large payloads; HTTP is more compatible. Auto picks the best option." },
     ],
   },
   {
@@ -95,19 +97,20 @@ const SECTIONS: ConfigSection[] = [
     icon: SettingsIcon,
     gradient: "from-fuchsia-500 to-fuchsia-700 shadow-fuchsia-600/20",
     keys: [
-      { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number" },
-      { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number" },
-      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "token_aware"] },
-      { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean" },
-      { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean" },
-      { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean" },
-      { key: "MAI_DEDUP_SIMILARITY_THRESHOLD", label: "L3 Similarity Threshold", type: "number" },
-      { key: "DEDUP_EMBED_BATCH_SIZE", label: "L3 Embed Batch Size", type: "number" },
-      { key: "DEDUP_SEARCH_CONCURRENCY", label: "L3 Search Concurrency", type: "number" },
-      { key: "CHUNK_WINDOW_SIZE", label: "Overlap Window Size", type: "number" },
-      { key: "CHUNK_OVERLAP_SIZE", label: "Overlap Size", type: "number" },
-      { key: "CHUNK_SMART_TARGET_TOKENS", label: "Smart Target Tokens", type: "number" },
-      { key: "CHUNK_RECURSIVE_OVERLAP_CHARS", label: "Recursive Overlap Chars", type: "number" },
+      { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number", tooltip: "How many embedding vectors are sent to the vector database in one batch during ingestion. Larger batches are faster but use more memory." },
+      { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number", tooltip: "Number of parallel threads used to generate embeddings during ingestion. Higher values speed up ingestion on multi-core machines." },
+      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "token_aware"], tooltip: "How documents are split into smaller chunks before embedding. Semantic splits by meaning; overlap uses sliding windows; structure_aware respects headings and tables." },
+      { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean", tooltip: "Layer 1 deduplication: fast SHA-256 hash check. Catches exact duplicate chunks instantly with zero performance cost." },
+      { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean", tooltip: "Layer 2 deduplication: Global Content Index lookup. Catches near-duplicate chunks that have the same normalized text content." },
+      { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean", tooltip: "Layer 3 deduplication: embedding-based similarity search. Catches paraphrased duplicates by comparing vector similarity. Most expensive layer." },
+      { key: "MAI_DEDUP_SIMILARITY_THRESHOLD", label: "L3 Similarity Threshold", type: "number", tooltip: "Cosine similarity score (0.0-1.0) above which two chunks are considered duplicates in L3. Higher values = stricter matching (fewer false positives)." },
+      { key: "DEDUP_EMBED_BATCH_SIZE", label: "L3 Embed Batch Size", type: "number", tooltip: "Number of chunks embedded in one batch during L3 semantic dedup. Larger batches are faster but require more GPU/CPU memory." },
+      { key: "DEDUP_SEARCH_CONCURRENCY", label: "L3 Search Concurrency", type: "number", tooltip: "Number of parallel similarity searches during L3 dedup. Higher values speed up dedup but increase vector database load." },
+      { key: "DEDUP_L3_REDIS_THRESHOLD", label: "L3 Redis Offload Threshold", type: "number", placeholder: "500", tooltip: "When the dedup set exceeds this many embeddings, overflow is offloaded to Redis instead of keeping everything in memory. Prevents OOM on large ingestions." },
+      { key: "CHUNK_WINDOW_SIZE", label: "Overlap Window Size", type: "number", tooltip: "Size of the sliding window (in tokens) for overlap-based chunking. Larger windows capture more context per chunk." },
+      { key: "CHUNK_OVERLAP_SIZE", label: "Overlap Size", type: "number", tooltip: "How many tokens overlap between consecutive chunks. More overlap means better context continuity but larger total storage." },
+      { key: "CHUNK_SMART_TARGET_TOKENS", label: "Smart Target Tokens", type: "number", tooltip: "Target chunk size for smart_check chunking strategy. The algorithm tries to create chunks close to this token count." },
+      { key: "CHUNK_RECURSIVE_OVERLAP_CHARS", label: "Recursive Overlap Chars", type: "number", tooltip: "Character overlap for recursive_overlap chunking. Used when recursively splitting large sections that exceed the chunk limit." },
     ],
   },
   {
@@ -117,10 +120,10 @@ const SECTIONS: ConfigSection[] = [
     icon: Zap,
     gradient: "from-purple-500 to-purple-700 shadow-purple-600/20",
     keys: [
-      { key: "PHANTOM_EMBED_BATCH_SIZE", label: "Embed Batch Size", type: "number" },
-      { key: "PHANTOM_UPSERT_BATCH_SIZE", label: "Upsert Batch Size", type: "number" },
-      { key: "PHANTOM_INGEST_WORKERS", label: "Ingest Workers", type: "number" },
-      { key: "PHANTOM_BLOOM_CAPACITY", label: "Bloom Filter Capacity", type: "number" },
+      { key: "PHANTOM_EMBED_BATCH_SIZE", label: "Embed Batch Size", type: "number", tooltip: "PHANTOM engine: number of texts embedded per GPU/CPU batch. Tune this based on your hardware — larger batches saturate GPU better." },
+      { key: "PHANTOM_UPSERT_BATCH_SIZE", label: "Upsert Batch Size", type: "number", tooltip: "PHANTOM engine: number of vectors sent to the vector database in a single upsert call. Larger batches reduce network round-trips." },
+      { key: "PHANTOM_INGEST_WORKERS", label: "Ingest Workers", type: "number", tooltip: "PHANTOM engine: number of parallel worker threads for the ingestion pipeline. More workers = faster ingestion on multi-core systems." },
+      { key: "PHANTOM_BLOOM_CAPACITY", label: "Bloom Filter Capacity", type: "number", tooltip: "PHANTOM engine: max number of entries in the Bloom filter used for fast duplicate pre-screening. Set higher than your expected total chunk count." },
     ],
   },
 
@@ -132,23 +135,37 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-sky-500 to-indigo-600 shadow-sky-600/20",
     keys: [
-      { key: "DEFAULT_TOKENIZER_BACKEND", label: "Tokenizer Backend", type: "select", options: ["whitespace", "huggingface", "spacy", "nltk"] },
-      { key: "CHUNK_SIZE", label: "Token Chunk Size", type: "number", placeholder: "512" },
-      { key: "CHUNK_OVERLAP", label: "Token Chunk Overlap", type: "number", placeholder: "64" },
-      { key: "MIN_CHUNK_TOKENS", label: "Min Chunk Tokens", type: "number", placeholder: "30" },
+      { key: "DEFAULT_TOKENIZER_BACKEND", label: "Tokenizer Backend", type: "select", options: ["whitespace", "huggingface", "spacy", "nltk"], tooltip: "How text is split into tokens for chunk sizing. HuggingFace is most accurate for multilingual text; whitespace is fastest but least precise." },
+      { key: "CHUNK_SIZE", label: "Token Chunk Size", type: "number", placeholder: "512", tooltip: "Maximum number of tokens per chunk. Controls how large each piece of text is before embedding. 512 is a good default for most embedding models." },
+      { key: "CHUNK_OVERLAP", label: "Token Chunk Overlap", type: "number", placeholder: "64", tooltip: "Number of tokens shared between consecutive chunks. Overlap prevents information loss at chunk boundaries." },
+      { key: "MIN_CHUNK_TOKENS", label: "Min Chunk Tokens", type: "number", placeholder: "30", tooltip: "Chunks smaller than this token count are discarded as too short to be meaningful. Prevents noisy micro-chunks from polluting search results." },
       { key: "HF_TOKENIZER_MODEL", label: "HuggingFace Tokenizer Model", type: "select", options: [
         "bert-base-multilingual-cased",
         "ai4bharat/indic-bert",
         "bert-base-uncased",
         "xlm-roberta-base",
         "google/muril-base-cased",
-      ]},
+      ], tooltip: "Which HuggingFace tokenizer model to use for token counting. Should match or be compatible with your embedding model for accurate chunk sizing." },
       { key: "SPACY_MODEL", label: "spaCy Language Model", type: "select", options: [
         "en_core_web_sm",
         "en_core_web_lg",
         "xx_sent_ud_sm",
         "xx_ent_wiki_sm",
-      ]},
+      ], tooltip: "spaCy language model for sentence-aware tokenization. Use xx_ models for multilingual support; en_ models for English-only workloads." },
+    ],
+  },
+
+  /* ────────────────── EMBEDDING CACHE ────────────────── */
+  {
+    category: "pipeline",
+    title: "Embedding Cache",
+    description: "2-tier query embedding cache (in-memory LRU + optional Redis) to avoid duplicate embedding calls",
+    icon: Zap,
+    gradient: "from-teal-500 to-teal-700 shadow-teal-600/20",
+    keys: [
+      { key: "EMBED_CACHE_REDIS", label: "Enable Redis Cache Tier", type: "boolean", tooltip: "When enabled, query embeddings are cached in Redis (shared across workers) in addition to the in-memory LRU cache. Prevents duplicate embedding calls across processes." },
+      { key: "EMBED_CACHE_TTL", label: "Cache TTL (seconds)", type: "number", placeholder: "600", tooltip: "How long cached embeddings stay valid. After this time, the embedding is recomputed. 600s (10 min) is a good balance between freshness and performance." },
+      { key: "EMBED_CACHE_MAX_MEMORY", label: "In-Memory LRU Size", type: "number", placeholder: "256", tooltip: "Maximum number of query embeddings kept in the in-memory LRU cache per process. Increase for high-traffic systems with many unique queries." },
     ],
   },
 
@@ -160,14 +177,14 @@ const SECTIONS: ConfigSection[] = [
     icon: HardDrive,
     gradient: "from-orange-500 to-orange-700 shadow-orange-600/20",
     keys: [
-      { key: "CHROMA_PATH", label: "Local Storage Path", placeholder: "./chroma_db (leave empty for remote)" },
-      { key: "CHROMA_HOST", label: "Remote Host", placeholder: "e.g. chromadb-server (empty = local mode)" },
-      { key: "CHROMA_PORT", label: "Remote Port", type: "number" },
-      { key: "CHROMA_SSL", label: "SSL", type: "select", options: ["false", "true"] },
-      { key: "CHROMA_TENANT", label: "Tenant" },
-      { key: "CHROMA_DATABASE", label: "Database" },
-      { key: "CHROMA_TELEMETRY", label: "Telemetry", type: "select", options: ["false", "true"] },
-      { key: "CHROMA_API_KEY", label: "API Key", sensitive: true },
+      { key: "CHROMA_PATH", label: "Local Storage Path", placeholder: "./chroma_db (leave empty for remote)", tooltip: "File system path where ChromaDB stores data locally. Leave empty if connecting to a remote ChromaDB server instead." },
+      { key: "CHROMA_HOST", label: "Remote Host", placeholder: "e.g. chromadb-server (empty = local mode)", tooltip: "Hostname or IP of a remote ChromaDB server. When set, ChromaDB connects via HTTP instead of using local files." },
+      { key: "CHROMA_PORT", label: "Remote Port", type: "number", tooltip: "Port number for the remote ChromaDB server. Default is typically 8000." },
+      { key: "CHROMA_SSL", label: "SSL", type: "select", options: ["false", "true"], tooltip: "Enable HTTPS encryption for the connection to a remote ChromaDB server. Required for production deployments." },
+      { key: "CHROMA_TENANT", label: "Tenant", tooltip: "Multi-tenant isolation identifier. Each tenant has completely separate data. Use 'default_tenant' for single-tenant setups." },
+      { key: "CHROMA_DATABASE", label: "Database", tooltip: "Database name within the tenant. Allows logical separation of different datasets under the same tenant." },
+      { key: "CHROMA_TELEMETRY", label: "Telemetry", type: "select", options: ["false", "true"], tooltip: "Whether ChromaDB sends anonymous usage statistics to the ChromaDB team. Disable for air-gapped or privacy-sensitive environments." },
+      { key: "CHROMA_API_KEY", label: "API Key", sensitive: true, tooltip: "Authentication key for a secured remote ChromaDB server. Not needed for local mode." },
     ],
   },
   {
@@ -177,13 +194,13 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-violet-500 to-violet-700 shadow-violet-600/20",
     keys: [
-      { key: "QDRANT_HOST", label: "Host" },
-      { key: "QDRANT_PORT", label: "Port", type: "number" },
-      { key: "QDRANT_URL", label: "URL (Cloud)", type: "url", placeholder: "https://your-cluster.qdrant.io" },
-      { key: "QDRANT_TRANSPORT", label: "Transport", type: "select", options: ["auto", "grpc", "http"] },
-      { key: "QDRANT_PREFER_GRPC", label: "Prefer gRPC", type: "select", options: ["false", "true"] },
-      { key: "QDRANT_TIMEOUT", label: "Timeout (sec)", type: "number" },
-      { key: "QDRANT_API_KEY", label: "API Key", sensitive: true },
+      { key: "QDRANT_HOST", label: "Host", tooltip: "Hostname or IP address of the Qdrant server. Use 'localhost' for local development." },
+      { key: "QDRANT_PORT", label: "Port", type: "number", tooltip: "Port number for the Qdrant HTTP API. Default is 6333. gRPC port is typically 6334." },
+      { key: "QDRANT_URL", label: "URL (Cloud)", type: "url", placeholder: "https://your-cluster.qdrant.io", tooltip: "Full URL for Qdrant Cloud clusters. When set, overrides Host and Port settings." },
+      { key: "QDRANT_TRANSPORT", label: "Transport", type: "select", options: ["auto", "grpc", "http"], tooltip: "Network protocol for Qdrant communication. gRPC is ~2x faster for large vector payloads; HTTP is more firewall-friendly." },
+      { key: "QDRANT_PREFER_GRPC", label: "Prefer gRPC", type: "select", options: ["false", "true"], tooltip: "When transport is 'auto', prefer gRPC over HTTP if both are available. Recommended for high-throughput ingestion." },
+      { key: "QDRANT_TIMEOUT", label: "Timeout (sec)", type: "number", tooltip: "Maximum seconds to wait for a Qdrant response before timing out. Increase for large collection operations." },
+      { key: "QDRANT_API_KEY", label: "API Key", sensitive: true, tooltip: "Authentication key for Qdrant Cloud or a secured self-hosted instance. Not needed for unsecured local setups." },
     ],
   },
   {
@@ -193,13 +210,13 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-cyan-500 to-cyan-700 shadow-cyan-600/20",
     keys: [
-      { key: "MILVUS_URI", label: "URI (Cloud)", type: "url" },
-      { key: "MILVUS_HOST", label: "Host" },
-      { key: "MILVUS_PORT", label: "Port", type: "number" },
-      { key: "MILVUS_DB_NAME", label: "DB Name" },
-      { key: "MILVUS_ALIAS", label: "Alias" },
-      { key: "MILVUS_TRANSPORT", label: "Transport", type: "select", options: ["grpc"] },
-      { key: "MILVUS_TOKEN", label: "Token", sensitive: true },
+      { key: "MILVUS_URI", label: "URI (Cloud)", type: "url", tooltip: "Full connection URI for Milvus Cloud (Zilliz). When set, overrides Host and Port." },
+      { key: "MILVUS_HOST", label: "Host", tooltip: "Hostname or IP of the Milvus server. Use 'localhost' for local development with Docker." },
+      { key: "MILVUS_PORT", label: "Port", type: "number", tooltip: "Port for the Milvus gRPC API. Default is 19530." },
+      { key: "MILVUS_DB_NAME", label: "DB Name", tooltip: "Milvus database name for logical data isolation. Use 'default' unless you have multiple databases." },
+      { key: "MILVUS_ALIAS", label: "Alias", tooltip: "Connection alias for managing multiple Milvus connections. Use 'default' for single-server setups." },
+      { key: "MILVUS_TRANSPORT", label: "Transport", type: "select", options: ["grpc"], tooltip: "Milvus uses gRPC for all communication. This cannot be changed." },
+      { key: "MILVUS_TOKEN", label: "Token", sensitive: true, tooltip: "Authentication token for Milvus Cloud (Zilliz) or token-authenticated self-hosted instances." },
     ],
   },
   {
@@ -209,16 +226,16 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-teal-500 to-teal-700 shadow-teal-600/20",
     keys: [
-      { key: "PINECONE_MODE", label: "Mode", type: "select", options: ["cloud", "local"] },
-      { key: "PINECONE_API_KEY", label: "API Key", sensitive: true },
-      { key: "PINECONE_INDEX_NAME", label: "Index Name" },
-      { key: "PINECONE_NAMESPACE", label: "Namespace" },
-      { key: "PINECONE_METRIC", label: "Metric", type: "select", options: ["cosine", "dotproduct", "euclidean"] },
-      { key: "PINECONE_EMBEDDING_DIM", label: "Embedding Dimension", type: "number" },
-      { key: "PINECONE_CLOUD", label: "Cloud", type: "select", options: ["aws", "gcp", "azure"] },
-      { key: "PINECONE_REGION", label: "Region" },
-      { key: "PINECONE_POD_TYPE", label: "Pod Type" },
-      { key: "PINECONE_LOCAL_PATH", label: "Local Path", placeholder: "./pinecone_local_db" },
+      { key: "PINECONE_MODE", label: "Mode", type: "select", options: ["cloud", "local"], tooltip: "Cloud mode connects to Pinecone's managed service; local mode uses a file-based index for development without an API key." },
+      { key: "PINECONE_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Pinecone API key from the Pinecone console. Required for cloud mode only." },
+      { key: "PINECONE_INDEX_NAME", label: "Index Name", tooltip: "Name of the Pinecone index to use. Must be created in the Pinecone console first (cloud mode) or will be auto-created (local mode)." },
+      { key: "PINECONE_NAMESPACE", label: "Namespace", tooltip: "Logical partition within the index. Use different namespaces to isolate data per client or environment without separate indexes." },
+      { key: "PINECONE_METRIC", label: "Metric", type: "select", options: ["cosine", "dotproduct", "euclidean"], tooltip: "Distance metric for similarity search. Cosine is best for normalized embeddings; dotproduct for unnormalized; euclidean for spatial data." },
+      { key: "PINECONE_EMBEDDING_DIM", label: "Embedding Dimension", type: "number", tooltip: "Vector dimension size. Must match your embedding model's output dimension (e.g. 384 for MiniLM, 768 for BERT, 1536 for OpenAI)." },
+      { key: "PINECONE_CLOUD", label: "Cloud", type: "select", options: ["aws", "gcp", "azure"], tooltip: "Cloud provider where your Pinecone index is hosted. Choose the one closest to your application servers for lowest latency." },
+      { key: "PINECONE_REGION", label: "Region", tooltip: "Cloud region for the Pinecone index (e.g. us-east-1, eu-west-1). Must match the region selected in Pinecone console." },
+      { key: "PINECONE_POD_TYPE", label: "Pod Type", tooltip: "Pinecone pod hardware tier. Options like s1, p1, p2 offer different price/performance tradeoffs. Higher tiers have faster queries." },
+      { key: "PINECONE_LOCAL_PATH", label: "Local Path", placeholder: "./pinecone_local_db", tooltip: "File system path where the local Pinecone index stores data. Only used in local mode for development/testing." },
     ],
   },
   {
@@ -228,14 +245,14 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-green-500 to-green-700 shadow-green-600/20",
     keys: [
-      { key: "WEAVIATE_URL", label: "URL", type: "url" },
-      { key: "WEAVIATE_EMBEDDED", label: "Embedded", type: "select", options: ["false", "true"] },
-      { key: "WEAVIATE_TRANSPORT", label: "Transport", type: "select", options: ["auto", "grpc", "http"] },
-      { key: "WEAVIATE_GRPC_HOST", label: "gRPC Host" },
-      { key: "WEAVIATE_GRPC_PORT", label: "gRPC Port", type: "number" },
-      { key: "WEAVIATE_SKIP_INIT_CHECKS", label: "Skip Init Checks", type: "select", options: ["false", "true"] },
-      { key: "WEAVIATE_ADDITIONAL_HEADERS_JSON", label: "Headers JSON" },
-      { key: "WEAVIATE_API_KEY", label: "API Key", sensitive: true },
+      { key: "WEAVIATE_URL", label: "URL", type: "url", tooltip: "Full URL of the Weaviate instance (e.g. http://localhost:8080). Required for all connection modes." },
+      { key: "WEAVIATE_EMBEDDED", label: "Embedded", type: "select", options: ["false", "true"], tooltip: "Run Weaviate as an embedded process inside the application instead of connecting to an external server. Good for development." },
+      { key: "WEAVIATE_TRANSPORT", label: "Transport", type: "select", options: ["auto", "grpc", "http"], tooltip: "Network protocol for Weaviate communication. gRPC (port 50051) is faster; HTTP is more compatible." },
+      { key: "WEAVIATE_GRPC_HOST", label: "gRPC Host", tooltip: "Separate hostname for Weaviate's gRPC API if it differs from the HTTP URL host. Usually not needed." },
+      { key: "WEAVIATE_GRPC_PORT", label: "gRPC Port", type: "number", tooltip: "Port for Weaviate's gRPC endpoint. Default is 50051." },
+      { key: "WEAVIATE_SKIP_INIT_CHECKS", label: "Skip Init Checks", type: "select", options: ["false", "true"], tooltip: "Skip connectivity checks when the client starts. Enable only for faster startup when you know the server is available." },
+      { key: "WEAVIATE_ADDITIONAL_HEADERS_JSON", label: "Headers JSON", tooltip: "Extra HTTP headers as a JSON object (e.g. for proxy auth). Format: {\"X-Custom\": \"value\"}." },
+      { key: "WEAVIATE_API_KEY", label: "API Key", sensitive: true, tooltip: "Authentication key for Weaviate Cloud or a secured self-hosted instance." },
     ],
   },
   {
@@ -245,15 +262,15 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-red-500 to-red-600 shadow-red-600/20",
     keys: [
-      { key: "REDIS_URL", label: "URL (Cloud)", type: "url", placeholder: "redis://user:pass@host:port" },
-      { key: "REDIS_HOST", label: "Host" },
-      { key: "REDIS_PORT", label: "Port", type: "number" },
-      { key: "REDIS_PASSWORD", label: "Password", sensitive: true },
-      { key: "REDIS_USERNAME", label: "Username" },
-      { key: "REDIS_DB", label: "DB Number", type: "number" },
-      { key: "REDIS_SSL", label: "SSL", type: "select", options: ["false", "true"] },
-      { key: "REDIS_SSL_CA_CERTS", label: "CA Cert Path" },
-      { key: "REDIS_PREFIX", label: "Key Prefix" },
+      { key: "REDIS_URL", label: "URL (Cloud)", type: "url", placeholder: "redis://user:pass@host:port", tooltip: "Full Redis connection URL for cloud-hosted Redis (e.g. Redis Cloud, ElastiCache). When set, overrides Host/Port/Password fields." },
+      { key: "REDIS_HOST", label: "Host", tooltip: "Hostname or IP of the Redis server. Use 'localhost' for local development." },
+      { key: "REDIS_PORT", label: "Port", type: "number", tooltip: "Redis server port. Default is 6379." },
+      { key: "REDIS_PASSWORD", label: "Password", sensitive: true, tooltip: "Redis authentication password. Required if your Redis instance has AUTH enabled." },
+      { key: "REDIS_USERNAME", label: "Username", tooltip: "Redis ACL username. Only needed for Redis 6+ with ACL authentication enabled." },
+      { key: "REDIS_DB", label: "DB Number", type: "number", tooltip: "Redis database number (0-15). Use different numbers to isolate data for different environments on the same server." },
+      { key: "REDIS_SSL", label: "SSL", type: "select", options: ["false", "true"], tooltip: "Enable TLS encryption for the Redis connection. Required for cloud-hosted Redis and production environments." },
+      { key: "REDIS_SSL_CA_CERTS", label: "CA Cert Path", tooltip: "Path to the CA certificate file for verifying the Redis server's SSL certificate. Required for custom/self-signed certificates." },
+      { key: "REDIS_PREFIX", label: "Key Prefix", tooltip: "Prefix added to all Redis keys used by the vector search module. Prevents key collisions when sharing a Redis instance." },
     ],
   },
 
@@ -265,9 +282,9 @@ const SECTIONS: ConfigSection[] = [
     icon: Server,
     gradient: "from-slate-500 to-slate-700 shadow-slate-600/20",
     keys: [
-      { key: "OLLAMA_BASE_URL", label: "Base URL", type: "url" },
-      { key: "OLLAMA_EMBED_MODEL", label: "Embed Model" },
-      { key: "OLLAMA_LLM_MODEL", label: "LLM Model" },
+      { key: "OLLAMA_BASE_URL", label: "Base URL", type: "url", tooltip: "URL where Ollama is running (e.g. http://localhost:11434). Ollama must be installed and running on this address." },
+      { key: "OLLAMA_EMBED_MODEL", label: "Embed Model", tooltip: "Ollama model used for generating embeddings (e.g. nomic-embed-text, mxbai-embed-large). Must be pulled via 'ollama pull' first." },
+      { key: "OLLAMA_LLM_MODEL", label: "LLM Model", tooltip: "Ollama model used for text generation, HyDE, and RAG answers (e.g. llama3, mistral, phi3). Must be pulled via 'ollama pull' first." },
     ],
   },
   {
@@ -277,11 +294,11 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-yellow-500 to-yellow-700 shadow-yellow-600/20",
     keys: [
-      { key: "HF_EMBED_MODEL", label: "Model" },
-      { key: "HF_EMBED_DEVICE", label: "Device", type: "select", options: ["auto", "cpu", "cuda"] },
-      { key: "HF_NORMALIZE_EMBEDDINGS", label: "Normalize", type: "boolean" },
-      { key: "HF_BATCH_SIZE", label: "Batch Size", type: "number" },
-      { key: "HF_EMBED_QUERY_PREFIX", label: "Query Prefix" },
+      { key: "HF_EMBED_MODEL", label: "Model", tooltip: "HuggingFace sentence-transformer model for embeddings (e.g. all-MiniLM-L6-v2). Downloaded automatically on first use." },
+      { key: "HF_EMBED_DEVICE", label: "Device", type: "select", options: ["auto", "cpu", "cuda"], tooltip: "Hardware to run the embedding model on. 'auto' detects GPU if available; 'cuda' forces GPU; 'cpu' forces CPU (slower but always works)." },
+      { key: "HF_NORMALIZE_EMBEDDINGS", label: "Normalize", type: "boolean", tooltip: "Whether to L2-normalize embeddings to unit length. Required for cosine similarity to work correctly. Keep enabled unless you know otherwise." },
+      { key: "HF_BATCH_SIZE", label: "Batch Size", type: "number", tooltip: "Number of texts embedded in one forward pass. Larger batches are faster on GPU but use more memory. Auto-splits if a batch is too large." },
+      { key: "HF_EMBED_QUERY_PREFIX", label: "Query Prefix", tooltip: "Text prefix prepended to queries before embedding (e.g. 'query: '). Some models require this for asymmetric search to work correctly." },
     ],
   },
   {
@@ -291,9 +308,9 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-emerald-500 to-emerald-700 shadow-emerald-600/20",
     keys: [
-      { key: "OPENAI_API_KEY", label: "API Key", sensitive: true },
-      { key: "OPENAI_EMBED_MODEL", label: "Embed Model" },
-      { key: "OPENAI_LLM_MODEL", label: "LLM Model" },
+      { key: "OPENAI_API_KEY", label: "API Key", sensitive: true, tooltip: "Your OpenAI API key from platform.openai.com. Required for both embedding and LLM features when using OpenAI as a provider." },
+      { key: "OPENAI_EMBED_MODEL", label: "Embed Model", tooltip: "OpenAI embedding model name (e.g. text-embedding-3-small, text-embedding-ada-002). Newer models produce better quality embeddings." },
+      { key: "OPENAI_LLM_MODEL", label: "LLM Model", tooltip: "OpenAI chat model for text generation (e.g. gpt-4o, gpt-4-turbo, gpt-3.5-turbo). Used for RAG answers and HyDE expansion." },
     ],
   },
   {
@@ -303,8 +320,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Zap,
     gradient: "from-orange-500 to-red-600 shadow-orange-600/20",
     keys: [
-      { key: "GROQ_API_KEY", label: "API Key", sensitive: true },
-      { key: "GROQ_LLM_MODEL", label: "LLM Model" },
+      { key: "GROQ_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Groq API key from console.groq.com. Groq provides ultra-fast inference for open-source LLMs." },
+      { key: "GROQ_LLM_MODEL", label: "LLM Model", tooltip: "Groq-hosted model name (e.g. llama3-70b-8192, mixtral-8x7b-32768). Groq specializes in fast inference for these models." },
     ],
   },
   {
@@ -314,8 +331,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-amber-500 to-amber-700 shadow-amber-600/20",
     keys: [
-      { key: "ANTHROPIC_API_KEY", label: "API Key", sensitive: true },
-      { key: "ANTHROPIC_LLM_MODEL", label: "LLM Model" },
+      { key: "ANTHROPIC_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Anthropic API key from console.anthropic.com. Required to use Claude models for text generation." },
+      { key: "ANTHROPIC_LLM_MODEL", label: "LLM Model", tooltip: "Anthropic Claude model (e.g. claude-3-5-sonnet, claude-3-opus). Claude excels at nuanced reasoning and long-context tasks." },
     ],
   },
   {
@@ -325,8 +342,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-blue-400 to-blue-600 shadow-blue-500/20",
     keys: [
-      { key: "GEMINI_API_KEY", label: "API Key", sensitive: true },
-      { key: "GEMINI_LLM_MODEL", label: "LLM Model" },
+      { key: "GEMINI_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Google AI API key from aistudio.google.com. Required for Gemini model access." },
+      { key: "GEMINI_LLM_MODEL", label: "LLM Model", tooltip: "Google Gemini model (e.g. gemini-2.0-flash, gemini-1.5-pro). Flash models are faster; Pro models are more capable." },
     ],
   },
   {
@@ -336,8 +353,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-pink-500 to-pink-700 shadow-pink-600/20",
     keys: [
-      { key: "COHERE_API_KEY", label: "API Key", sensitive: true },
-      { key: "COHERE_EMBED_MODEL", label: "Embed Model" },
+      { key: "COHERE_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Cohere API key from dashboard.cohere.com. Required for Cohere embedding and reranking models." },
+      { key: "COHERE_EMBED_MODEL", label: "Embed Model", tooltip: "Cohere embedding model (e.g. embed-english-v3.0, embed-multilingual-v3.0). Cohere embeddings support 100+ languages." },
     ],
   },
 
@@ -349,19 +366,19 @@ const SECTIONS: ConfigSection[] = [
     icon: Image,
     gradient: "from-rose-500 to-rose-700 shadow-rose-600/20",
     keys: [
-      { key: "AI_PROFILE", label: "AI Execution Profile", type: "select", options: ["cpu", "gpu", "api", "dist"] },
+      { key: "AI_PROFILE", label: "AI Execution Profile", type: "select", options: ["cpu", "gpu", "api", "dist"], tooltip: "Where vision AI models run. CPU = local processor (slow); GPU = local NVIDIA GPU (fast); API = cloud provider (no local hardware needed); Dist = distributed across multiple nodes." },
       { key: "VISION_MODEL_CPU", label: "CPU Vision Model", type: "select", options: [
         "Qwen/Qwen2.5-VL-3B-Instruct",
         "vikhyatk/moondream2",
         "openai/clip-vit-large-patch14",
-      ]},
+      ], tooltip: "Vision model used when running on CPU. Smaller models (3B parameters) are recommended for CPU to maintain reasonable speed." },
       { key: "VISION_MODEL_GPU", label: "GPU Vision Model", type: "select", options: [
         "Qwen/Qwen2.5-VL-7B-Instruct",
         "Qwen/Qwen2.5-VL-72B-Instruct",
         "lmms-lab/llava-onevision-qwen2-7b-ov-hf",
         "OpenGVLab/InternVL3-8B",
-      ]},
-      { key: "VISION_API_PROVIDER", label: "API Vision Provider", type: "select", options: ["openai", "anthropic", "google"] },
+      ], tooltip: "Vision model used when running on GPU. Larger models (7B-72B) produce better results for image understanding, chart reading, and OCR." },
+      { key: "VISION_API_PROVIDER", label: "API Vision Provider", type: "select", options: ["openai", "anthropic", "google"], tooltip: "Which cloud API to use for vision tasks when AI_PROFILE is 'api'. Each provider has different strengths for image understanding." },
       { key: "VISION_API_MODEL", label: "API Vision Model", type: "select", options: [
         "gpt-4o",
         "gpt-4-vision-preview",
@@ -369,7 +386,7 @@ const SECTIONS: ConfigSection[] = [
         "claude-3-7-sonnet-20250219",
         "gemini-2.0-flash",
         "gemini-1.5-pro",
-      ]},
+      ], tooltip: "Specific API model for vision tasks. Must be compatible with the selected API provider above." },
     ],
   },
   {
@@ -379,13 +396,13 @@ const SECTIONS: ConfigSection[] = [
     icon: Zap,
     gradient: "from-fuchsia-500 to-fuchsia-700 shadow-fuchsia-600/20",
     keys: [
-      { key: "VISION_QUANTIZE", label: "GPU Quantization", type: "select", options: ["none", "4bit", "8bit"] },
-      { key: "VISION_FLASH_ATTENTION", label: "Flash Attention 2", type: "boolean" },
-      { key: "VISION_MAX_PIXELS", label: "Max Pixels (GPU/API)", type: "number", placeholder: "1003520" },
-      { key: "VISION_MIN_PIXELS", label: "Min Pixels", type: "number", placeholder: "200704" },
-      { key: "VISION_BATCH_SIZE_CPU", label: "CPU Batch Size", type: "number", placeholder: "1" },
-      { key: "VISION_BATCH_SIZE_GPU", label: "GPU Batch Size", type: "number", placeholder: "4" },
-      { key: "VIDEO_VISION_FRAMES", label: "Video Frame Sample Count", type: "number", placeholder: "8" },
+      { key: "VISION_QUANTIZE", label: "GPU Quantization", type: "select", options: ["none", "4bit", "8bit"], tooltip: "Reduce model memory usage by quantizing weights. 4bit uses ~4x less VRAM; 8bit uses ~2x less. 'none' keeps full precision for best quality." },
+      { key: "VISION_FLASH_ATTENTION", label: "Flash Attention 2", type: "boolean", tooltip: "Enable Flash Attention 2 for faster and more memory-efficient GPU inference. Requires a compatible NVIDIA GPU (Ampere or newer)." },
+      { key: "VISION_MAX_PIXELS", label: "Max Pixels (GPU/API)", type: "number", placeholder: "1003520", tooltip: "Maximum total pixel count for input images. Images exceeding this are downscaled. Higher values produce better OCR but use more memory." },
+      { key: "VISION_MIN_PIXELS", label: "Min Pixels", type: "number", placeholder: "200704", tooltip: "Minimum total pixel count. Images smaller than this are upscaled to ensure the model can extract sufficient detail." },
+      { key: "VISION_BATCH_SIZE_CPU", label: "CPU Batch Size", type: "number", placeholder: "1", tooltip: "Number of images processed simultaneously on CPU. Keep at 1 for CPU — higher values cause memory issues without speed benefit." },
+      { key: "VISION_BATCH_SIZE_GPU", label: "GPU Batch Size", type: "number", placeholder: "4", tooltip: "Number of images processed simultaneously on GPU. Higher values utilize GPU better but require more VRAM." },
+      { key: "VIDEO_VISION_FRAMES", label: "Video Frame Sample Count", type: "number", placeholder: "8", tooltip: "Number of frames extracted from videos for vision analysis. More frames give better coverage but increase processing time and cost." },
     ],
   },
 
@@ -397,14 +414,14 @@ const SECTIONS: ConfigSection[] = [
     icon: Layers,
     gradient: "from-orange-500 to-orange-700 shadow-orange-600/20",
     keys: [
-      { key: "CELERY_ENABLED", label: "Enable Celery", type: "boolean" },
+      { key: "CELERY_ENABLED", label: "Enable Celery", type: "boolean", tooltip: "Master switch for the distributed task queue. When enabled, ingestion and validation tasks run asynchronously via Celery workers instead of inline." },
       { key: "CELERY_BROKER", label: "Broker Type", type: "select", options: [
         "redis", "rabbitmq", "sqs", "kafka", "redpanda", "warpstream",
         "nats", "pulsar", "kinesis", "pubsub", "eventhubs", "upstash",
         "redis_streams", "tinybird", "glassflow", "streamnative", "aiven",
-      ]},
-      { key: "CELERY_BROKER_URL", label: "Broker URL Override (advanced)", placeholder: "Leave EMPTY — auto-built from Broker Type above. Only set for custom URLs." },
-      { key: "CELERY_RESULT_BACKEND", label: "Result Backend Override (advanced)", placeholder: "Leave EMPTY — defaults to Redis. Do NOT put Kafka IPs here.", sensitive: true },
+      ], tooltip: "Message broker that delivers tasks to Celery workers. Redis is simplest; RabbitMQ is most robust; Kafka is best for event streaming architectures." },
+      { key: "CELERY_BROKER_URL", label: "Broker URL Override (advanced)", placeholder: "Leave EMPTY — auto-built from Broker Type above. Only set for custom URLs.", tooltip: "Override the auto-generated broker URL. Only set this if you need a custom connection string. Leave empty to let the system build the URL from Broker Type." },
+      { key: "CELERY_RESULT_BACKEND", label: "Result Backend Override (advanced)", placeholder: "Leave EMPTY — defaults to Redis. Do NOT put Kafka IPs here.", sensitive: true, tooltip: "Where Celery stores task results and status. Defaults to Redis. Do NOT use Kafka URLs here — Kafka is a broker, not a result store." },
     ],
   },
   {
@@ -414,7 +431,7 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-red-500 to-red-600 shadow-red-600/20",
     keys: [
-      { key: "CELERY_REDIS_URL", label: "Redis URL", type: "url", placeholder: "redis://localhost:6379/0", sensitive: true },
+      { key: "CELERY_REDIS_URL", label: "Redis URL", type: "url", placeholder: "redis://localhost:6379/0", sensitive: true, tooltip: "Redis connection URL used as Celery's message broker. Include password if AUTH is enabled: redis://:password@host:port/db" },
     ],
   },
   {
@@ -424,7 +441,7 @@ const SECTIONS: ConfigSection[] = [
     icon: Network,
     gradient: "from-amber-500 to-amber-700 shadow-amber-600/20",
     keys: [
-      { key: "RABBITMQ_URL", label: "AMQP URL", type: "url", placeholder: "amqp://guest:guest@localhost:5672//", sensitive: true },
+      { key: "RABBITMQ_URL", label: "AMQP URL", type: "url", placeholder: "amqp://guest:guest@localhost:5672//", sensitive: true, tooltip: "RabbitMQ AMQP connection URL. The double slash at the end is the default vhost. Change credentials from guest/guest in production." },
     ],
   },
   {
@@ -434,20 +451,20 @@ const SECTIONS: ConfigSection[] = [
     icon: Shield,
     gradient: "from-slate-600 to-slate-800 shadow-slate-700/20",
     keys: [
-      { key: "KAFKA_BOOTSTRAP_SERVERS", label: "Bootstrap Servers", placeholder: "localhost:9092" },
-      { key: "KAFKA_CLIENT_ID", label: "Client ID", placeholder: "mai-producer" },
-      { key: "KAFKA_SECURITY_PROTOCOL", label: "Security Protocol", type: "select", options: ["PLAINTEXT", "SASL_PLAINTEXT", "SASL_SSL", "SSL"] },
-      { key: "KAFKA_SASL_MECHANISM", label: "SASL Mechanism", type: "select", options: ["", "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER"] },
-      { key: "KAFKA_SASL_USERNAME", label: "SASL Username" },
-      { key: "KAFKA_SASL_PASSWORD", label: "SASL Password", sensitive: true },
-      { key: "KAFKA_OAUTHBEARER_CONFIG", label: "OAUTHBEARER Config" },
-      { key: "KAFKA_SSL_CA_LOCATION", label: "CA Certificate Path", placeholder: "/path/to/ca.pem" },
-      { key: "KAFKA_SSL_CERTIFICATE_LOCATION", label: "Client Certificate Path", placeholder: "/path/to/client.pem" },
-      { key: "KAFKA_SSL_KEY_LOCATION", label: "Client Key Path", placeholder: "/path/to/client-key.pem" },
-      { key: "KAFKA_SSL_KEY_PASSWORD", label: "Key Password", sensitive: true },
-      { key: "KAFKA_SSL_ENDPOINT_IDENTIFICATION", label: "Endpoint Identification", type: "select", options: ["https", "none"] },
-      { key: "KAFKA_SCHEMA_REGISTRY_URL", label: "Schema Registry URL", type: "url", placeholder: "http://localhost:8081" },
-      { key: "KAFKA_SCHEMA_REGISTRY_AUTH", label: "Schema Registry Auth", sensitive: true, placeholder: "key:secret" },
+      { key: "KAFKA_BOOTSTRAP_SERVERS", label: "Bootstrap Servers", placeholder: "localhost:9092", tooltip: "Comma-separated list of Kafka broker addresses for initial connection. The client discovers other brokers automatically after connecting." },
+      { key: "KAFKA_CLIENT_ID", label: "Client ID", placeholder: "mai-producer", tooltip: "Identifier for this application in Kafka broker logs. Helps with debugging and monitoring which client produced/consumed messages." },
+      { key: "KAFKA_SECURITY_PROTOCOL", label: "Security Protocol", type: "select", options: ["PLAINTEXT", "SASL_PLAINTEXT", "SASL_SSL", "SSL"], tooltip: "How to authenticate and encrypt Kafka connections. PLAINTEXT = no security; SASL_SSL = username/password + encryption (recommended for cloud)." },
+      { key: "KAFKA_SASL_MECHANISM", label: "SASL Mechanism", type: "select", options: ["", "PLAIN", "SCRAM-SHA-256", "SCRAM-SHA-512", "OAUTHBEARER"], tooltip: "Authentication method when using SASL. PLAIN sends credentials in cleartext (use with SSL); SCRAM hashes them; OAUTHBEARER uses tokens." },
+      { key: "KAFKA_SASL_USERNAME", label: "SASL Username", tooltip: "Username for SASL authentication with the Kafka cluster. Required when SASL mechanism is PLAIN or SCRAM." },
+      { key: "KAFKA_SASL_PASSWORD", label: "SASL Password", sensitive: true, tooltip: "Password for SASL authentication. Keep this secret — rotate periodically for security." },
+      { key: "KAFKA_OAUTHBEARER_CONFIG", label: "OAUTHBEARER Config", tooltip: "Configuration string for OAUTHBEARER token retrieval. Format depends on your OAuth provider." },
+      { key: "KAFKA_SSL_CA_LOCATION", label: "CA Certificate Path", placeholder: "/path/to/ca.pem", tooltip: "Path to the Certificate Authority file for verifying Kafka broker SSL certificates. Required for SSL and SASL_SSL protocols." },
+      { key: "KAFKA_SSL_CERTIFICATE_LOCATION", label: "Client Certificate Path", placeholder: "/path/to/client.pem", tooltip: "Path to the client's SSL certificate for mutual TLS (mTLS) authentication. Only needed for certificate-based auth." },
+      { key: "KAFKA_SSL_KEY_LOCATION", label: "Client Key Path", placeholder: "/path/to/client-key.pem", tooltip: "Path to the client's private key for mTLS authentication. Must match the client certificate above." },
+      { key: "KAFKA_SSL_KEY_PASSWORD", label: "Key Password", sensitive: true, tooltip: "Password to decrypt the client's private key file. Only needed if the key file is password-protected." },
+      { key: "KAFKA_SSL_ENDPOINT_IDENTIFICATION", label: "Endpoint Identification", type: "select", options: ["https", "none"], tooltip: "Whether to verify the broker's hostname matches its SSL certificate. 'https' is secure; 'none' disables (not recommended)." },
+      { key: "KAFKA_SCHEMA_REGISTRY_URL", label: "Schema Registry URL", type: "url", placeholder: "http://localhost:8081", tooltip: "URL of the Confluent Schema Registry for Avro/Protobuf/JSON Schema validation. Ensures message format compatibility." },
+      { key: "KAFKA_SCHEMA_REGISTRY_AUTH", label: "Schema Registry Auth", sensitive: true, placeholder: "key:secret", tooltip: "Authentication credentials for the Schema Registry in 'key:secret' format. Required for Confluent Cloud." },
     ],
   },
   {
@@ -457,24 +474,24 @@ const SECTIONS: ConfigSection[] = [
     icon: Activity,
     gradient: "from-emerald-600 to-emerald-800 shadow-emerald-700/20",
     keys: [
-      { key: "KAFKA_EVENTS_ENABLED", label: "Enable Kafka Events", type: "boolean" },
-      { key: "KAFKA_ENABLE_IDEMPOTENCE", label: "Idempotent Producer (exactly-once)", type: "boolean" },
-      { key: "KAFKA_ACKS", label: "Acknowledgements", type: "select", options: ["all", "1", "0"] },
-      { key: "KAFKA_COMPRESSION_TYPE", label: "Compression", type: "select", options: ["lz4", "snappy", "gzip", "zstd", "none"] },
-      { key: "KAFKA_LINGER_MS", label: "Linger (ms)", type: "number", placeholder: "5" },
-      { key: "KAFKA_BATCH_SIZE", label: "Batch Size (bytes)", type: "number", placeholder: "65536" },
-      { key: "KAFKA_BATCH_NUM_MESSAGES", label: "Batch Max Messages", type: "number", placeholder: "10000" },
-      { key: "KAFKA_MESSAGE_MAX_BYTES", label: "Max Message Size (bytes)", type: "number", placeholder: "1048576" },
-      { key: "KAFKA_DELIVERY_TIMEOUT_MS", label: "Delivery Timeout (ms)", type: "number", placeholder: "120000" },
-      { key: "KAFKA_MAX_IN_FLIGHT", label: "Max In-Flight Requests", type: "number", placeholder: "5" },
-      { key: "KAFKA_CONSUMER_GROUP_ID", label: "Consumer Group ID", placeholder: "mai-consumer-group" },
-      { key: "KAFKA_AUTO_OFFSET_RESET", label: "Auto Offset Reset", type: "select", options: ["earliest", "latest", "none"] },
-      { key: "KAFKA_ENABLE_AUTO_COMMIT", label: "Auto Commit", type: "boolean" },
-      { key: "KAFKA_MAX_POLL_INTERVAL_MS", label: "Max Poll Interval (ms)", type: "number", placeholder: "300000" },
-      { key: "KAFKA_SESSION_TIMEOUT_MS", label: "Session Timeout (ms)", type: "number", placeholder: "45000" },
-      { key: "KAFKA_HEARTBEAT_INTERVAL_MS", label: "Heartbeat Interval (ms)", type: "number", placeholder: "3000" },
-      { key: "KAFKA_FETCH_MIN_BYTES", label: "Fetch Min Bytes", type: "number", placeholder: "1" },
-      { key: "KAFKA_FETCH_MAX_BYTES", label: "Fetch Max Bytes", type: "number", placeholder: "52428800" },
+      { key: "KAFKA_EVENTS_ENABLED", label: "Enable Kafka Events", type: "boolean", tooltip: "Master switch for publishing ingestion events to Kafka topics. When disabled, no messages are sent to Kafka even if it's configured." },
+      { key: "KAFKA_ENABLE_IDEMPOTENCE", label: "Idempotent Producer (exactly-once)", type: "boolean", tooltip: "Ensures each message is written to Kafka exactly once, even during retries. Prevents duplicate events. Recommended for production." },
+      { key: "KAFKA_ACKS", label: "Acknowledgements", type: "select", options: ["all", "1", "0"], tooltip: "How many broker replicas must confirm a write. 'all' = safest (no data loss); '1' = leader only (faster); '0' = fire-and-forget (fastest, may lose data)." },
+      { key: "KAFKA_COMPRESSION_TYPE", label: "Compression", type: "select", options: ["lz4", "snappy", "gzip", "zstd", "none"], tooltip: "Compress messages before sending. lz4 = fastest; zstd = best compression ratio; none = no compression. Reduces network bandwidth." },
+      { key: "KAFKA_LINGER_MS", label: "Linger (ms)", type: "number", placeholder: "5", tooltip: "How long to wait before sending a batch. Higher values batch more messages (better throughput) but add latency." },
+      { key: "KAFKA_BATCH_SIZE", label: "Batch Size (bytes)", type: "number", placeholder: "65536", tooltip: "Maximum size of a message batch in bytes. Larger batches are more efficient but use more memory. 64KB is a good default." },
+      { key: "KAFKA_BATCH_NUM_MESSAGES", label: "Batch Max Messages", type: "number", placeholder: "10000", tooltip: "Maximum number of messages in a single batch. Limits batch size by message count in addition to the byte limit." },
+      { key: "KAFKA_MESSAGE_MAX_BYTES", label: "Max Message Size (bytes)", type: "number", placeholder: "1048576", tooltip: "Maximum size of a single Kafka message. Default 1MB. Increase if ingestion events contain very large chunk text." },
+      { key: "KAFKA_DELIVERY_TIMEOUT_MS", label: "Delivery Timeout (ms)", type: "number", placeholder: "120000", tooltip: "Maximum time to wait for a message to be delivered before it's considered failed. Includes retries." },
+      { key: "KAFKA_MAX_IN_FLIGHT", label: "Max In-Flight Requests", type: "number", placeholder: "5", tooltip: "Maximum unacknowledged requests per connection. Lower values ensure ordering; higher values improve throughput. Set to 1 for strict ordering." },
+      { key: "KAFKA_CONSUMER_GROUP_ID", label: "Consumer Group ID", placeholder: "mai-consumer-group", tooltip: "Consumer group name. All consumers with the same group ID share the workload by splitting topic partitions among themselves." },
+      { key: "KAFKA_AUTO_OFFSET_RESET", label: "Auto Offset Reset", type: "select", options: ["earliest", "latest", "none"], tooltip: "Where to start reading when a consumer has no saved offset. 'earliest' = from beginning; 'latest' = only new messages; 'none' = error." },
+      { key: "KAFKA_ENABLE_AUTO_COMMIT", label: "Auto Commit", type: "boolean", tooltip: "Automatically mark messages as processed. When disabled, your code must manually commit offsets (safer but requires more code)." },
+      { key: "KAFKA_MAX_POLL_INTERVAL_MS", label: "Max Poll Interval (ms)", type: "number", placeholder: "300000", tooltip: "Maximum time between consumer polls before the broker considers this consumer dead and rebalances its partitions." },
+      { key: "KAFKA_SESSION_TIMEOUT_MS", label: "Session Timeout (ms)", type: "number", placeholder: "45000", tooltip: "How long a consumer can be unresponsive before the broker removes it from the group. Lower = faster failure detection." },
+      { key: "KAFKA_HEARTBEAT_INTERVAL_MS", label: "Heartbeat Interval (ms)", type: "number", placeholder: "3000", tooltip: "How often the consumer sends heartbeats to the broker. Should be less than 1/3 of session timeout." },
+      { key: "KAFKA_FETCH_MIN_BYTES", label: "Fetch Min Bytes", type: "number", placeholder: "1", tooltip: "Minimum amount of data the broker waits to accumulate before responding to a fetch request. Higher values reduce requests but add latency." },
+      { key: "KAFKA_FETCH_MAX_BYTES", label: "Fetch Max Bytes", type: "number", placeholder: "52428800", tooltip: "Maximum amount of data fetched in a single request. Default 50MB. Increase for high-throughput consumers." },
     ],
   },
   {
@@ -484,14 +501,14 @@ const SECTIONS: ConfigSection[] = [
     icon: Layers,
     gradient: "from-purple-600 to-purple-800 shadow-purple-700/20",
     keys: [
-      { key: "KAFKA_DEFAULT_PARTITIONS", label: "Default Partitions", type: "number", placeholder: "3" },
-      { key: "KAFKA_DEFAULT_REPLICATION_FACTOR", label: "Replication Factor", type: "number", placeholder: "1" },
-      { key: "KAFKA_TOPIC_RETENTION_MS", label: "Retention (ms)", type: "number", placeholder: "604800000" },
-      { key: "KAFKA_TOPIC_CLEANUP_POLICY", label: "Cleanup Policy", type: "select", options: ["delete", "compact", "delete,compact"] },
-      { key: "KAFKA_CONNECTOR_GROUP_ID", label: "Connector Group ID", placeholder: "mai-connector-group" },
-      { key: "KAFKA_CONNECTOR_MAX_MESSAGES", label: "Connector Max Messages", type: "number", placeholder: "100" },
-      { key: "KAFKA_CONNECTOR_POLL_TIMEOUT_S", label: "Connector Poll Timeout (s)", type: "number", placeholder: "10" },
-      { key: "KAFKA_SERVICE_THREADS", label: "Service Thread Pool Size", type: "number", placeholder: "4" },
+      { key: "KAFKA_DEFAULT_PARTITIONS", label: "Default Partitions", type: "number", placeholder: "3", tooltip: "Number of partitions for auto-created topics. More partitions = higher parallelism but more overhead. Match to your consumer count." },
+      { key: "KAFKA_DEFAULT_REPLICATION_FACTOR", label: "Replication Factor", type: "number", placeholder: "1", tooltip: "Number of broker replicas for each partition. Set to 3 in production (survives 2 broker failures). 1 is fine for development." },
+      { key: "KAFKA_TOPIC_RETENTION_MS", label: "Retention (ms)", type: "number", placeholder: "604800000", tooltip: "How long Kafka keeps messages before deleting. Default 7 days (604800000ms). Increase for audit trails; decrease to save disk space." },
+      { key: "KAFKA_TOPIC_CLEANUP_POLICY", label: "Cleanup Policy", type: "select", options: ["delete", "compact", "delete,compact"], tooltip: "How Kafka removes old data. 'delete' = remove after retention; 'compact' = keep latest per key; 'delete,compact' = both strategies." },
+      { key: "KAFKA_CONNECTOR_GROUP_ID", label: "Connector Group ID", placeholder: "mai-connector-group", tooltip: "Consumer group used by the Kafka Connect sink connector. Must be unique per connector to avoid conflicts." },
+      { key: "KAFKA_CONNECTOR_MAX_MESSAGES", label: "Connector Max Messages", type: "number", placeholder: "100", tooltip: "Maximum messages the connector processes in a single poll cycle. Higher values increase throughput but use more memory." },
+      { key: "KAFKA_CONNECTOR_POLL_TIMEOUT_S", label: "Connector Poll Timeout (s)", type: "number", placeholder: "10", tooltip: "How long the connector waits for new messages before returning an empty poll. Lower values = more responsive; higher = less CPU usage." },
+      { key: "KAFKA_SERVICE_THREADS", label: "Service Thread Pool Size", type: "number", placeholder: "4", tooltip: "Number of threads in the Kafka service thread pool. Controls how many operations (produce, consume, admin) can run concurrently." },
     ],
   },
   {
@@ -501,8 +518,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Network,
     gradient: "from-indigo-500 to-indigo-700 shadow-indigo-600/20",
     keys: [
-      { key: "NATS_URL", label: "NATS URL", type: "url", placeholder: "nats://localhost:4222" },
-      { key: "PULSAR_URL", label: "Pulsar URL", type: "url", placeholder: "pulsar://localhost:6650" },
+      { key: "NATS_URL", label: "NATS URL", type: "url", placeholder: "nats://localhost:4222", tooltip: "NATS JetStream server URL. NATS is a lightweight, high-performance messaging system. JetStream adds persistence." },
+      { key: "PULSAR_URL", label: "Pulsar URL", type: "url", placeholder: "pulsar://localhost:6650", tooltip: "Apache Pulsar broker URL. Pulsar is a multi-tenant, geo-replicated messaging platform. StreamNative provides managed Pulsar." },
     ],
   },
   {
@@ -512,11 +529,11 @@ const SECTIONS: ConfigSection[] = [
     icon: Globe,
     gradient: "from-sky-500 to-sky-700 shadow-sky-600/20",
     keys: [
-      { key: "SQS_REGION", label: "SQS Region", placeholder: "us-east-1" },
-      { key: "SQS_QUEUE_PREFIX", label: "SQS Queue Prefix", placeholder: "mai-" },
-      { key: "GOOGLE_CLOUD_PROJECT", label: "GCP Project ID" },
-      { key: "PUBSUB_SUBSCRIPTION_PREFIX", label: "Pub/Sub Prefix", placeholder: "mai-" },
-      { key: "UPSTASH_BROKER_TYPE", label: "Upstash Mode", type: "select", options: ["redis", "kafka"] },
+      { key: "SQS_REGION", label: "SQS Region", placeholder: "us-east-1", tooltip: "AWS region where your SQS queues are created (e.g. us-east-1, eu-west-1). Must match your AWS infrastructure." },
+      { key: "SQS_QUEUE_PREFIX", label: "SQS Queue Prefix", placeholder: "mai-", tooltip: "Prefix added to SQS queue names. Helps identify queues belonging to this application in your AWS account." },
+      { key: "GOOGLE_CLOUD_PROJECT", label: "GCP Project ID", tooltip: "Your Google Cloud project ID. Required for Pub/Sub access. Find it in the GCP console project selector." },
+      { key: "PUBSUB_SUBSCRIPTION_PREFIX", label: "Pub/Sub Prefix", placeholder: "mai-", tooltip: "Prefix for Google Pub/Sub subscription names. Helps identify subscriptions belonging to this application." },
+      { key: "UPSTASH_BROKER_TYPE", label: "Upstash Mode", type: "select", options: ["redis", "kafka"], tooltip: "Which Upstash managed service to use as broker. Upstash Redis is simpler; Upstash Kafka provides full Kafka compatibility." },
     ],
   },
   {
@@ -526,20 +543,20 @@ const SECTIONS: ConfigSection[] = [
     icon: SettingsIcon,
     gradient: "from-orange-600 to-amber-700 shadow-orange-600/20",
     keys: [
-      { key: "CELERY_WORKER_POOL", label: "Pool Type", type: "select", options: ["solo", "prefork", "threads", "gevent", "eventlet"] },
-      { key: "CELERY_WORKER_CONCURRENCY", label: "Concurrency", type: "number" },
-      { key: "CELERY_WORKER_LOGLEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] },
-      { key: "CELERY_WORKER_QUEUES", label: "Queues (comma-sep)", placeholder: "ingestion,validation" },
-      { key: "CELERY_WORKER_PREFETCH_MULTIPLIER", label: "Prefetch Multiplier", type: "number" },
-      { key: "CELERY_WORKER_MAX_TASKS_PER_CHILD", label: "Max Tasks/Child (0=∞)", type: "number" },
-      { key: "CELERY_TASK_SOFT_TIME_LIMIT", label: "Soft Time Limit (s, 0=off)", type: "number" },
-      { key: "CELERY_TASK_HARD_TIME_LIMIT", label: "Hard Time Limit (s, 0=off)", type: "number" },
-      { key: "CELERY_TASK_MAX_RETRIES", label: "Max Retries", type: "number" },
-      { key: "CELERY_TASK_RETRY_DELAY", label: "Retry Delay (s)", type: "number" },
-      { key: "CELERY_RESULT_EXPIRES", label: "Result Expiry (s)", type: "number" },
-      { key: "CELERY_WORKER_DISABLE_HEARTBEAT", label: "Disable Heartbeat", type: "boolean" },
-      { key: "CELERY_WORKER_DISABLE_GOSSIP", label: "Disable Gossip", type: "boolean" },
-      { key: "CELERY_WORKER_DISABLE_MINGLE", label: "Disable Mingle", type: "boolean" },
+      { key: "CELERY_WORKER_POOL", label: "Pool Type", type: "select", options: ["solo", "prefork", "threads", "gevent", "eventlet"], tooltip: "Worker execution model. 'solo' = single process (debug); 'prefork' = multiple processes (best for CPU tasks); 'gevent/eventlet' = async I/O (best for network tasks)." },
+      { key: "CELERY_WORKER_CONCURRENCY", label: "Concurrency", type: "number", tooltip: "Number of concurrent tasks per worker. For prefork = number of child processes; for gevent = greenlets. 0 = auto-detect CPU count." },
+      { key: "CELERY_WORKER_LOGLEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], tooltip: "Minimum severity for worker log messages. DEBUG shows everything (verbose); ERROR shows only failures. INFO is a good default." },
+      { key: "CELERY_WORKER_QUEUES", label: "Queues (comma-sep)", placeholder: "ingestion,validation", tooltip: "Which task queues this worker consumes from. Separate queues let you route different task types to specialized workers." },
+      { key: "CELERY_WORKER_PREFETCH_MULTIPLIER", label: "Prefetch Multiplier", type: "number", tooltip: "How many tasks each worker prefetches from the broker. 1 = fair distribution; higher values improve throughput but reduce fairness." },
+      { key: "CELERY_WORKER_MAX_TASKS_PER_CHILD", label: "Max Tasks/Child (0=∞)", type: "number", tooltip: "Replace child process after this many tasks to free leaked memory. 0 = never replace. Set to 100-1000 if you see memory growth." },
+      { key: "CELERY_TASK_SOFT_TIME_LIMIT", label: "Soft Time Limit (s, 0=off)", type: "number", tooltip: "Raises SoftTimeLimitExceeded in the task after this many seconds, giving it a chance to clean up before being killed." },
+      { key: "CELERY_TASK_HARD_TIME_LIMIT", label: "Hard Time Limit (s, 0=off)", type: "number", tooltip: "Forcefully kills the task after this many seconds with no cleanup. Should be higher than soft limit. 0 = no limit." },
+      { key: "CELERY_TASK_MAX_RETRIES", label: "Max Retries", type: "number", tooltip: "Maximum times a failed task is retried before being marked as permanently failed. Set based on your error tolerance." },
+      { key: "CELERY_TASK_RETRY_DELAY", label: "Retry Delay (s)", type: "number", tooltip: "Seconds to wait between retry attempts. Gives transient issues (network, DB locks) time to resolve." },
+      { key: "CELERY_RESULT_EXPIRES", label: "Result Expiry (s)", type: "number", tooltip: "How long task results are kept in the result backend before being deleted. Longer retention uses more storage." },
+      { key: "CELERY_WORKER_DISABLE_HEARTBEAT", label: "Disable Heartbeat", type: "boolean", tooltip: "Stop sending periodic heartbeats to the broker. Reduces network traffic but makes it harder to detect dead workers." },
+      { key: "CELERY_WORKER_DISABLE_GOSSIP", label: "Disable Gossip", type: "boolean", tooltip: "Stop sharing worker state with other workers. Reduces overhead in large clusters where you don't need worker discovery." },
+      { key: "CELERY_WORKER_DISABLE_MINGLE", label: "Disable Mingle", type: "boolean", tooltip: "Skip synchronizing clock and revoked tasks on startup. Speeds up worker boot but may miss previously revoked tasks." },
     ],
   },
 
@@ -551,9 +568,9 @@ const SECTIONS: ConfigSection[] = [
     icon: SearchIcon,
     gradient: "from-indigo-500 to-indigo-700 shadow-indigo-600/20",
     keys: [
-      { key: "SERPER_API_KEY", label: "API Key", sensitive: true },
-      { key: "SEARCH_RESULTS_LIMIT", label: "Results Limit", type: "number" },
-      { key: "SEARCH_CACHE_EXPIRY_HOURS", label: "Cache Expiry (hrs)", type: "number" },
+      { key: "SERPER_API_KEY", label: "API Key", sensitive: true, tooltip: "Your Serper.dev API key for web search augmentation. Enables RAG answers to include live web results." },
+      { key: "SEARCH_RESULTS_LIMIT", label: "Results Limit", type: "number", tooltip: "Maximum number of web search results to fetch per query. More results give broader context but increase latency and cost." },
+      { key: "SEARCH_CACHE_EXPIRY_HOURS", label: "Cache Expiry (hrs)", type: "number", tooltip: "How long web search results are cached before fetching fresh ones. Reduces API costs for repeated queries." },
     ],
   },
   {
@@ -563,8 +580,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Image,
     gradient: "from-rose-500 to-rose-700 shadow-rose-600/20",
     keys: [
-      { key: "AI_IMAGE_MODEL", label: "Model" },
-      { key: "DEEPAI_API_KEY", label: "API Key", sensitive: true },
+      { key: "AI_IMAGE_MODEL", label: "Model", tooltip: "AI model used for generating images from text prompts. Options depend on the API provider (e.g. DeepAI, DALL-E)." },
+      { key: "DEEPAI_API_KEY", label: "API Key", sensitive: true, tooltip: "Your DeepAI API key for AI image generation. Get one at deepai.org." },
     ],
   },
 
@@ -576,9 +593,9 @@ const SECTIONS: ConfigSection[] = [
     icon: Activity,
     gradient: "from-purple-500 to-purple-700 shadow-purple-600/20",
     keys: [
-      { key: "SENTRY_DSN", label: "DSN", sensitive: true, placeholder: "https://key@sentry.io/project" },
-      { key: "ENVIRONMENT", label: "Environment", type: "select", options: ["development", "staging", "production"] },
-      { key: "SENTRY_TRACES_SAMPLE_RATE", label: "Traces Sample Rate", type: "number", placeholder: "0.1" },
+      { key: "SENTRY_DSN", label: "DSN", sensitive: true, placeholder: "https://key@sentry.io/project", tooltip: "Sentry Data Source Name — the URL that tells the SDK where to send error reports. Find it in your Sentry project settings." },
+      { key: "ENVIRONMENT", label: "Environment", type: "select", options: ["development", "staging", "production"], tooltip: "Tags all Sentry events with this environment label. Use to filter errors by deployment stage in the Sentry dashboard." },
+      { key: "SENTRY_TRACES_SAMPLE_RATE", label: "Traces Sample Rate", type: "number", placeholder: "0.1", tooltip: "Fraction of requests to trace for performance monitoring (0.0-1.0). 0.1 = 10% of requests. Higher values increase cost." },
     ],
   },
   {
@@ -588,8 +605,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Activity,
     gradient: "from-cyan-500 to-cyan-700 shadow-cyan-600/20",
     keys: [
-      { key: "LOG_FORMAT", label: "Log Format", type: "select", options: ["text", "json"] },
-      { key: "LOG_LEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] },
+      { key: "LOG_FORMAT", label: "Log Format", type: "select", options: ["text", "json"], tooltip: "Output format for application logs. 'text' is human-readable for local development; 'json' is structured for log aggregators (ELK, Datadog)." },
+      { key: "LOG_LEVEL", label: "Log Level", type: "select", options: ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], tooltip: "Minimum severity level for log output. DEBUG = all messages; ERROR = only errors. INFO is recommended for production." },
     ],
   },
   {
@@ -599,7 +616,7 @@ const SECTIONS: ConfigSection[] = [
     icon: Shield,
     gradient: "from-rose-500 to-rose-700 shadow-rose-600/20",
     keys: [
-      { key: "RATE_LIMIT_DEFAULT", label: "Default Limit", placeholder: "200/minute" },
+      { key: "RATE_LIMIT_DEFAULT", label: "Default Limit", placeholder: "200/minute", tooltip: "Global rate limit applied to all API endpoints. Format: 'count/period' (e.g. '200/minute', '1000/hour'). Protects against abuse and DoS." },
     ],
   },
 
@@ -611,7 +628,7 @@ const SECTIONS: ConfigSection[] = [
     icon: Database,
     gradient: "from-blue-500 to-blue-700 shadow-blue-600/20",
     keys: [
-      { key: "DATABASE_URL", label: "Connection String", sensitive: true },
+      { key: "DATABASE_URL", label: "Connection String", sensitive: true, tooltip: "PostgreSQL connection string in format: postgresql://user:password@host:port/dbname. This is the primary database for all application data." },
     ],
   },
   {
@@ -621,9 +638,9 @@ const SECTIONS: ConfigSection[] = [
     icon: Shield,
     gradient: "from-red-500 to-red-700 shadow-red-600/20",
     keys: [
-      { key: "JWT_SECRET", label: "JWT Secret", sensitive: true },
-      { key: "JWT_ALGORITHM", label: "Algorithm", type: "select", options: ["HS256", "HS384", "HS512"] },
-      { key: "ACCESS_TOKEN_EXPIRE_MINUTES", label: "Token Expiry (min)", type: "number" },
+      { key: "JWT_SECRET", label: "JWT Secret", sensitive: true, tooltip: "Secret key used to sign and verify JWT authentication tokens. Must be a long random string. Never share or commit to version control." },
+      { key: "JWT_ALGORITHM", label: "Algorithm", type: "select", options: ["HS256", "HS384", "HS512"], tooltip: "Hashing algorithm for JWT tokens. HS256 is fastest; HS512 is most secure. All use symmetric HMAC signing with the JWT Secret." },
+      { key: "ACCESS_TOKEN_EXPIRE_MINUTES", label: "Token Expiry (min)", type: "number", tooltip: "How many minutes before an access token expires and the user must re-authenticate. Shorter = more secure; longer = less login friction." },
     ],
   },
   {
@@ -633,8 +650,8 @@ const SECTIONS: ConfigSection[] = [
     icon: Globe,
     gradient: "from-sky-500 to-sky-700 shadow-sky-600/20",
     keys: [
-      { key: "CORS_ORIGINS", label: "Allowed Origins", placeholder: "* or comma-separated URLs" },
-      { key: "VITE_API_URL", label: "Frontend API URL", type: "url" },
+      { key: "CORS_ORIGINS", label: "Allowed Origins", placeholder: "* or comma-separated URLs", tooltip: "Which domains can make API requests. '*' allows all (development only). In production, list specific origins (e.g. https://yourdomain.com)." },
+      { key: "VITE_API_URL", label: "Frontend API URL", type: "url", tooltip: "Base URL the frontend uses to call the backend API. Must include protocol and port (e.g. http://localhost:8000). Change when deploying." },
     ],
   },
   {
@@ -644,15 +661,15 @@ const SECTIONS: ConfigSection[] = [
     icon: Clock,
     gradient: "from-amber-500 to-amber-700 shadow-amber-600/20",
     keys: [
-      { key: "ENABLE_VALIDATION", label: "Validation Worker", type: "boolean" },
-      { key: "ENABLE_CONFLICT", label: "Conflict Detection", type: "boolean" },
-      { key: "ENABLE_TEMPORAL", label: "Temporal Worker", type: "boolean" },
-      { key: "VALIDATION_INTERVAL", label: "Validation Interval (sec)", type: "number" },
-      { key: "CONFLICT_INTERVAL", label: "Conflict Interval (sec)", type: "number" },
-      { key: "TEMPORAL_INTERVAL", label: "Temporal Interval (sec)", type: "number" },
-      { key: "VALIDATION_BATCH_SIZE", label: "Validation Batch", type: "number" },
-      { key: "CONFLICT_BATCH_SIZE", label: "Conflict Batch", type: "number" },
-      { key: "TEMPORAL_BATCH_SIZE", label: "Temporal Batch", type: "number" },
+      { key: "ENABLE_VALIDATION", label: "Validation Worker", type: "boolean", tooltip: "Enable the background validation worker that periodically checks ingested content for integrity issues (hash mismatches, missing vectors)." },
+      { key: "ENABLE_CONFLICT", label: "Conflict Detection", type: "boolean", tooltip: "Enable background detection of conflicting content — documents that contain contradictory information about the same topic." },
+      { key: "ENABLE_TEMPORAL", label: "Temporal Worker", type: "boolean", tooltip: "Enable detection of outdated content based on timestamps. Flags documents that may contain stale information." },
+      { key: "VALIDATION_INTERVAL", label: "Validation Interval (sec)", type: "number", tooltip: "Seconds between validation worker runs. Lower = more frequent checks but more CPU/DB load." },
+      { key: "CONFLICT_INTERVAL", label: "Conflict Interval (sec)", type: "number", tooltip: "Seconds between conflict detection runs. Conflict detection compares document pairs, so it can be CPU-intensive at scale." },
+      { key: "TEMPORAL_INTERVAL", label: "Temporal Interval (sec)", type: "number", tooltip: "Seconds between temporal staleness checks. Scans documents for date-related content that may be expired." },
+      { key: "VALIDATION_BATCH_SIZE", label: "Validation Batch", type: "number", tooltip: "Number of documents processed per validation run. Larger batches catch more issues per cycle but take longer." },
+      { key: "CONFLICT_BATCH_SIZE", label: "Conflict Batch", type: "number", tooltip: "Number of document pairs compared per conflict detection run. Keep moderate to avoid long-running queries." },
+      { key: "TEMPORAL_BATCH_SIZE", label: "Temporal Batch", type: "number", tooltip: "Number of documents scanned per temporal check run. Higher = more thorough per cycle." },
     ],
   },
 ];
@@ -708,6 +725,7 @@ function ConfigField({
         <div className="flex items-center gap-2 mb-1.5">
           <span className="text-xs font-mono text-slate-400">{keyDef.key}</span>
           <span className="text-xs font-medium text-slate-600">{keyDef.label}</span>
+          {keyDef.tooltip && <InfoTooltip text={keyDef.tooltip} />}
           {isChanged && (
             <span className="ml-auto text-[10px] font-semibold text-amber-600 bg-amber-100 rounded px-1.5 py-0.5">Modified</span>
           )}
@@ -751,7 +769,10 @@ function ConfigField({
     <div className="group flex items-center justify-between py-3.5 border-b border-slate-100 last:border-0 hover:bg-slate-50/50 px-4 -mx-4 rounded-lg transition-colors">
       <div className="flex flex-col gap-0.5">
         <span className="text-xs font-mono text-slate-400">{keyDef.key}</span>
-        <span className="text-sm font-medium text-slate-700">{keyDef.label}</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-sm font-medium text-slate-700">{keyDef.label}</span>
+          {keyDef.tooltip && <InfoTooltip text={keyDef.tooltip} />}
+        </div>
       </div>
       <div className="flex items-center gap-2">
         {keyDef.type === "badge" || keyDef.type === "select" ? (

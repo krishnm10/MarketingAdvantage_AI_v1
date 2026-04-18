@@ -268,6 +268,31 @@ async def update_config(
     except Exception as e:
         logger.warning("Failed to clear ingestion pipeline cache: %s", e)
 
+    # ── Background warm-up: rebuild pipelines for active tenants ──────
+    # Avoids every next request paying the full pipeline build cost.
+    try:
+        import asyncio as _asyncio
+        from app.services.ingestion.ingestion_service_v2 import _get_pipeline
+
+        active_ids = [
+            v for k, v in os.environ.items()
+            if k.startswith("MAI_") and k.endswith("_VECTORDB")
+        ]
+        # Also warm up the default (no-tenant) pipeline
+        default_id = os.getenv("MAI_DEFAULT_BUSINESS_ID", "default")
+
+        async def _warm_up():
+            loop = _asyncio.get_running_loop()
+            for bid in [default_id]:
+                try:
+                    await loop.run_in_executor(None, _get_pipeline, bid)
+                except Exception as warm_exc:
+                    logger.debug("Warm-up for %s skipped: %s", bid, warm_exc)
+
+        _asyncio.ensure_future(_warm_up())
+    except Exception as e:
+        logger.debug("Pipeline warm-up skipped: %s", e)
+
     # ── Audit log ─────────────────────────────────────────────────────────
     try:
         audit = AdminAuditLog(

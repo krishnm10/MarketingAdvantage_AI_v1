@@ -15,9 +15,13 @@ Notes:
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import List
 
 from app.core.embedders.base import BaseEmbedder, EmbedderInfo, _l2_normalize
+
+logger = logging.getLogger(__name__)
 
 
 class OllamaEmbedder(BaseEmbedder):
@@ -42,9 +46,33 @@ class OllamaEmbedder(BaseEmbedder):
         self._normalize = bool(normalize)
         self._supports_batch_embed = hasattr(self._client, "embed")
 
-        # Determine dim once (cheap + avoids config mismatch later)
-        test = self.embed_query("dim_probe")
-        self._dim = len(test)
+        # Determine dim once — retry with exponential backoff so a
+        # momentarily-unavailable Ollama doesn't crash the whole pipeline.
+        _MAX_RETRIES = 3
+        _BACKOFF = [1, 2, 4]  # seconds
+        last_err: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                test = self.embed_query("dim_probe")
+                self._dim = len(test)
+                last_err = None
+                break
+            except Exception as exc:
+                last_err = exc
+                wait = _BACKOFF[attempt] if attempt < len(_BACKOFF) else _BACKOFF[-1]
+                logger.warning(
+                    "[OllamaEmbedder] dim_probe attempt %d/%d failed (%s). "
+                    "Retrying in %ds …",
+                    attempt + 1, _MAX_RETRIES, exc, wait,
+                )
+                time.sleep(wait)
+
+        if last_err is not None:
+            raise RuntimeError(
+                f"[OllamaEmbedder] Failed to probe embedding dimension after "
+                f"{_MAX_RETRIES} attempts. Is Ollama running at {base_url}? "
+                f"Last error: {last_err}"
+            ) from last_err
 
     @property
     def info(self) -> EmbedderInfo:

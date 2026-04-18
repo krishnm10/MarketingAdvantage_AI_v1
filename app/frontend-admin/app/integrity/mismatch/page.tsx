@@ -16,7 +16,7 @@ export default function Mismatch() {
 
   useEffect(() => {
     apiClient
-      .get("/integrity/content-mismatch")
+      .get("/api/v2/ingestion-admin/integrity/content-mismatch")
       .then((res) => setData(res.data.mismatches || []))
       .catch((err) => console.error("Content mismatch fetch error:", err))
       .finally(() => setLoading(false));

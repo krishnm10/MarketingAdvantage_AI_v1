@@ -65,7 +65,9 @@ from app.core.llms.base       import BaseLLM
 from app.core.llms.chain      import LLMChain, ChainResult
 
 # ── Pipeline config (from AssembledPipeline built by PipelineFactory) ──────
-from app.core.config.client_config_schema import ClientConfig, RetrievalConfig
+from app.core.config.client_config_schema import (
+    ClientConfig, RetrievalConfig, SearchMode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +183,19 @@ class RAGPipeline:
             self._reranker_model,
         )
 
+        # Startup check: warn if trust scoring is enabled but calculator
+        # is missing — prevents silent fallback going unnoticed.
+        if config.retrieval.enable_trust_scoring:
+            try:
+                from app.services.retrieval.trust_calculator import TrustCalculator  # noqa: F401
+            except ImportError:
+                logger.warning(
+                    "[RAGPipeline] client=%s: enable_trust_scoring=True but "
+                    "trust_calculator module is not importable. Trust scores "
+                    "will use fallback average-score method.",
+                    config.client_id,
+                )
+
     # =========================================================================
     # Main query entrypoint — this is what callers use
     # =========================================================================
@@ -241,11 +256,32 @@ class RAGPipeline:
         )
 
         # ─────────────────────────────────────────────────────────────
-        # STEP 1 — Embed the query
+        # STEP 1 — Embed the query (with optional HyDE expansion)
         # Uses whatever embedder is plugged in (OpenAI/Ollama/HF/Cohere)
+        # Cached via embedding_cache to avoid duplicate work for
+        # identical concurrent queries.
+        #
+        # HyDE: if enabled AND an LLM is available, generate a
+        # hypothetical answer first and embed THAT instead of the
+        # raw query.  Falls back to raw query if LLM call fails.
         # ─────────────────────────────────────────────────────────────
         t0 = time.perf_counter()
-        query_embedding = self.embedder.embed_query(user_query)
+        embed_text = user_query
+
+        if retrieval_cfg.enable_hyde and self.llm is not None:
+            try:
+                hyde_text = self._hyde_expand(user_query)
+                if hyde_text:
+                    embed_text = hyde_text
+                    logger.info("[RAGPipeline] HyDE: embedding hypothetical answer (%d chars)", len(hyde_text))
+            except Exception as e:
+                logger.warning("[RAGPipeline] HyDE expansion failed, using raw query: %s", e)
+
+        try:
+            from app.core.embedders.embedding_cache import get_cached_query_embedding
+            query_embedding = get_cached_query_embedding(self.embedder, embed_text)
+        except ImportError:
+            query_embedding = self.embedder.embed_query(embed_text)
         latency["embed_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         logger.debug(
@@ -254,9 +290,12 @@ class RAGPipeline:
         )
 
         # ─────────────────────────────────────────────────────────────
-        # STEP 2 — Vector search
+        # STEP 2 — Vector search (+ optional keyword/hybrid search)
         # Uses whatever VectorDB is plugged in (Pinecone/Qdrant/Chroma/…)
+        # When search_mode=HYBRID, also runs BM25 keyword search and
+        # merges via Reciprocal Rank Fusion (RRF).
         # ─────────────────────────────────────────────────────────────
+        search_mode = retrieval_cfg.search_mode
         t0 = time.perf_counter()
         vector_hits: List[VectorHit] = self.vectordb.search(
             collection=collection,
@@ -267,8 +306,8 @@ class RAGPipeline:
         latency["vectordb_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         logger.info(
-            "[RAGPipeline] VectorDB returned %d hits | %.1fms",
-            len(vector_hits), latency["vectordb_ms"],
+            "[RAGPipeline] VectorDB returned %d hits | %.1fms | mode=%s",
+            len(vector_hits), latency["vectordb_ms"], search_mode.value,
         )
 
         # Serialize hits to dict list for downstream use
@@ -281,6 +320,59 @@ class RAGPipeline:
             }
             for h in vector_hits
         ]
+
+        # ── Hybrid / keyword search branch ────────────────────────
+        if search_mode in (SearchMode.HYBRID, SearchMode.KEYWORD) and vector_hits:
+            try:
+                from app.core.search.bm25_index import BM25Index
+                from app.core.search.rrf_fusion import reciprocal_rank_fusion
+
+                t0 = time.perf_counter()
+                bm25 = BM25Index()
+                bm25.build(retrieved_chunks)
+                keyword_hits = bm25.search(user_query, k=k_retrieval)
+                keyword_dicts = [
+                    {"id": h.id, "text": h.text, "score": h.score, "metadata": h.metadata}
+                    for h in keyword_hits
+                ]
+                latency["bm25_ms"] = round((time.perf_counter() - t0) * 1000, 2)
+
+                if search_mode == SearchMode.HYBRID:
+                    fused = reciprocal_rank_fusion(
+                        vector_hits=retrieved_chunks,
+                        keyword_hits=keyword_dicts,
+                        alpha=retrieval_cfg.hybrid_alpha,
+                        top_k=k_retrieval,
+                    )
+                    retrieved_chunks = [
+                        {
+                            "id":       f.id,
+                            "text":     f.text,
+                            "score":    f.rrf_score,
+                            "metadata": f.metadata,
+                        }
+                        for f in fused
+                    ]
+                    logger.info(
+                        "[RAGPipeline] Hybrid RRF fused %d results | "
+                        "alpha=%.2f | bm25_ms=%.1f",
+                        len(retrieved_chunks),
+                        retrieval_cfg.hybrid_alpha,
+                        latency["bm25_ms"],
+                    )
+                else:
+                    # KEYWORD only — replace vector results with BM25
+                    retrieved_chunks = keyword_dicts
+                    logger.info(
+                        "[RAGPipeline] Keyword-only: %d BM25 results | %.1fms",
+                        len(retrieved_chunks), latency["bm25_ms"],
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[RAGPipeline] Hybrid search failed, falling back to "
+                    "vector-only: %s", e,
+                )
+                latency["bm25_ms"] = 0.0
 
         # ─────────────────────────────────────────────────────────────
         # STEP 3 — Reranking (optional)
@@ -381,6 +473,7 @@ class RAGPipeline:
                 prompt = self._build_rag_prompt(
                     query=user_query,
                     context=context_str,
+                    system_prompt=llm_system_prompt,
                 )
                 llm_response = self.llm.generate(
                     prompt,
@@ -481,16 +574,20 @@ class RAGPipeline:
         return "\n\n".join(parts)
 
     @staticmethod
-    def _build_rag_prompt(query: str, context: str) -> str:
+    def _build_rag_prompt(query: str, context: str, system_prompt: Optional[str] = None) -> str:
         """
         Build the final RAG prompt sent to the LLM.
-        Structured for maximum LLM comprehension and citation accuracy.
+        Uses per-client system_prompt if provided, otherwise the default.
         """
-        return (
+        default_system = (
             "You are a Marketing Intelligence Assistant for enterprise businesses.\n"
             "Answer the question using ONLY the context provided below.\n"
             "If the context does not contain enough information, say so clearly.\n"
-            "Cite the source number [1], [2], etc. when referencing specific facts.\n\n"
+            "Cite the source number [1], [2], etc. when referencing specific facts."
+        )
+        prompt_prefix = system_prompt or default_system
+        return (
+            f"{prompt_prefix}\n\n"
             f"Context:\n{context}\n\n"
             f"Question: {query}\n\n"
             "Answer:"
@@ -511,31 +608,66 @@ class RAGPipeline:
         merged.update(request_filters or {})
         return merged if merged else None
 
+    def _hyde_expand(self, query: str) -> Optional[str]:
+        """
+        HyDE: ask the LLM to generate a hypothetical short answer, then
+        embed that answer instead of the raw query.  This often produces
+        embeddings closer to the real answer in vector space.
+
+        Returns None if the LLM is a chain (chains need context) or if
+        the response is too short to be useful.
+        """
+        if isinstance(self.llm, LLMChain):
+            return None
+        hyde_prompt = (
+            "Write a short factual paragraph that would answer this question. "
+            "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
+            f"Question: {query}\n\nAnswer:"
+        )
+        resp = self.llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
+        text = (resp.text or "").strip()
+        # Fall back to raw query if response is trivially short
+        return text if len(text) > 20 else None
+
     def _calculate_trust(self, chunks: List[Dict[str, Any]]) -> float:
         """
         Calculate trust/confidence score from context chunks.
+
         Uses existing trust_calculator.py if available,
         falls back to a simple average score calculation.
         """
         try:
-            # Hook into existing trust_calculator.py
-            # (preserves your existing trust scoring logic)
             from app.services.retrieval.trust_calculator import TrustCalculator
             calculator = TrustCalculator()
             return calculator.calculate(chunks)
         except ImportError:
-            # Fallback: weighted average of rerank_score (preferred) or score
-            if not chunks:
-                return 0.0
-            scores = []
-            for c in chunks:
-                score = (
-                    c.get("rerank_score")
-                    or c.get("score")
-                    or 0.0
-                )
-                scores.append(float(score))
-            return round(sum(scores) / len(scores), 4) if scores else 0.0
+            logger.warning(
+                "[RAGPipeline] trust_calculator not importable — using "
+                "fallback average-score trust. Install or fix the module "
+                "to get proper trust scoring."
+            )
+            return self._fallback_trust(chunks)
+        except Exception as e:
+            logger.warning(
+                "[RAGPipeline] TrustCalculator.calculate() raised %s — "
+                "using fallback average-score trust.", e,
+            )
+            return self._fallback_trust(chunks)
+
+    @staticmethod
+    def _fallback_trust(chunks: List[Dict[str, Any]]) -> float:
+        """Simple average of rerank_score or score when TrustCalculator is unavailable."""
+        if not chunks:
+            return 0.0
+        scores = []
+        for c in chunks:
+            score = (
+                c.get("rerank_score")
+                or c.get("score")
+                or 0.0
+            )
+            scores.append(float(score))
+        return round(sum(scores) / len(scores), 4) if scores else 0.0
 
     def health_check(self) -> Dict[str, Any]:
         """

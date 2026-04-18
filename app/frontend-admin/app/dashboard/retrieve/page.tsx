@@ -24,6 +24,7 @@ import {
   Info,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import InfoTooltip from "@/components/ui/InfoTooltip";
 
 /* ────────────────────────────────────────────────────────────
    Types
@@ -51,6 +52,7 @@ interface ResultItem {
 interface RetrieveResponse {
   query: string;
   intent: string;
+  search_mode?: string;
   total_results: number;
   total_dropped: number;
   latency_ms: number;
@@ -236,6 +238,10 @@ export default function RetrievePage() {
   const [query, setQuery] = useState("");
   const [intent, setIntent] = useState<string>("answer");
   const [topK, setTopK] = useState<string>("");
+  const [searchMode, setSearchMode] = useState<string>("semantic");
+  const [enableHyde, setEnableHyde] = useState(false);
+  const [hybridAlpha, setHybridAlpha] = useState<number>(0.7);
+  const [similarityThreshold, setSimilarityThreshold] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -256,6 +262,11 @@ export default function RetrievePage() {
     try {
       const payload: Record<string, any> = { query: q, intent };
       if (topK && parseInt(topK) > 0) payload.top_k = parseInt(topK);
+      if (searchMode !== "semantic") payload.search_mode = searchMode;
+      if (enableHyde) payload.enable_hyde = true;
+      if (searchMode === "hybrid") payload.hybrid_alpha = hybridAlpha;
+      if (similarityThreshold && parseFloat(similarityThreshold) > 0)
+        payload.similarity_threshold = parseFloat(similarityThreshold);
 
       const res = await apiClient.post<RetrieveResponse>("/api/v2/retrieve/query", payload);
       const entry: HistoryEntry = {
@@ -345,22 +356,89 @@ export default function RetrievePage() {
 
           {/* Advanced settings */}
           {showSettings && (
-            <div className="flex items-center gap-4 mb-4 p-3 rounded-lg bg-slate-50 border border-slate-100">
-              <div className="flex items-center gap-2">
-                <label className="text-xs text-slate-500 font-medium">Top K:</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={50}
-                  value={topK}
-                  onChange={(e) => setTopK(e.target.value)}
-                  placeholder="default"
-                  className="w-20 rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none"
-                />
+            <div className="space-y-3 mb-4 p-4 rounded-lg bg-slate-50 border border-slate-100">
+              {/* Row 1: Top K + Search Mode */}
+              <div className="flex flex-wrap items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 font-medium">Top K:</label>
+                  <InfoTooltip text="Number of top matching chunks to retrieve. Higher values return more context but may include less relevant results." />
+                  <input
+                    type="number"
+                    min={1}
+                    max={50}
+                    value={topK}
+                    onChange={(e) => setTopK(e.target.value)}
+                    placeholder="default"
+                    className="w-20 rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 font-medium">Search Mode:</label>
+                  <InfoTooltip text="How to search the vector store. Semantic = meaning-based (best for questions); Hybrid = combines semantic + keyword BM25 (best overall); Keyword = exact text match only." />
+                  <select
+                    value={searchMode}
+                    onChange={(e) => setSearchMode(e.target.value)}
+                    className="rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none bg-white"
+                  >
+                    <option value="semantic">Semantic</option>
+                    <option value="hybrid">Hybrid (Semantic + BM25)</option>
+                    <option value="keyword">Keyword (BM25)</option>
+                  </select>
+                </div>
+                <div className="flex items-center gap-2">
+                  <label className="text-xs text-slate-500 font-medium">Min Score:</label>
+                  <InfoTooltip text="Minimum similarity score (0.0-1.0) to include a result. Higher values filter out less relevant chunks. 0.0 returns everything." />
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={similarityThreshold}
+                    onChange={(e) => setSimilarityThreshold(e.target.value)}
+                    placeholder="0.0"
+                    className="w-20 rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none"
+                  />
+                </div>
               </div>
-              <div className="flex items-center gap-1 text-[10px] text-slate-400">
-                <Info className="w-3 h-3" />
-                Override max results (leave empty for policy default)
+
+              {/* Row 2: Hybrid Alpha slider (visible when hybrid mode) */}
+              {searchMode === "hybrid" && (
+                <div className="flex items-center gap-3">
+                  <label className="text-xs text-slate-500 font-medium whitespace-nowrap">
+                    Hybrid Alpha: <span className="font-mono text-slate-700">{hybridAlpha.toFixed(2)}</span>
+                  </label>
+                  <InfoTooltip text="Balance between semantic and keyword search. 0.0 = pure keyword (BM25); 1.0 = pure semantic (embeddings). 0.5 is a balanced default." />
+                  <input
+                    type="range"
+                    min={0}
+                    max={1}
+                    step={0.05}
+                    value={hybridAlpha}
+                    onChange={(e) => setHybridAlpha(parseFloat(e.target.value))}
+                    className="flex-1 h-1.5 accent-primary-600"
+                  />
+                  <div className="flex justify-between text-[10px] text-slate-400 w-36">
+                    <span>Keyword</span>
+                    <span>Semantic</span>
+                  </div>
+                </div>
+              )}
+
+              {/* Row 3: HyDE toggle */}
+              <div className="flex items-center gap-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={enableHyde}
+                    onChange={(e) => setEnableHyde(e.target.checked)}
+                    className="rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+                  />
+                  <span className="text-xs text-slate-500 font-medium">HyDE</span>
+                </label>
+                <InfoTooltip text="Hypothetical Document Embeddings — uses an LLM to generate a hypothetical answer first, then searches using that answer's embedding. Improves recall for complex questions but adds latency." />
+                <span className="text-[10px] text-slate-400">
+                  Generate a hypothetical answer to improve embedding quality (requires LLM)
+                </span>
               </div>
             </div>
           )}
@@ -424,6 +502,12 @@ export default function RetrievePage() {
                     <Target className="w-3 h-3" />
                     {entry.intent}
                   </span>
+                  {entry.response.search_mode && entry.response.search_mode !== "semantic" && (
+                    <span className="flex items-center gap-1 text-primary-500">
+                      <Zap className="w-3 h-3" />
+                      {entry.response.search_mode}
+                    </span>
+                  )}
                   <span className="flex items-center gap-1">
                     <FileText className="w-3 h-3" />
                     {entry.response.total_results} result{entry.response.total_results !== 1 ? "s" : ""}

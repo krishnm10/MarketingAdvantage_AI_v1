@@ -135,23 +135,30 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
 
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
-        PERF-FIX: Single batch call — O(1) regardless of len(texts).
-        sentence_transformers handles batching internally via self._batch_size.
+        PERF-FIX: Process in sub-batches of _batch_size to avoid blocking
+        the executor thread indefinitely for very large inputs (1000+ texts).
+        sentence_transformers handles internal batching per sub-call.
         GPU/CPU is selected by _resolve_device() at __init__ time.
         Returns: [[float, ...], [float, ...], ...]
         """
         if not texts:
             return []
         self._load_model()  # FIX-4: no-op after first call
-        vecs = self._m.encode(
-            texts,
-            batch_size=self._batch_size,
-            normalize_embeddings=self._normalize,
-            show_progress_bar=False,
-        ).tolist()
+
+        all_vecs: list = []
+        for start in range(0, len(texts), self._batch_size):
+            batch = texts[start : start + self._batch_size]
+            batch_vecs = self._m.encode(
+                batch,
+                batch_size=self._batch_size,
+                normalize_embeddings=self._normalize,
+                show_progress_bar=False,
+            ).tolist()
+            all_vecs.extend(batch_vecs)
+
         if self._normalize:
-            return [_l2_normalize(v) for v in vecs]
-        return [[float(x) for x in v] for v in vecs]
+            return [_l2_normalize(v) for v in all_vecs]
+        return [[float(x) for x in v] for v in all_vecs]
 
 
 

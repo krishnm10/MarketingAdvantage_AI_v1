@@ -257,8 +257,6 @@ class ChromaVectorDB(BaseVectorDB):
         updated   = len(doc_ids) - inserted
 
         try:
-            count_before = col.count()
-
             col.upsert(
                 ids=doc_ids,
                 embeddings=embeddings,
@@ -267,25 +265,35 @@ class ChromaVectorDB(BaseVectorDB):
             )
 
             # ── POST-UPSERT VERIFICATION ────────────────────────────
-            # ChromaDB PersistentClient writes to SQLite WAL on upsert.
-            # Verify the count changed to catch silent write failures
-            # (e.g. WAL lock contention, disk-full, or segment corruption).
-            count_after = col.count()
-            expected_min = count_before + inserted  # at minimum, new records added
-
-            if inserted > 0 and count_after < expected_min:
+            # Spot-check a random sample of IDs to confirm the write
+            # actually persisted.  Previous approach compared col.count()
+            # before/after, but ChromaDB's SQLite-WAL count is NOT
+            # guaranteed to be immediately consistent — producing
+            # false-positive warnings.  A targeted ID lookup is reliable.
+            import random
+            sample_size = min(5, len(doc_ids))
+            sample_ids  = random.sample(doc_ids, sample_size)
+            try:
+                check = col.get(ids=sample_ids, include=[])
+                found = set(check["ids"]) if check and "ids" in check else set()
+                missing = [sid for sid in sample_ids if sid not in found]
+                if missing:
+                    logger.warning(
+                        "[ChromaVectorDB] batch_upsert VERIFICATION WARNING on '%s': "
+                        "%d/%d sampled IDs not found after upsert: %s. "
+                        "Possible silent write failure.",
+                        collection, len(missing), sample_size, missing,
+                    )
+            except Exception as verify_exc:
                 logger.warning(
-                    "[ChromaVectorDB] batch_upsert VERIFICATION WARNING on '%s': "
-                    "count %d → %d (expected ≥ %d). "
-                    "%d vectors may not have persisted.",
-                    collection, count_before, count_after, expected_min,
-                    expected_min - count_after,
+                    "[ChromaVectorDB] Post-upsert verification query failed on '%s': %s",
+                    collection, verify_exc,
                 )
 
             logger.info(
-                "[ChromaVectorDB] batch_upsert '%s': +%d new, ~%d updated "
-                "(count %d → %d)",
-                collection, inserted, updated, count_before, count_after,
+                "[ChromaVectorDB] batch_upsert '%s': +%d new, ~%d updated, "
+                "%d total vectors submitted",
+                collection, inserted, updated, len(doc_ids),
             )
             return BatchUpsertResult(inserted=inserted, updated=updated)
 

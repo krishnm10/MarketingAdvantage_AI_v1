@@ -35,6 +35,7 @@
 # =============================================
 
 import hashlib
+import json as _json
 import os
 import re
 import uuid
@@ -49,6 +50,110 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 from app.utils.logger import log_info, log_warning
+
+
+# ── L3 Redis embedding offload ───────────────────────────────────────────────
+# For large batches (> _L3_REDIS_THRESHOLD chunks), store precomputed embedding
+# vectors in Redis temp keys (TTL = 300s) instead of holding all in RAM.
+# Transparent fallback to in-memory if Redis is unavailable.
+_L3_REDIS_THRESHOLD = int(os.getenv("DEDUP_L3_REDIS_THRESHOLD", "500"))
+_L3_REDIS_TTL = 300  # seconds
+_l3_redis = None
+_l3_redis_checked = False
+
+
+def _get_l3_redis():
+    """Lazy-connect to Redis for L3 embedding offload. Returns None if unavailable."""
+    global _l3_redis, _l3_redis_checked
+    if _l3_redis_checked:
+        return _l3_redis
+    _l3_redis_checked = True
+    try:
+        import redis
+        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _l3_redis = redis.Redis.from_url(url, decode_responses=True, socket_timeout=2)
+        _l3_redis.ping()
+    except Exception:
+        _l3_redis = None
+    return _l3_redis
+
+
+def _l3_store_embedding(chunk_id: str, embedding: List[float]) -> bool:
+    """Store an embedding vector in Redis. Returns True on success."""
+    r = _get_l3_redis()
+    if r is None:
+        return False
+    try:
+        r.setex(f"mai:l3embed:{chunk_id}", _L3_REDIS_TTL, _json.dumps(embedding))
+        return True
+    except Exception:
+        return False
+
+
+def _l3_get_embedding(chunk_id: str) -> Optional[List[float]]:
+    """Retrieve an embedding vector from Redis. Returns None on miss."""
+    r = _get_l3_redis()
+    if r is None:
+        return None
+    try:
+        val = r.get(f"mai:l3embed:{chunk_id}")
+        if val:
+            return _json.loads(val)
+    except Exception:
+        pass
+    return None
+
+
+# ── L3 Redis embedding offload ───────────────────────────────────────────────
+# For large batches (> _L3_REDIS_THRESHOLD chunks), store precomputed embedding
+# vectors in Redis temp keys (TTL = 300s) instead of holding all in RAM.
+# Transparent fallback to in-memory if Redis is unavailable.
+_L3_REDIS_THRESHOLD = int(os.getenv("DEDUP_L3_REDIS_THRESHOLD", "500"))
+_L3_REDIS_TTL = 300  # seconds
+_l3_redis = None
+_l3_redis_checked = False
+
+
+def _get_l3_redis():
+    """Lazy-connect to Redis for L3 embedding offload. Returns None if unavailable."""
+    global _l3_redis, _l3_redis_checked
+    if _l3_redis_checked:
+        return _l3_redis
+    _l3_redis_checked = True
+    try:
+        import redis
+        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+        _l3_redis = redis.Redis.from_url(url, decode_responses=True, socket_timeout=2)
+        _l3_redis.ping()
+    except Exception:
+        _l3_redis = None
+    return _l3_redis
+
+
+def _l3_store_embedding(chunk_id: str, embedding: List[float]) -> bool:
+    """Store an embedding vector in Redis. Returns True on success."""
+    r = _get_l3_redis()
+    if r is None:
+        return False
+    try:
+        r.setex(f"mai:l3embed:{chunk_id}", _L3_REDIS_TTL, _json.dumps(embedding))
+        return True
+    except Exception:
+        return False
+
+
+def _l3_get_embedding(chunk_id: str) -> Optional[List[float]]:
+    """Retrieve an embedding vector from Redis. Returns None on miss."""
+    r = _get_l3_redis()
+    if r is None:
+        return None
+    try:
+        val = r.get(f"mai:l3embed:{chunk_id}")
+        if val:
+            return _json.loads(val)
+    except Exception:
+        pass
+    return None
 
 
 def _build_gci_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
@@ -92,14 +197,25 @@ def _safe_env_int(key: str, default: int, min_value: int = 1) -> int:
 
 def normalize_for_hash(text: str) -> str:
     """
-    Ultra-aggressive normalization — minor variations never create different hashes.
-    Strips case, whitespace variations, and punctuation.
+    Aggressive normalization — minor variations never create different hashes.
+    Strips case, whitespace variations, and most punctuation.
+
+    Preserves ``%``, ``$``, and ``.`` adjacent to digits so that
+    numeric-heavy content (financial reports, metrics) keeps its
+    semantic meaning.  Examples:
+      "revenue increased 15% in Q3 2024" → "revenue increased 15% in q3 2024"
+      "$1,000.50 profit"                 → "$1000.50 profit"
     """
     if not text or not isinstance(text, str):
         return ""
     text = text.lower()
     text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'[^a-z0-9\s]', '', text)
+    # Remove commas inside numbers (1,000 → 1000) to normalise formatting
+    text = re.sub(r'(?<=\d),(?=\d)', '', text)
+    # Strip everything except alphanumeric, whitespace, %, $, .
+    text = re.sub(r'[^a-z0-9\s%$.]', '', text)
+    # Strip orphaned $ and . (not adjacent to any digit on either side)
+    text = re.sub(r'(?<!\d)[$.](?!\d)', '', text)
     text = text.strip()
     text = ' '.join(text.split())
     return text
@@ -456,6 +572,13 @@ async def deduplicate_chunks(
         # Batch-compute embeddings once for all L2 survivors that do not already
         # carry a cached vector. This removes the old 1-request-per-chunk pattern
         # from semantic dedup and lets the active embedder use its fastest batch path.
+        #
+        # For large batches (> _L3_REDIS_THRESHOLD), offload vectors to Redis
+        # temp keys to avoid holding all embeddings in RAM simultaneously.
+        _use_redis_offload = (
+            len(l2_survivors) > _L3_REDIS_THRESHOLD
+            and _get_l3_redis() is not None
+        )
         uncached_chunks = [
             chunk for chunk in l2_survivors
             if not chunk.get("_cached_embedding")
@@ -479,7 +602,14 @@ async def deduplicate_chunks(
                             f"for {len(batch)} texts"
                         )
                     for chunk, embedding in zip(batch, batch_embeddings):
-                        chunk["_cached_embedding"] = embedding
+                        if _use_redis_offload:
+                            cid = chunk.get("semantic_hash") or chunk.get("id", str(uuid.uuid4()))
+                            if _l3_store_embedding(cid, embedding):
+                                chunk["_cached_embedding_redis_key"] = cid
+                            else:
+                                chunk["_cached_embedding"] = embedding
+                        else:
+                            chunk["_cached_embedding"] = embedding
                     embedded_count += len(batch)
 
                 log_info(
@@ -516,6 +646,16 @@ async def deduplicate_chunks(
                     # Reuse cached embedding if already computed
                     if chunk.get("_cached_embedding"):
                         query_embedding: List[float] = chunk["_cached_embedding"]
+                    elif chunk.get("_cached_embedding_redis_key"):
+                        redis_vec = _l3_get_embedding(chunk["_cached_embedding_redis_key"])
+                        if redis_vec is not None:
+                            query_embedding = redis_vec
+                        else:
+                            query_embedding = await loop.run_in_executor(
+                                None,
+                                lambda t=chunk_text, e=_emb: e.embed_query(t),
+                            )
+                            chunk["_cached_embedding"] = query_embedding
                     else:
                         # FIX-B5-2: _emb is now a default arg, not a reference
                         query_embedding = await loop.run_in_executor(

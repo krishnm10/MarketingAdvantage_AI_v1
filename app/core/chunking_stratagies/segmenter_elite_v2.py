@@ -100,6 +100,10 @@ from app.core.plugin_registry import llm_registry
 # CONFIGURATION — v2-specific env vars
 # ─────────────────────────────────────────────────────────────────────────────
 
+# WARNING — Proposition decomposition makes multiple LLM calls per batch of
+# 8 sentences.  For a 50-page PDF with 2 000+ sentences that can mean 250+
+# Ollama round-trips (1–3 s each) *during ingestion*.  Keep false unless
+# you have GPU-accelerated LLM serving.
 ENABLE_PROPOSITIONS: bool = os.getenv("CHUNK_ELITE_PROPOSITIONS", "false").lower() == "true"
 ENABLE_AGENTIC_SPLIT: bool = os.getenv("CHUNK_ELITE_AGENTIC_SPLIT", "false").lower() == "true"
 

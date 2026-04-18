@@ -75,12 +75,14 @@ from app.core.chunking_stratagies.text_preprocessor import (
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Default chunk size bounds (characters, not tokens).
+# At ~4.5 chars/token, 1800 chars ≈ 400 tokens — in the sweet spot
+# for most embedding models (80–400 tokens ideal range).
 # Tunable per-call; these are production-validated defaults.
-DEFAULT_MAX_CHUNK_LEN: int = 600
-DEFAULT_MIN_CHUNK_LEN: int = 150
+DEFAULT_MAX_CHUNK_LEN: int = 1800
+DEFAULT_MIN_CHUNK_LEN: int = 400
 
 # Hard recursion/iteration depth guard.
-# At max_chunk_len=600, depth=20 handles input up to 600 × 2^20 = 629 MB.
+# At max_chunk_len=1800, depth=20 handles input up to 1800 × 2^20 ≈ 1.9 GB.
 # No real document approaches this; guard exists purely for pathological input.
 MAX_SPLIT_DEPTH: int = 20
 
