@@ -230,7 +230,28 @@ def compute_ranking_score(
     _validate_score(semantic_score, "semantic_score")  # ✅ With underscore
     
     # -------------------------------------------------
-    # SAFE quality score (fallback to tap_trust if zero)
+    # UNVALIDATED content: trust signals are absent, not negative.
+    # Use a provisional formula (semantic * conflict * temporal) so
+    # good semantic matches are not zeroed out. Mark as "provisional".
+    # -------------------------------------------------
+    _is_unvalidated = getattr(trust_signals, "is_unvalidated", False)
+
+    if _is_unvalidated:
+        final_score = (
+            pow(semantic_score, weights.semantic_weight)
+            * pow(trust_signals.conflict_modifier, weights.conflict_weight)
+            * pow(trust_signals.temporal_decay, weights.temporal_weight)
+        )
+        final_score = _clamp(final_score, weights.min_trust_floor, weights.max_trust_ceiling)
+
+        log_debug(
+            f"[TrustCalc] PROVISIONAL ranking (unvalidated): "
+            f"semantic={semantic_score:.4f}, final={final_score:.4f}"
+        )
+        return _round_score(final_score)
+
+    # -------------------------------------------------
+    # VALIDATED content: full multiplicative formula
     # -------------------------------------------------
     effective_agentic = trust_signals.agentic_validation_score
     if effective_agentic == 0.0:
@@ -238,28 +259,22 @@ def compute_ranking_score(
         log_debug(
             f"[TrustCalc] agentic=0, using tap_trust={trust_signals.tap_trust_score:.4f} fallback"
         )
-    
-    # -------------------------------------------------
-    # Multiplicative formula (FIXED)
-    # -------------------------------------------------
+
     final_score = (
         pow(semantic_score, weights.semantic_weight) *
         pow(trust_signals.tap_trust_score, weights.trust_weight) *
-        pow(effective_agentic, weights.quality_weight) *  # ✅ Uses fallback
+        pow(effective_agentic, weights.quality_weight) *
         pow(trust_signals.conflict_modifier, weights.conflict_weight) *
         pow(trust_signals.temporal_decay, weights.temporal_weight)
     )
-    
-    # -------------------------------------------------
-    # Clamp to valid range
-    # -------------------------------------------------
+
     final_score = _clamp(final_score, weights.min_trust_floor, weights.max_trust_ceiling)
-    
+
     log_debug(
         f"[TrustCalc] Ranking score: semantic={semantic_score:.4f}, "
         f"trust={trust_signals.tap_trust_score:.4f}, final={final_score:.4f}"
     )
-    
+
     return _round_score(final_score)
 
 

@@ -16,6 +16,8 @@ from functools import lru_cache
 from threading import Lock as _threading_lock
 from typing import Any, Dict, List, Optional, Tuple
 
+import uuid as _uuid_module
+
 try:
     from cachetools import TTLCache
     _HAS_CACHETOOLS = True
@@ -47,6 +49,11 @@ from app.services.ingestion.deduplication_engine_v2 import (
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info, log_warning
 from app.core.chunking_stratagies.text_preprocessor import preprocess_document_text
+from app.middleware.security_middleware import validate_business_id as _validate_business_id
+from app.utils.instrumentation import timed_stage, IngestionLogger
+from app.utils.cost_tracker import record_tokens
+
+_ing_logger = IngestionLogger(__name__)
 
 # ── Pluggable pipeline factory ────────────────────────────────────────
 from app.core.pipeline_factory import pipeline_factory
@@ -105,6 +112,20 @@ def _vector_transport_env(prefix: str) -> str:
 
 
 BATCH_SIZE: int = _safe_env_int("INGEST_BATCH_SIZE", 256)
+
+# ── Visual LLM concurrency cap ───────────────────────────────────────────────
+# Created lazily per event-loop to avoid cross-loop leaks under uvicorn reload.
+# Semaphore value: configurable via VISUAL_LLM_CONCURRENCY env var (default 4).
+# Prevents unbounded concurrent LLM calls when documents contain many charts.
+_VISUAL_LLM_CONCURRENCY: int = _safe_env_int("VISUAL_LLM_CONCURRENCY", 4)
+_VISUAL_LLM_SEMAPHORE: Optional[asyncio.Semaphore] = None
+
+def _get_visual_llm_semaphore() -> asyncio.Semaphore:
+    """Return (or create) the module-level semaphore bound to the running loop."""
+    global _VISUAL_LLM_SEMAPHORE
+    if _VISUAL_LLM_SEMAPHORE is None:
+        _VISUAL_LLM_SEMAPHORE = asyncio.Semaphore(_VISUAL_LLM_CONCURRENCY)
+    return _VISUAL_LLM_SEMAPHORE
 
 
 def _resolve_embed_parallelism(embedder_kind: Optional[str]) -> int:
@@ -394,13 +415,20 @@ def _coerce_to_str(value: Any) -> str:
 
 def _normalize_business_id(business_id: Optional[Any]) -> str:
     """
-    Normalize tenant/business identifier to a stable string key.
-    Accepts UUID objects, strings, or None.
+    Normalize and validate tenant/business identifier to a stable string key.
+
+    Delegates to security_middleware.validate_business_id which:
+      - Accepts UUID strings (normalized to lowercase dashes)
+      - Accepts safe slugs: [a-z0-9_-], max 64 chars
+      - Rejects strings with special chars that could collide with env-var names
+      - Maps None → "default"
+
+    This prevents env-var injection: a malicious client_id="GLOBAL" could
+    construct MAI_GLOBAL_VECTORDB via _business_env_prefix(). After this fix,
+    "GLOBAL" is lowercased/sanitized to "global" which is still benign, but
+    any chars that could form a collision are stripped.
     """
-    if business_id is None:
-        return "default"
-    raw = str(business_id).strip()
-    return raw or "default"
+    return _validate_business_id(business_id)
 
 
 def _business_env_prefix(client_id: str) -> str:
@@ -480,6 +508,14 @@ async def _chunk_text_with_strategy(
 
     The preprocessor is idempotent, so strategies that also call it
     internally (semantic, structure_aware, overlap, etc.) are unaffected.
+
+    Model-native tokenizer injection (Phase 2):
+    When USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING=true (default) and an
+    EmbedderBundle is available, a ChunkingTokenCounter is built from the
+    bundle and injected via _ACTIVE_TOKEN_COUNTER ContextVar.  All chunking
+    strategies read from this ContextVar via segmenter_v2.count_tokens(), so
+    every strategy automatically uses the embedding model's native tokenizer
+    for accurate token counts without any signature changes.
     """
     # ── Centralised pre-processing — quality & integrity gate ─────────
     text = preprocess_document_text(text or "")
@@ -487,15 +523,117 @@ async def _chunk_text_with_strategy(
         return []
 
     strategy = (strategy_override or _resolve_chunking_strategy(pipeline)).lower()
-    chunker = get_chunker(strategy)
-    return await chunker.chunk(
-        text,
-        db_session=db_session,
-        file_id=file_id,
-        business_id=business_id,
-        source_type=source_type,
-        embedding_model=embedding_model,
-    )
+    bundle = getattr(pipeline, "embedder_bundle", None)
+
+    # ── Model-native tokenizer injection for ALL strategies ───────────
+    # Controlled by USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING env flag.
+    # When enabled, every call to segmenter_v2.count_tokens() (used by all
+    # chunking strategies) will use the embedding model's native tokenizer
+    # instead of the generic BERT factory backend.
+    _ctx_token = None
+    _counter = None
+    _use_native = os.getenv("USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING", "true").lower() != "false"
+
+    if _use_native and bundle is not None:
+        try:
+            from app.ai.chunking.token_counter import ChunkingTokenCounter
+            from app.core.chunking_stratagies.segmenter_v2 import _ACTIVE_TOKEN_COUNTER
+            # Try to get calibrated alignment metrics from the validator cache.
+            # calibrate() is a fast no-op when the result is already cached.
+            _alignment_metrics = None
+            try:
+                from app.ai.validation.tokenizer_validator import tokenizer_validator
+                _alignment_metrics = tokenizer_validator.get_alignment_metrics_for_bundle(
+                    bundle, run_calibration=True
+                )
+            except Exception as _cal_exc:
+                log_warning(
+                    f"[IngestionV2] Calibration skipped for model={bundle.model_id}: {_cal_exc}. "
+                    f"Using provider defaults for soft_cap."
+                )
+            _counter = ChunkingTokenCounter.from_bundle(
+                bundle, alignment_metrics=_alignment_metrics,
+                cache_size=int(os.getenv("CHUNKING_TOKEN_COUNTER_CACHE_SIZE", "512")),
+            )
+            _ctx_token = _ACTIVE_TOKEN_COUNTER.set(_counter.count)
+            log_info(
+                f"[IngestionV2] Model-native token counting active | "
+                f"strategy={strategy} | model={bundle.model_id} | "
+                f"hard_cap={_counter.hard_cap} | soft_cap={_counter.soft_cap} | "
+                f"soft_cap_factor={_counter.metrics.soft_cap_factor:.2f} | "
+                f"remote={_counter.is_remote} | calibrated={_counter.metrics.calibrated}"
+            )
+        except Exception as _inject_exc:
+            log_warning(
+                f"[IngestionV2] ChunkingTokenCounter injection failed "
+                f"({_inject_exc}); falling back to factory tokenizer for all strategies."
+            )
+            _ctx_token = None
+            _counter = None
+
+    try:
+        # ── Phase 1: token_aware + EmbedderBundle → model-native tokenizer ──
+        # When the pipeline carries a Phase 1 EmbedderBundle and the active
+        # strategy is "token_aware", bypass the generic chunker and delegate to
+        # token_aware_chunk() with the bundle's native TokenizerContract.  This
+        # enforces F-01/F-02/F-16: the exact same tokenizer used for embedding is
+        # also used to measure and bound each chunk.
+        if strategy == "token_aware":
+            if bundle is not None:
+                try:
+                    from app.services.ingestion.token_chunking_service import (
+                        token_aware_chunk,
+                    )
+                    log_info(
+                        f"[IngestionV2] token_aware chunking with Phase 1 tokenizer "
+                        f"| model={bundle.model_id} | family={bundle.tokenizer_family.value} "
+                        f"| max_tokens={bundle.embed_max_tokens}"
+                    )
+                    return await token_aware_chunk(
+                        text,
+                        db_session=db_session,
+                        file_id=file_id,
+                        business_id=business_id,
+                        source_type=source_type,
+                        embedding_model=embedding_model,
+                        tokenizer_contract=bundle.tokenizer,
+                        chunk_size=bundle.embed_max_tokens,
+                    )
+                except Exception as _phase1_exc:
+                    log_info(
+                        f"[IngestionV2] Phase 1 token_aware path failed "
+                        f"({_phase1_exc}); falling back to generic chunker."
+                    )
+                    # Fall through to generic chunker below
+
+        chunker = get_chunker(strategy)
+        return await chunker.chunk(
+            text,
+            db_session=db_session,
+            file_id=file_id,
+            business_id=business_id,
+            source_type=source_type,
+            embedding_model=embedding_model,
+        )
+
+    finally:
+        # ── Always reset the ContextVar after chunking ─────────────────
+        # This prevents the model-native counter from leaking into unrelated
+        # async tasks that share the same event loop.
+        if _ctx_token is not None:
+            from app.core.chunking_stratagies.segmenter_v2 import _ACTIVE_TOKEN_COUNTER
+            _ACTIVE_TOKEN_COUNTER.reset(_ctx_token)
+            if _counter is not None:
+                stats = _counter.stats()
+                if stats["remote_calls"] > 0 or stats["approx_calls"] > 0:
+                    log_info(
+                        f"[IngestionV2] ChunkingTokenCounter stats | "
+                        f"strategy={strategy} | model={bundle.model_id if bundle else 'n/a'} | "
+                        f"cache_hits={stats['cache_hits']} | "
+                        f"cache_misses={stats['cache_misses']} | "
+                        f"remote_calls={stats['remote_calls']} | "
+                        f"approx_calls={stats['approx_calls']}"
+                    )
 
 
 # ============================================================
@@ -767,10 +905,29 @@ def _build_config_from_env(
             ),
             query_prefix=os.getenv("HF_EMBED_QUERY_PREFIX", ""),
         )
+    elif embedder_type == "cohere":
+        from app.core.config.client_config_schema import CohereEmbedderConfig
+        emb_cfg = EmbedderConfig(
+            type=EmbedderType.COHERE,
+            cohere=CohereEmbedderConfig(
+                model=os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0"),
+                api_key_env="COHERE_API_KEY",
+            ),
+        )
+    elif embedder_type in ("gemini", "google"):
+        # "google" is accepted as an alias for the "gemini" enum value
+        from app.core.config.client_config_schema import GeminiEmbedderConfig
+        emb_cfg = EmbedderConfig(
+            type=EmbedderType.GEMINI,
+            gemini=GeminiEmbedderConfig(
+                model=os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001"),
+                api_key_env="GOOGLE_API_KEY",
+            ),
+        )
     else:
         raise ValueError(
             f"[Pipeline] Unknown MAI_EMBEDDER='{embedder_type}'. "
-            f"Supported: ollama, openai, huggingface"
+            f"Supported: ollama, openai, huggingface, cohere, gemini"
         )
 
     return ClientConfig(
@@ -802,27 +959,43 @@ def _build_config_from_env(
 def _looks_like_visual_content(text: str) -> bool:
     """
     Heuristic detector for charts, graphs, tables, numeric-heavy visuals.
-    ADDITIVE ONLY — no side effects.
-    Skips text that was already processed by VisualExplainerCPU.
+
+    FIX (P0): The original used digit_ratio > 0.35 OR keyword_hits >= 2,
+    which caused false-positive storms: prose like "Revenue grew 12% in 2022
+    compared to 2021, as shown in the table below." hit 2 weak keywords and
+    was routed to the LLM visual explainer. This burns tokens and corrupts the
+    chunk (LLM explanation replaces original text).
+
+    New criteria requires EITHER:
+      (a) BOTH high digit density AND tabular structure (short lines, many rows)
+      (b) At least 2 STRONG visual-specific keywords that rarely appear in prose
     """
     if not text or not isinstance(text, str) or len(text) < 80:
         return False
 
-    # Already has a semantic analysis section — skip re-processing
+    # Already processed by VisualExplainerCPU — skip re-processing
     if "--- Semantic Analysis ---" in text:
         return False
 
+    # Criterion (a): high digit density + structural signals (short lines = table/chart)
     digit_ratio = sum(c.isdigit() for c in text) / max(len(text), 1)
+    if digit_ratio > 0.35:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        if lines:
+            avg_line_len = sum(len(ln) for ln in lines) / len(lines)
+            # Short average line length with many lines = tabular/chart structure
+            has_tabular_structure = avg_line_len < 40 and len(lines) > 5
+            if has_tabular_structure:
+                return True
 
-    keywords = [
-        "%", "chart", "graph", "table", "figure",
-        "axis", "source:", "year",
-        "2019", "2020", "2021", "2022",
-        "2023", "2024", "2025", "2026",
+    # Criterion (b): strong visual-specific keywords that rarely appear in general prose
+    strong_visual_keywords = [
+        "x-axis", "y-axis", "axis label", "legend", "data series",
+        "chart title", "chart type", "bar chart", "pie chart",
+        "line graph", "scatter plot", "SOURCE:", "figure ",
     ]
-
-    keyword_hits = sum(1 for k in keywords if k in text.lower())
-    return digit_ratio > 0.35 or keyword_hits >= 2
+    strong_hits = sum(1 for k in strong_visual_keywords if k.lower() in text.lower())
+    return strong_hits >= 2
 
 
 # ============================================================
@@ -1056,6 +1229,21 @@ class _CollectionAdapter:
     def delete(self, ids=None, where=None):
         if not ids:
             return
+        # Prefer bulk delete (O(1) round-trips) over serial delete (O(N))
+        if hasattr(self._vdb, "delete_many") and callable(self._vdb.delete_many):
+            try:
+                self._vdb.delete_many(collection=self._col, doc_ids=list(ids))
+                log_info(
+                    f"[CollectionAdapter] delete_many → {len(list(ids))} ids "
+                    f"from '{self._col}'"
+                )
+                return
+            except Exception as e:
+                log_info(
+                    f"[CollectionAdapter] delete_many failed ({e}), "
+                    f"falling back to serial delete"
+                )
+        # Serial fallback for plugins that don't implement delete_many
         for doc_id in ids:
             try:
                 self._vdb.delete(collection=self._col, doc_id=doc_id)
@@ -1386,9 +1574,23 @@ class IngestionServiceV2:
                 await IngestionServiceV2._run_pipeline(db, file_record, parsed)
                 log_info(f"[IngestionV2] ✅ Completed ingestion for {file_id}")
 
-            except Exception as e:
-                log_info(f"[CRITICAL] Ingestion failed for {file_id}: {e}")
-                await IngestionServiceV2._set_file_error(db, file_id, str(e))
+            except Exception as original_error:
+                _ing_logger.error(
+                    "Ingestion failed",
+                    file_id=str(file_id),
+                    stage="pipeline",
+                    error_type=type(original_error).__name__,
+                    error=str(original_error)[:500],
+                )
+                try:
+                    await IngestionServiceV2._set_file_error(db, file_id, str(original_error))
+                except Exception as db_err:
+                    # DB error during error-status update must not mask the original
+                    log_warning(
+                        f"[IngestionV2] Could not persist error status for {file_id}: "
+                        f"{db_err} (original: {original_error})"
+                    )
+                raise original_error
 
     # ----------------------------------------------------------
     # Direct ingestion for pre-parsed output (RSS, API, etc.)
@@ -1471,15 +1673,16 @@ class IngestionServiceV2:
             f"[IngestionV2] Active embedding model for {file_id}: {embedding_model}"
         )
 
-        chunks = await IngestionServiceV2._extract_chunks(
-            parsed_payload,
-            file_id,
-            file_type,
-            business_id,
-            db,
-            embedding_model=embedding_model,
-            pipeline=pipeline,          # FIX-D: pass resolved pipeline
-        )
+        async with timed_stage("extract_chunks", file_id=str(file_id), business_id=str(business_id)):
+            chunks = await IngestionServiceV2._extract_chunks(
+                parsed_payload,
+                file_id,
+                file_type,
+                business_id,
+                db,
+                embedding_model=embedding_model,
+                pipeline=pipeline,          # FIX-D: pass resolved pipeline
+            )
         IngestionServiceV2._assert_chunk_embedding_model(
             chunks=chunks,
             expected_model=embedding_model,
@@ -1503,11 +1706,12 @@ class IngestionServiceV2:
             return
 
         try:
-            unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
-                db, chunks, file_id, business_id,
-                collection_name=pipeline.config.vectordb.collection,
-                pipeline=pipeline,          # FIX-D: pass resolved pipeline
-            )
+            async with timed_stage("dedup_chunks", file_id=str(file_id), business_id=str(business_id)):
+                unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
+                    db, chunks, file_id, business_id,
+                    collection_name=pipeline.config.vectordb.collection,
+                    pipeline=pipeline,          # FIX-D: pass resolved pipeline
+                )
         except Exception as dedup_err:
             # Fail-open fallback: dedup issues should not block ingestion.
             # This specifically protects direct-ingestion flows from transient
@@ -1603,9 +1807,10 @@ class IngestionServiceV2:
         _assign_structure_parent_offsets(all_chunks_for_storage)
 
         if all_chunks_for_storage:
-            await IngestionServiceV2._insert_chunks(
-                db, file_id, business_id, all_chunks_for_storage
-            )
+            async with timed_stage("insert_chunks", file_id=str(file_id), business_id=str(business_id)):
+                await IngestionServiceV2._insert_chunks(
+                    db, file_id, business_id, all_chunks_for_storage
+                )
             log_info(
                 f"[IngestionV2] Inserted {len(all_chunks_for_storage)} chunks: "
                 f"{len(unique_chunks)} unique, "
@@ -1628,14 +1833,15 @@ class IngestionServiceV2:
                 f"with {len(chunks_to_embed)} unique chunks "
                 f"(skipped {len(chunks) - len(chunks_to_embed)} duplicates)"
             )
-            await IngestionServiceV2.embed_and_store(
-                file_id, business_id, file_type, chunks_to_embed,
-                file_name=file_record.file_name,
-                source_url=file_record.source_url,
-                pipeline=pipeline,   # FIX-B4: pass pre-resolved pipeline — eliminates 4th _get_pipeline()
-                db=db,               # FIX-B4: pass caller's session — eliminates redundant async_session()
-                skip_presence_check=True,
-            )
+            async with timed_stage("embed_and_store", file_id=str(file_id), business_id=str(business_id)):
+                await IngestionServiceV2.embed_and_store(
+                    file_id, business_id, file_type, chunks_to_embed,
+                    file_name=file_record.file_name,
+                    source_url=file_record.source_url,
+                    pipeline=pipeline,   # FIX-B4: pass pre-resolved pipeline — eliminates 4th _get_pipeline()
+                    db=db,               # FIX-B4: pass caller's session — eliminates redundant async_session()
+                    skip_presence_check=True,
+                )
 
         else:
             log_info(
@@ -1814,41 +2020,50 @@ class IngestionServiceV2:
 
                     result: List[Dict[str, Any]] = []
 
-                    # ── B3-FIX-2: Visual items — concurrent LLM + chunk ───────
-                    # All LLM calls fired simultaneously via asyncio.gather().
-                    # Serial: 20 items × 2s = 40s.
-                    # Concurrent: max(2s) = 2s regardless of count.
+                    # ── B3-FIX-2: Visual items — semaphore-gated concurrent LLM + chunk ──
+                    # All LLM calls fired concurrently via asyncio.gather(), bounded by
+                    # _VISUAL_LLM_SEMAPHORE to prevent rate-limit exhaustion.
+                    # return_exceptions=True: one LLM failure does not crash the batch.
                     if visual_texts:
+                        _vis_sem = _get_visual_llm_semaphore()
+
                         async def _process_visual(vtext: str) -> List[Dict]:
-                            explanation = await _explain_visual_with_llm(vtext)
-                            source = explanation if explanation else vtext
-                            chunks = await _chunk_text_with_strategy(
-                                source,
-                                db_session=db,
-                                file_id=str(file_id),
-                                business_id=business_id,
-                                source_type=file_type,
-                                embedding_model=embedding_model,
-                                pipeline=pipeline,
-                                strategy_override=active_chunking_strategy,
-                            )
-                            orig_hash = hashlib.sha256(
-                                vtext.encode("utf-8")
-                            ).hexdigest()
-                            for ch in chunks:
-                                ch.setdefault("reasoning_ingestion", {}).update({
-                                    "content_type":       "visual",
-                                    "interpreted_by":     "llm",
-                                    "original_text_hash": orig_hash,
-                                })
-                                ch.setdefault("embedding_model", embedding_model)
-                            return chunks
+                            async with _vis_sem:
+                                explanation = await _explain_visual_with_llm(vtext)
+                                source = explanation if explanation else vtext
+                                vis_chunks = await _chunk_text_with_strategy(
+                                    source,
+                                    db_session=db,
+                                    file_id=str(file_id),
+                                    business_id=business_id,
+                                    source_type=file_type,
+                                    embedding_model=embedding_model,
+                                    pipeline=pipeline,
+                                    strategy_override=active_chunking_strategy,
+                                )
+                                orig_hash = hashlib.sha256(
+                                    vtext.encode("utf-8")
+                                ).hexdigest()
+                                for ch in vis_chunks:
+                                    ch.setdefault("reasoning_ingestion", {}).update({
+                                        "content_type":       "visual",
+                                        "interpreted_by":     "llm",
+                                        "original_text_hash": orig_hash,
+                                    })
+                                    ch.setdefault("embedding_model", embedding_model)
+                                return vis_chunks
 
                         visual_results = await asyncio.gather(
                             *[_process_visual(vt) for vt in visual_texts],
-                            return_exceptions=False,
+                            return_exceptions=True,   # FIX: one failure must not crash entire batch
                         )
                         for chunk_list in visual_results:
+                            if isinstance(chunk_list, Exception):
+                                log_warning(
+                                    f"[IngestionV2] Visual LLM processing failed for one item "
+                                    f"in {file_id}: {type(chunk_list).__name__}: {chunk_list}"
+                                )
+                                continue
                             result.extend(chunk_list)
                             # FIX-B3-1: chunk_list goes out of scope after extend
                             # — immediately GC-eligible, not held until loop end
@@ -2587,6 +2802,19 @@ class IngestionServiceV2:
                                ),
                     )
             
+                    # ── Token cost tracking ────────────────────────────────────
+                    batch_tokens = sum(int(c.get("tokens") or 0) for c in batch)
+                    if batch_tokens > 0:
+                        try:
+                            record_tokens(
+                                str(_business_id) if _business_id else "default",
+                                "embed",
+                                batch_tokens,
+                                raise_on_hard_limit=False,  # don't block mid-ingest
+                            )
+                        except Exception:
+                            pass  # cost tracking must never block ingestion
+
                     log_info(
                         f"[IngestionV2] ✅ Batch {batch_idx + 1}: "
                         f"{len(batch)} vectors via {_vectordb.kind}"

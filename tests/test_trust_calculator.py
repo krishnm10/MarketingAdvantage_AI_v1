@@ -88,20 +88,53 @@ def test_ranking_score_calculation():
     assert score_weak < 0.2
     print("   ✅ Multiplicative penalty works\n")
     
-    # Test 3: Any zero component = zero score
-    print("3. Zero trust component")
+    # Test 3: Zero trust on VALIDATED content still kills score
+    print("3. Zero trust component (validated)")
     signals_zero = TrustSignals(
-        tap_trust_score=0.0,  # Zero kills everything
+        tap_trust_score=0.0,
         agentic_validation_score=1.0,
         reasoning_quality_score=1.0,
         conflict_modifier=1.0,
         temporal_decay=1.0,
+        trust_state="validated",
     )
     
     score_zero = compute_ranking_score(1.0, signals_zero)
-    print(f"   Score: {score_zero:.4f} (should be 0.0)")
+    print(f"   Score: {score_zero:.4f} (should be 0.0 for validated zero-trust)")
     assert score_zero == 0.0
-    print("   ✅ Zero component kills score\n")
+    print("   ✅ Zero component kills score for validated content\n")
+
+    # Test 4: Unvalidated content — trust=0 should NOT zero the score
+    print("4. Unvalidated content (provisional scoring)")
+    signals_unval = TrustSignals(
+        tap_trust_score=0.0,
+        agentic_validation_score=0.0,
+        reasoning_quality_score=0.0,
+        conflict_modifier=1.0,
+        temporal_decay=1.0,
+        trust_state="unvalidated",
+    )
+
+    score_unval = compute_ranking_score(0.8, signals_unval)
+    print(f"   Score: {score_unval:.4f} (should be ~0.8, not 0)")
+    assert score_unval > 0.7, f"Unvalidated content got {score_unval}, expected > 0.7"
+    print("   ✅ Unvalidated content scores based on semantic\n")
+
+    # Test 5: Unvalidated with temporal decay
+    print("5. Unvalidated content with temporal decay")
+    signals_unval_old = TrustSignals(
+        tap_trust_score=0.0,
+        agentic_validation_score=0.0,
+        reasoning_quality_score=0.0,
+        conflict_modifier=1.0,
+        temporal_decay=0.5,
+        trust_state="unvalidated",
+    )
+
+    score_unval_old = compute_ranking_score(0.8, signals_unval_old)
+    print(f"   Score: {score_unval_old:.4f} (should be ~0.4)")
+    assert 0.3 < score_unval_old < 0.5, f"Got {score_unval_old}"
+    print("   ✅ Temporal decay still applied to unvalidated content\n")
 
 
 def test_trust_breakdown():

@@ -1,0 +1,224 @@
+# =============================================================================
+# app/ai/catalog/reranker_catalog.yaml
+#
+# Canonical reranker catalog for Phase 2.
+#
+# Schema fields per entry:
+#   model_id                  — unique identifier; used in ClientConfig and UI
+#   provider                  — matches RerankerProvider enum
+#   display_name              — human-readable label for UI
+#   max_input_tokens_per_pair — hard limit for query+passage token count
+#   score_space               — "probability" | "logit" | "cosine"
+#   supports_batch_scoring    — bool; true = all pairs in one call
+#   lang_support              — ISO-639-1 codes; ["*"] = multilingual
+#   tokenizer_family          — own tokenizer family; "external" = API-managed
+#   tier                      — "local" | "api" | "hosted"
+#   requires_gpu              — bool
+#   notes_short               — concise capability note for UI display
+#   default_top_k             — recommended top-k for this reranker
+#   env_key                   — env var name for API key (API-based only)
+# =============================================================================
+
+schema_version: "2.0"
+
+rerankers:
+
+  # ── Local cross-encoder (HuggingFace sentence-transformers) ──────────────
+
+  - model_id:                  "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    provider:                  "huggingface"
+    display_name:              "MiniLM-L6 Cross-Encoder (MS-MARCO)"
+    max_input_tokens_per_pair: 512
+    score_space:               "logit"
+    supports_batch_scoring:    true
+    lang_support:              ["en"]
+    tokenizer_family:          "wordpiece"
+    tier:                      "local"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Fast cross-encoder; 6-layer MiniLM; good for English QA."
+    env_key:                   null
+
+  - model_id:                  "cross-encoder/ms-marco-MiniLM-L-12-v2"
+    provider:                  "huggingface"
+    display_name:              "MiniLM-L12 Cross-Encoder (MS-MARCO)"
+    max_input_tokens_per_pair: 512
+    score_space:               "logit"
+    supports_batch_scoring:    true
+    lang_support:              ["en"]
+    tokenizer_family:          "wordpiece"
+    tier:                      "local"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "12-layer MiniLM; higher quality than L6 at moderate cost."
+    env_key:                   null
+
+  - model_id:                  "BAAI/bge-reranker-v2-m3"
+    provider:                  "huggingface"
+    display_name:              "BGE Reranker v2-m3 (Multilingual)"
+    max_input_tokens_per_pair: 8192
+    score_space:               "logit"
+    supports_batch_scoring:    true
+    lang_support:              ["*"]
+    tokenizer_family:          "sentencepiece"
+    tier:                      "local"
+    requires_gpu:              true
+    default_top_k:             5
+    notes_short:               "Multilingual BGE reranker; large context window; GPU recommended."
+    env_key:                   null
+
+  - model_id:                  "BAAI/bge-reranker-large"
+    provider:                  "huggingface"
+    display_name:              "BGE Reranker Large (English)"
+    max_input_tokens_per_pair: 512
+    score_space:               "logit"
+    supports_batch_scoring:    true
+    lang_support:              ["en", "zh"]
+    tokenizer_family:          "wordpiece"
+    tier:                      "local"
+    requires_gpu:              true
+    default_top_k:             5
+    notes_short:               "BGE large reranker; strong English/Chinese performance."
+    env_key:                   null
+
+  # ── FlashRank (CPU-optimised, no GPU required) ────────────────────────────
+
+  - model_id:                  "flashrank/ms-marco-MiniLM-L-12-v2"
+    provider:                  "flashrank"
+    display_name:              "FlashRank MiniLM-L12"
+    max_input_tokens_per_pair: 512
+    score_space:               "probability"
+    supports_batch_scoring:    true
+    lang_support:              ["en"]
+    tokenizer_family:          "wordpiece"
+    tier:                      "local"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "CPU-native FlashRank; low latency; ideal for edge/serverless."
+    env_key:                   null
+
+  # ── Cohere Rerank (API-based) ─────────────────────────────────────────────
+
+  - model_id:                  "cohere/rerank-english-v3.0"
+    provider:                  "cohere"
+    display_name:              "Cohere Rerank English v3.0"
+    max_input_tokens_per_pair: 4096
+    score_space:               "probability"
+    supports_batch_scoring:    true
+    lang_support:              ["en"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Cohere managed API; high-quality English reranking; GDPR-aware."
+    env_key:                   "COHERE_API_KEY"
+
+  - model_id:                  "cohere/rerank-multilingual-v3.0"
+    provider:                  "cohere"
+    display_name:              "Cohere Rerank Multilingual v3.0"
+    max_input_tokens_per_pair: 4096
+    score_space:               "probability"
+    supports_batch_scoring:    true
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Cohere managed API; 100+ language reranking."
+    env_key:                   "COHERE_API_KEY"
+
+  # ── LLM-as-Judge (OpenAI) ─────────────────────────────────────────────────
+
+  - model_id:                  "llm-judge/gpt-4o-mini"
+    provider:                  "openai_llm"
+    display_name:              "LLM-as-Judge (GPT-4o-mini)"
+    max_input_tokens_per_pair: 16384
+    score_space:               "probability"
+    supports_batch_scoring:    false
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Pointwise LLM scoring via GPT-4o-mini; high precision, higher latency."
+    env_key:                   "OPENAI_API_KEY"
+
+  - model_id:                  "llm-judge/gpt-4o"
+    provider:                  "openai_llm"
+    display_name:              "LLM-as-Judge (GPT-4o)"
+    max_input_tokens_per_pair: 32768
+    score_space:               "probability"
+    supports_batch_scoring:    false
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Listwise LLM scoring via GPT-4o; highest precision, premium cost."
+    env_key:                   "OPENAI_API_KEY"
+
+  # ── LLM-as-Judge (Gemini) ─────────────────────────────────────────────────
+
+  - model_id:                  "llm-judge/gemini-1.5-flash"
+    provider:                  "gemini"
+    display_name:              "LLM-as-Judge (Gemini 1.5 Flash)"
+    max_input_tokens_per_pair: 32768
+    score_space:               "probability"
+    supports_batch_scoring:    false
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Pointwise LLM scoring via Gemini 1.5 Flash; multilingual; very fast."
+    env_key:                   "GOOGLE_API_KEY"
+    judge_provider:            "gemini"
+    judge_strategy:            "pointwise"
+
+  - model_id:                  "llm-judge/gemini-1.5-pro"
+    provider:                  "gemini"
+    display_name:              "LLM-as-Judge (Gemini 1.5 Pro)"
+    max_input_tokens_per_pair: 131072
+    score_space:               "probability"
+    supports_batch_scoring:    true
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Listwise LLM scoring via Gemini 1.5 Pro; 1M context; best multilingual precision."
+    env_key:                   "GOOGLE_API_KEY"
+    judge_provider:            "gemini"
+    judge_strategy:            "listwise"
+
+  - model_id:                  "llm-judge/gemini-2.0-flash"
+    provider:                  "gemini"
+    display_name:              "LLM-as-Judge (Gemini 2.0 Flash)"
+    max_input_tokens_per_pair: 32768
+    score_space:               "probability"
+    supports_batch_scoring:    false
+    lang_support:              ["*"]
+    tokenizer_family:          "external"
+    tier:                      "api"
+    requires_gpu:              false
+    default_top_k:             5
+    notes_short:               "Pointwise scoring via Gemini 2.0 Flash (2026); best speed/quality ratio."
+    env_key:                   "GOOGLE_API_KEY"
+    judge_provider:            "gemini"
+    judge_strategy:            "pointwise"
+
+  # ── ColBERT (late-interaction) ────────────────────────────────────────────
+
+  - model_id:                  "colbert/colbertv2.0"
+    provider:                  "colbert"
+    display_name:              "ColBERT v2.0"
+    max_input_tokens_per_pair: 512
+    score_space:               "cosine"
+    supports_batch_scoring:    true
+    lang_support:              ["en"]
+    tokenizer_family:          "wordpiece"
+    tier:                      "local"
+    requires_gpu:              true
+    default_top_k:             5
+    notes_short:               "Late-interaction token-level scoring; excellent for complex queries."
+    env_key:                   null

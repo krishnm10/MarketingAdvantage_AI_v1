@@ -22,6 +22,14 @@ import {
   Check,
   Trash2,
   Info,
+  Bot,
+  MessageSquare,
+  Bug,
+  Database,
+  Brain,
+  Server,
+  XCircle,
+  Settings,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import InfoTooltip from "@/components/ui/InfoTooltip";
@@ -57,6 +65,11 @@ interface RetrieveResponse {
   total_dropped: number;
   latency_ms: number;
   results: ResultItem[];
+  answer?: string | null;
+  answer_model?: string | null;
+  answer_latency_ms?: number | null;
+  answer_error?: string | null;
+  debug_info?: Record<string, any> | null;
 }
 
 interface HistoryEntry {
@@ -106,6 +119,172 @@ function ScoreBar({ value, max = 1, color }: { value: number; max?: number; colo
         <div className={cn("h-full rounded-full transition-all", color)} style={{ width: `${pct}%` }} />
       </div>
       <span className="text-xs font-mono text-slate-500 w-10 text-right">{value.toFixed(3)}</span>
+    </div>
+  );
+}
+
+/* ────────────────────────────────────────────────────────────
+   Debug Panel Component
+   ──────────────────────────────────────────────────────────── */
+
+function DebugPanel({ entry }: { entry: HistoryEntry }) {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const d = entry.response.debug_info;
+  const ae = entry.response.answer_error;
+
+  const copyTrace = () => {
+    const trace = {
+      query: entry.query,
+      intent: entry.intent,
+      timestamp: new Date(entry.timestamp).toISOString(),
+      response_meta: {
+        total_results: entry.response.total_results,
+        total_dropped: entry.response.total_dropped,
+        latency_ms: entry.response.latency_ms,
+        answer_model: entry.response.answer_model,
+        answer_latency_ms: entry.response.answer_latency_ms,
+        answer_error: entry.response.answer_error,
+      },
+      debug_info: d,
+      results_summary: entry.response.results.map((r) => ({
+        rank: r.rank,
+        chunk_id: r.chunk_id,
+        score: r.score,
+        trust_decision: r.trust_decision,
+      })),
+    };
+    navigator.clipboard.writeText(JSON.stringify(trace, null, 2));
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  return (
+    <div className="ml-11 mt-2">
+      <button
+        onClick={() => setOpen(!open)}
+        className={cn(
+          "flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-[11px] font-medium border transition-colors",
+          open
+            ? "bg-slate-100 text-slate-700 border-slate-200"
+            : "text-slate-400 border-transparent hover:bg-slate-50 hover:text-slate-600 hover:border-slate-200"
+        )}
+      >
+        <Bug className="w-3 h-3" />
+        Debug Panel
+        {open ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+      </button>
+
+      {open && (
+        <div className="mt-2 rounded-xl border border-slate-200 bg-slate-50/80 overflow-hidden shadow-sm">
+          {/* Header row */}
+          <div className="flex items-center justify-between px-4 py-2.5 bg-slate-100 border-b border-slate-200">
+            <span className="text-[11px] font-semibold text-slate-600 uppercase tracking-wider flex items-center gap-1.5">
+              <Settings className="w-3 h-3" /> Pipeline Debug
+            </span>
+            <button
+              onClick={copyTrace}
+              className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-700 transition-colors"
+            >
+              {copied ? <Check className="w-3 h-3 text-emerald-500" /> : <Copy className="w-3 h-3" />}
+              {copied ? "Copied!" : "Copy trace JSON"}
+            </button>
+          </div>
+
+          {/* Answer error banner */}
+          {ae && (
+            <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border-b border-red-100">
+              <XCircle className="w-3.5 h-3.5 text-red-500 flex-shrink-0 mt-0.5" />
+              <div>
+                <p className="text-[11px] font-semibold text-red-700">LLM Generation Error</p>
+                <p className="text-[11px] text-red-600 mt-0.5 leading-relaxed">{ae}</p>
+              </div>
+            </div>
+          )}
+
+          {/* Pipeline config chips */}
+          {d && (
+            <div className="px-4 py-3 border-b border-slate-200">
+              <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-2">Pipeline Config</p>
+              <div className="flex flex-wrap gap-1.5">
+                {[
+                  { label: "Embedder",    value: d.embedder,          icon: Brain },
+                  { label: "LLM",         value: d.llm_provider,      icon: Bot },
+                  { label: "VectorDB",    value: d.vectordb,           icon: Database },
+                  { label: "Chunking",    value: d.chunking_strategy,  icon: Layers },
+                  { label: "Search",      value: d.search_mode,        icon: Search },
+                  { label: "Collection",  value: d.collection,         icon: Server },
+                  { label: "Reranker",    value: d.reranker_used,      icon: Layers },
+                ].map(({ label, value, icon: Icon }) => value && (
+                  <span key={label} className="inline-flex items-center gap-1 text-[11px] bg-white border border-slate-200 text-slate-700 px-2 py-1 rounded-md">
+                    <Icon className="w-3 h-3 text-slate-400" />
+                    <span className="text-slate-400">{label}:</span>
+                    <span className="font-semibold">{String(value)}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Score summary */}
+          {d && (
+            <div className="px-4 py-3 border-b border-slate-200">
+              <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-2">Retrieval Signals</p>
+              <div className="flex flex-wrap gap-3 text-[11px]">
+                <span className="flex items-center gap-1 text-slate-600">
+                  <Target className="w-3 h-3 text-slate-400" />
+                  Top K: <strong className="ml-0.5">{d.top_k_returned ?? "—"}</strong>
+                  {d.top_k_requested && <span className="text-slate-400"> (req: {d.top_k_requested})</span>}
+                </span>
+                <span className="flex items-center gap-1 text-slate-600">
+                  <BarChart3 className="w-3 h-3 text-slate-400" />
+                  Dropped: <strong className="ml-0.5">{d.total_dropped ?? "—"}</strong>
+                </span>
+                {d.max_score != null && (
+                  <span className={cn("flex items-center gap-1", d.max_score >= (d.score_gate_threshold ?? 0.25) ? "text-emerald-600" : "text-red-500")}>
+                    <Zap className="w-3 h-3" />
+                    Max score: <strong className="ml-0.5">{d.max_score.toFixed(4)}</strong>
+                    <span className="text-slate-400">(gate: {(d.score_gate_threshold ?? 0.25).toFixed(2)})</span>
+                  </span>
+                )}
+                {d.hyde_enabled && (
+                  <span className="flex items-center gap-1 text-violet-600">
+                    <Sparkles className="w-3 h-3" />
+                    HyDE active
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* LLM answer status */}
+          <div className="px-4 py-3">
+            <p className="text-[10px] text-slate-400 uppercase tracking-wider font-semibold mb-2">Answer Generation</p>
+            <div className="flex flex-wrap gap-3 text-[11px]">
+              <span className="flex items-center gap-1 text-slate-600">
+                <Bot className="w-3 h-3 text-slate-400" />
+                Requested: <strong className="ml-0.5">{d?.generate_answer ? "yes" : "no"}</strong>
+              </span>
+              <span className="flex items-center gap-1 text-slate-600">
+                <Check className="w-3 h-3 text-slate-400" />
+                Generated: <strong className={cn("ml-0.5", d?.answer_generated ? "text-emerald-600" : "text-slate-500")}>{d?.answer_generated ? "yes" : "no"}</strong>
+              </span>
+              {entry.response.answer_model && (
+                <span className="flex items-center gap-1 text-slate-600">
+                  <Brain className="w-3 h-3 text-slate-400" />
+                  Model: <strong className="ml-0.5 font-mono">{entry.response.answer_model}</strong>
+                </span>
+              )}
+              {entry.response.answer_latency_ms != null && (
+                <span className="flex items-center gap-1 text-slate-600">
+                  <Clock className="w-3 h-3 text-slate-400" />
+                  Latency: <strong className="ml-0.5">{entry.response.answer_latency_ms.toFixed(0)}ms</strong>
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -242,6 +421,7 @@ export default function RetrievePage() {
   const [enableHyde, setEnableHyde] = useState(false);
   const [hybridAlpha, setHybridAlpha] = useState<number>(0.7);
   const [similarityThreshold, setSimilarityThreshold] = useState<string>("");
+  const [generateAnswer, setGenerateAnswer] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [history, setHistory] = useState<HistoryEntry[]>([]);
@@ -267,6 +447,7 @@ export default function RetrievePage() {
       if (searchMode === "hybrid") payload.hybrid_alpha = hybridAlpha;
       if (similarityThreshold && parseFloat(similarityThreshold) > 0)
         payload.similarity_threshold = parseFloat(similarityThreshold);
+      if (generateAnswer) payload.generate_answer = true;
 
       const res = await apiClient.post<RetrieveResponse>("/api/v2/retrieve/query", payload);
       const entry: HistoryEntry = {
@@ -387,7 +568,7 @@ export default function RetrievePage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <label className="text-xs text-slate-500 font-medium">Min Score:</label>
-                  <InfoTooltip text="Minimum similarity score (0.0-1.0) to include a result. Higher values filter out less relevant chunks. 0.0 returns everything." />
+                  <InfoTooltip text="Minimum composite governance score (0.0–1.0). This is NOT raw cosine similarity — it combines semantic relevance, trust, and temporal signals. Typical useful values: 0.0 (no filter) to 0.5. Values above 0.6 will drop most results." />
                   <input
                     type="number"
                     min={0}
@@ -399,6 +580,12 @@ export default function RetrievePage() {
                     className="w-20 rounded-md border border-slate-200 px-2.5 py-1 text-xs text-slate-700 focus:border-primary-300 focus:ring-1 focus:ring-primary-200 outline-none"
                   />
                 </div>
+                {similarityThreshold && parseFloat(similarityThreshold) > 0.6 && (
+                  <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-700 text-xs">
+                    <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+                    Min Score above 0.6 will likely return 0 results — the governance composite score rarely exceeds this. Try 0.0–0.5.
+                  </div>
+                )}
               </div>
 
               {/* Row 2: Hybrid Alpha slider (visible when hybrid mode) */}
@@ -438,6 +625,26 @@ export default function RetrievePage() {
                 <InfoTooltip text="Hypothetical Document Embeddings — uses an LLM to generate a hypothetical answer first, then searches using that answer's embedding. Improves recall for complex questions but adds latency." />
                 <span className="text-[10px] text-slate-400">
                   Generate a hypothetical answer to improve embedding quality (requires LLM)
+                </span>
+              </div>
+
+              {/* Row 4: Generate Answer toggle */}
+              <div className="flex items-center gap-3 pt-1 border-t border-slate-200/60 mt-1">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={generateAnswer}
+                    onChange={(e) => setGenerateAnswer(e.target.checked)}
+                    className="rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+                  />
+                  <span className="text-xs text-slate-700 font-semibold flex items-center gap-1">
+                    <Bot className="w-3.5 h-3.5 text-primary-600" />
+                    Generate LLM Answer
+                  </span>
+                </label>
+                <InfoTooltip text="After retrieval, send the top chunks as context to the configured LLM (MAI_LLM env var) to generate a grounded, cited answer. Requires a valid LLM API key." />
+                <span className="text-[10px] text-slate-400">
+                  Full RAG: retrieve → ground → LLM generates a cited answer from your documents
                 </span>
               </div>
             </div>
@@ -482,7 +689,9 @@ export default function RetrievePage() {
       {loading && (
         <div className="flex items-center justify-center gap-3 py-8 text-slate-500">
           <Loader2 className="w-5 h-5 animate-spin" />
-          <span className="text-sm">Embedding query & running retrieval…</span>
+          <span className="text-sm">
+            {generateAnswer ? "Retrieving context & generating answer…" : "Embedding query & running retrieval…"}
+          </span>
         </div>
       )}
 
@@ -523,6 +732,46 @@ export default function RetrievePage() {
                 </div>
               </div>
             </div>
+
+            {/* LLM Generated Answer */}
+            {entry.response.answer && (
+              <div className="ml-11 rounded-xl border border-primary-200 bg-primary-50/40 overflow-hidden shadow-sm">
+                <div className="flex items-center gap-2 px-4 py-2.5 bg-primary-50 border-b border-primary-200/70">
+                  <Bot className="w-4 h-4 text-primary-600 flex-shrink-0" />
+                  <span className="text-xs font-semibold text-primary-700">AI Answer</span>
+                  {entry.response.answer_model && (
+                    <span className="ml-1 text-[10px] text-primary-400 font-mono">{entry.response.answer_model}</span>
+                  )}
+                  {entry.response.answer_latency_ms != null && (
+                    <span className="ml-auto text-[10px] text-primary-400 flex items-center gap-1">
+                      <Clock className="w-3 h-3" />
+                      {entry.response.answer_latency_ms.toFixed(0)}ms
+                    </span>
+                  )}
+                </div>
+                <div className="px-5 py-4">
+                  <p className="text-sm text-slate-800 leading-relaxed whitespace-pre-wrap">{entry.response.answer}</p>
+                  <p className="text-[10px] text-primary-400 mt-3 flex items-center gap-1">
+                    <MessageSquare className="w-3 h-3" />
+                    Answer grounded on {Math.min(entry.response.total_results, 5)} retrieved source{entry.response.total_results !== 1 ? "s" : ""}. Verify citations against source text below.
+                  </p>
+                </div>
+              </div>
+            )}
+
+            {/* LLM Generation Error Banner (shown when generate_answer=true but generation failed) */}
+            {!entry.response.answer && entry.response.answer_error && (
+              <div className="ml-11 flex items-start gap-3 p-3.5 rounded-xl bg-red-50 border border-red-200 text-red-700 shadow-sm">
+                <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-xs font-semibold">Answer Generation Failed</p>
+                  <p className="text-xs text-red-600 mt-0.5 leading-relaxed">{entry.response.answer_error}</p>
+                </div>
+              </div>
+            )}
+
+            {/* Debug Panel */}
+            <DebugPanel entry={entry} />
 
             {/* No results */}
             {entry.response.results.length === 0 && (

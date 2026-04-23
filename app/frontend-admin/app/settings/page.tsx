@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useMemo } from "react";
+import Link from "next/link";
 import { useFormatDate } from "@/lib/useHydrated";
 import {
   Database,
@@ -29,9 +30,22 @@ import {
   Layers,
   Activity,
   Network,
+  Cpu,
+  Link2,
+  Info,
+  Hash,
+  Scissors,
+  Filter,
+  BarChart3,
+  ShieldCheck,
+  Wand2,
+  ArrowRight,
+  User,
+  Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
+import { API } from "@/lib/apiRoutes";
 import InfoTooltip from "@/components/ui/InfoTooltip";
 
 /* ─── Types ─── */
@@ -63,15 +77,46 @@ interface Category {
 
 /* ─── Categories ─── */
 const CATEGORIES: Category[] = [
-  { id: "all",           label: "All",              icon: SettingsIcon, color: "text-slate-600" },
-  { id: "pipeline",      label: "Pipeline",         icon: Zap,          color: "text-primary-600" },
-  { id: "vectordb",      label: "Vector Databases",  icon: Database,     color: "text-violet-600" },
-  { id: "ai",            label: "AI Providers",      icon: Brain,        color: "text-emerald-600" },
-  { id: "taskqueue",     label: "Task Queue",        icon: Layers,       color: "text-orange-600" },
-  { id: "integrations",  label: "Integrations",      icon: Network,      color: "text-indigo-600" },
-  { id: "observability", label: "Observability",     icon: Activity,     color: "text-cyan-600" },
-  { id: "security",      label: "Security & App",    icon: Shield,       color: "text-red-600" },
+  { id: "all",           label: "All",                     icon: SettingsIcon, color: "text-slate-600" },
+  // ── Concept groups (guided, non-expert view) ──────────────────────────────
+  { id: "embedding",     label: "Embedding & Tokenization", icon: Hash,         color: "text-sky-600" },
+  { id: "storage",       label: "Storage & Indexing",       icon: Database,     color: "text-violet-600" },
+  { id: "generation",    label: "LLM & Generation",         icon: Brain,        color: "text-emerald-600" },
+  // ── Technical deep-dive ───────────────────────────────────────────────────
+  { id: "pipeline",      label: "Pipeline & Ingestion",     icon: Zap,          color: "text-primary-600" },
+  { id: "vectordb",      label: "Vector DB Config",          icon: Database,     color: "text-violet-600" },
+  { id: "ai",            label: "All AI Providers",          icon: Brain,        color: "text-teal-600" },
+  { id: "taskqueue",     label: "Task Queue",               icon: Layers,       color: "text-orange-600" },
+  { id: "integrations",  label: "Integrations",             icon: Network,      color: "text-indigo-600" },
+  { id: "observability", label: "Observability",            icon: Activity,     color: "text-cyan-600" },
+  { id: "security",      label: "Security & App",           icon: Shield,       color: "text-red-600" },
 ];
+
+/**
+ * Concept-aware category matcher.
+ * The three concept categories (embedding, storage, generation) use keyword
+ * matching on section title so existing SECTIONS need no category field changes.
+ */
+function sectionMatchesCategory(section: ConfigSection, catId: string): boolean {
+  if (catId === "all") return true;
+  const t = section.title;
+  const c = section.category;
+  switch (catId) {
+    case "embedding":
+      // Tokenization engine + all embedding provider sections
+      return (
+        (c === "pipeline" && /tokeniz|embed|chunk/i.test(t)) ||
+        (c === "ai" && /embed/i.test(t))
+      );
+    case "storage":
+      return c === "vectordb";
+    case "generation":
+      // All LLM provider sections (OpenAI LLM, Groq, Anthropic, Gemini, Ollama LLM, etc.)
+      return c === "ai" && /llm|gpt|claude|gemini|groq|grok|anthropic|ollama|cohere.*command/i.test(t) && !/embed/i.test(t);
+    default:
+      return c === catId;
+  }
+}
 
 /* ─── Section definitions (metadata only — values come from backend) ─── */
 const SECTIONS: ConfigSection[] = [
@@ -84,8 +129,8 @@ const SECTIONS: ConfigSection[] = [
     gradient: "from-primary-500 to-primary-700 shadow-primary-600/20",
     keys: [
       { key: "MAI_VECTORDB", label: "Vector Database", type: "select", options: ["qdrant", "chroma", "pinecone", "milvus", "weaviate", "redis"], tooltip: "Which vector database to use for storing and searching embeddings. Changing this switches the entire storage backend." },
-      { key: "MAI_EMBEDDER", label: "Embedder Provider", type: "select", options: ["huggingface", "ollama", "openai", "cohere"], tooltip: "The AI model provider used to convert text into vector embeddings. HuggingFace runs locally; others call external APIs." },
-      { key: "MAI_LLM", label: "LLM Provider", type: "select", options: ["ollama", "openai", "grok", "anthropic", "gemini"], tooltip: "The large language model provider for generating answers, summaries, and HyDE expansions. Ollama runs locally; others require API keys." },
+      { key: "MAI_EMBEDDER", label: "Embedder Provider", type: "select", options: ["huggingface", "ollama", "openai", "cohere", "google"], tooltip: "The AI model provider used to convert text into vector embeddings. HuggingFace/Ollama run locally; OpenAI, Cohere, and Google (Gemini) call external APIs." },
+      { key: "MAI_LLM", label: "LLM Provider", type: "select", options: ["ollama", "openai", "groq", "anthropic", "gemini"], tooltip: "The large language model provider for generating answers, summaries, and HyDE expansions. Ollama runs locally; others require API keys." },
       { key: "MAI_COLLECTION", label: "Default Collection", tooltip: "The default vector database collection name where all embeddings are stored. Think of it like a database table name." },
       { key: "MAI_VECTOR_TRANSPORT", label: "Vector Transport", type: "select", options: ["auto", "grpc", "http"], tooltip: "Network protocol for communicating with the vector database. gRPC is faster for large payloads; HTTP is more compatible. Auto picks the best option." },
     ],
@@ -99,7 +144,7 @@ const SECTIONS: ConfigSection[] = [
     keys: [
       { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number", tooltip: "How many embedding vectors are sent to the vector database in one batch during ingestion. Larger batches are faster but use more memory." },
       { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number", tooltip: "Number of parallel threads used to generate embeddings during ingestion. Higher values speed up ingestion on multi-core machines." },
-      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "token_aware"], tooltip: "How documents are split into smaller chunks before embedding. Semantic splits by meaning; overlap uses sliding windows; structure_aware respects headings and tables." },
+      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "recursive", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "elite", "elite_v2", "token_aware"], tooltip: "How documents are split into smaller chunks before embedding. token_aware uses model-native tokenization for exact limits; semantic/recursive split by meaning; elite/elite_v2 use LLM-assisted intelligent splitting." },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean", tooltip: "Layer 1 deduplication: fast SHA-256 hash check. Catches exact duplicate chunks instantly with zero performance cost." },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean", tooltip: "Layer 2 deduplication: Global Content Index lookup. Catches near-duplicate chunks that have the same normalized text content." },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean", tooltip: "Layer 3 deduplication: embedding-based similarity search. Catches paraphrased duplicates by comparing vector similarity. Most expensive layer." },
@@ -135,17 +180,21 @@ const SECTIONS: ConfigSection[] = [
     icon: Brain,
     gradient: "from-sky-500 to-indigo-600 shadow-sky-600/20",
     keys: [
-      { key: "DEFAULT_TOKENIZER_BACKEND", label: "Tokenizer Backend", type: "select", options: ["whitespace", "huggingface", "spacy", "nltk"], tooltip: "How text is split into tokens for chunk sizing. HuggingFace is most accurate for multilingual text; whitespace is fastest but least precise." },
+      { key: "USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING", label: "Model-Native Tokenizer for Chunking", type: "boolean", tooltip: "When enabled, ALL chunking strategies use the embedding model's native tokenizer (tiktoken for OpenAI, SentencePiece for Gemini, etc.) for accurate token counts instead of the generic BERT fallback. Eliminates precision gaps between chunk sizing and actual embedding limits." },
+      { key: "DEFAULT_TOKENIZER_BACKEND", label: "Fallback Tokenizer Backend", type: "select", options: ["whitespace", "huggingface", "spacy", "nltk"], tooltip: "Fallback tokenizer used when no EmbedderBundle is available or when model-native tokenization is disabled. HuggingFace is most accurate for multilingual text; whitespace is fastest but least precise." },
       { key: "CHUNK_SIZE", label: "Token Chunk Size", type: "number", placeholder: "512", tooltip: "Maximum number of tokens per chunk. Controls how large each piece of text is before embedding. 512 is a good default for most embedding models." },
       { key: "CHUNK_OVERLAP", label: "Token Chunk Overlap", type: "number", placeholder: "64", tooltip: "Number of tokens shared between consecutive chunks. Overlap prevents information loss at chunk boundaries." },
       { key: "MIN_CHUNK_TOKENS", label: "Min Chunk Tokens", type: "number", placeholder: "30", tooltip: "Chunks smaller than this token count are discarded as too short to be meaningful. Prevents noisy micro-chunks from polluting search results." },
+      { key: "GEMINI_CHUNK_SOFT_CAP_FACTOR", label: "Gemini Soft Cap Factor", type: "number", placeholder: "0.85", tooltip: "Safety factor applied to Gemini's embed_max_tokens to compute the soft token limit for chunking. Lower = more conservative (0.85 = 85% of model max). Reduces costly remote countTokens API calls for near-limit chunks." },
+      { key: "OPENAI_CHUNK_SOFT_CAP_FACTOR", label: "OpenAI Soft Cap Factor", type: "number", placeholder: "0.92", tooltip: "Safety factor for OpenAI tiktoken chunk sizing. Higher than Gemini since tiktoken is a local tokenizer with no API cost." },
+      { key: "CHUNKING_TOKEN_COUNTER_CACHE_SIZE", label: "Token Counter LRU Cache Size", type: "number", placeholder: "512", tooltip: "Number of token count results cached per ingestion pipeline instance. Avoids re-counting repeated text segments during recursive chunking." },
       { key: "HF_TOKENIZER_MODEL", label: "HuggingFace Tokenizer Model", type: "select", options: [
         "bert-base-multilingual-cased",
         "ai4bharat/indic-bert",
         "bert-base-uncased",
         "xlm-roberta-base",
         "google/muril-base-cased",
-      ], tooltip: "Which HuggingFace tokenizer model to use for token counting. Should match or be compatible with your embedding model for accurate chunk sizing." },
+      ], tooltip: "Which HuggingFace tokenizer model to use as the fallback token counter. Should match or be compatible with your embedding model for accurate chunk sizing." },
       { key: "SPACY_MODEL", label: "spaCy Language Model", type: "select", options: [
         "en_core_web_sm",
         "en_core_web_lg",
@@ -809,6 +858,358 @@ function ConfigField({
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
+/* ─── RAG READINESS DASHBOARD — Phase 1 ─── */
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Types ── */
+interface ComponentCheck {
+  component: string;
+  label: string;
+  status: "ok" | "warning" | "error" | "info";
+  message: string;
+  detail?: string | null;
+}
+
+interface AlignmentData {
+  catalog_available: boolean;
+  is_aligned: boolean | null;
+  reason: string | null;
+  embedder_model_id: string | null;
+  provider: string | null;
+  tokenizer_family: string | null;
+  embed_max_tokens: number | null;
+  dimension: number | null;
+  distance_metric: string | null;
+  is_normalized: boolean | null;
+  verification_status: string | null;
+  embedding_fingerprint: string | null;
+  safe_chunk_size: number | null;
+  recommended_chunk_overlap: number | null;
+  errors: string[];
+  warnings: string[];
+  failure_modes: string[];
+  // Phase 2 compatibility additions
+  component_checks: ComponentCheck[];
+  overall_score: number | null;
+  ingestion_ready: boolean | null;
+  readiness_label: string | null;
+}
+
+/* ── Icon mapping per component ── */
+const COMPONENT_ICON_MAP: Record<string, React.ElementType> = {
+  embedder:  Cpu,
+  tokenizer: Hash,
+  chunking:  Scissors,
+  vectordb:  Database,
+  reranker:  Filter,
+  llm:       Brain,
+  config:    Shield,
+};
+
+/* ── Readiness Arc Gauge (SVG, 270-degree sweep) ── */
+function ReadinessGauge({ score, label }: { score: number; label: string }) {
+  const size = 104;
+  const sw   = 9;
+  const r    = (size - sw * 2) / 2;
+  const cx   = size / 2;
+  const cy   = size / 2;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const startAngle = 135;
+  const filled     = startAngle + (Math.max(0, Math.min(100, score)) / 100) * 270;
+
+  function pt(angle: number) {
+    return {
+      x: +(cx + r * Math.cos(toRad(angle))).toFixed(3),
+      y: +(cy + r * Math.sin(toRad(angle))).toFixed(3),
+    };
+  }
+  function arc(from: number, to: number) {
+    const s = pt(from); const e = pt(to);
+    const large = to - from > 180 ? 1 : 0;
+    return `M ${s.x} ${s.y} A ${r} ${r} 0 ${large} 1 ${e.x} ${e.y}`;
+  }
+
+  const color =
+    label === "Ingestion Ready"      ? "#10b981" :
+    label === "Review Recommended"   ? "#f59e0b" : "#ef4444";
+
+  return (
+    <div className="flex flex-col items-center gap-2">
+      <div className="relative">
+        <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+          {/* track */}
+          <path d={arc(135, 405)} fill="none" stroke="#e2e8f0" strokeWidth={sw} strokeLinecap="round"/>
+          {/* fill */}
+          {score > 0 && (
+            <path d={arc(135, filled)} fill="none" stroke={color} strokeWidth={sw} strokeLinecap="round"
+              style={{ transition: "stroke-dasharray 0.4s ease" }}/>
+          )}
+        </svg>
+        <div className="absolute inset-0 flex flex-col items-center justify-center" style={{ paddingBottom: 6 }}>
+          <span className="text-[22px] font-black leading-none text-slate-800">{score}</span>
+          <span className="text-[9px] font-bold text-slate-400 tracking-widest">/100</span>
+        </div>
+      </div>
+      <span className={cn(
+        "text-[11px] font-bold text-center leading-tight px-1",
+        label === "Ingestion Ready"    ? "text-emerald-700" :
+        label === "Review Recommended" ? "text-amber-700"   : "text-red-700"
+      )}>{label}</span>
+    </div>
+  );
+}
+
+/* ── Single component card ── */
+function ComponentCard({ check }: { check: ComponentCheck }) {
+  const Icon = COMPONENT_ICON_MAP[check.component] ?? Activity;
+
+  const style = {
+    ok:      { wrap: "bg-emerald-50 border-emerald-200",  text: "text-emerald-700", icon: "text-emerald-600" },
+    warning: { wrap: "bg-amber-50 border-amber-200",      text: "text-amber-700",   icon: "text-amber-600"  },
+    error:   { wrap: "bg-red-50 border-red-200",          text: "text-red-700",     icon: "text-red-600"    },
+    info:    { wrap: "bg-slate-50 border-slate-200",      text: "text-slate-600",   icon: "text-slate-400"  },
+  }[check.status];
+
+  const StatusIcon = {
+    ok:      <CheckCircle2 className="h-3 w-3 text-emerald-600 flex-shrink-0" />,
+    warning: <AlertTriangle className="h-3 w-3 text-amber-600 flex-shrink-0" />,
+    error:   <XCircle className="h-3 w-3 text-red-600 flex-shrink-0" />,
+    info:    <Info className="h-3 w-3 text-slate-400 flex-shrink-0" />,
+  }[check.status];
+
+  return (
+    <div
+      className={cn("rounded-lg border p-3 flex flex-col gap-1.5", style.wrap)}
+      title={check.detail ?? undefined}
+    >
+      {/* header row */}
+      <div className="flex items-center gap-1.5">
+        <Icon className={cn("h-3.5 w-3.5", style.icon)} />
+        <span className="text-[10px] font-bold uppercase tracking-wide text-slate-500 truncate flex-1">
+          {check.label}
+        </span>
+        {StatusIcon}
+      </div>
+      {/* message */}
+      <p className={cn("text-xs font-semibold leading-tight truncate", style.text)}>
+        {check.message}
+      </p>
+    </div>
+  );
+}
+
+/* ── Main card ── */
+function EmbeddingAlignmentCard({
+  data,
+  loading,
+  error,
+  onRefresh,
+  chunkSizeEnvVal,
+}: {
+  data: AlignmentData | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  chunkSizeEnvVal: string;
+}) {
+  const chunkSizeNum = parseInt(chunkSizeEnvVal, 10) || null;
+  const isSizeUnsafe =
+    data?.safe_chunk_size != null &&
+    chunkSizeNum != null &&
+    chunkSizeNum > data.safe_chunk_size;
+
+  const score    = data?.overall_score ?? 0;
+  const rlabel   = data?.readiness_label ?? "Not Ready";
+  const hasIssues = (data?.errors?.length ?? 0) + (data?.warnings?.length ?? 0) > 0;
+
+  return (
+    <div className="rounded-xl border border-sky-200/80 bg-white shadow-card col-span-full overflow-hidden">
+
+      {/* ─── Header ─────────────────────────────────────────────────────── */}
+      <div className="flex items-center gap-3 border-b border-slate-100 px-6 py-4">
+        <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-sky-500 to-indigo-600 shadow-lg shrink-0">
+          <BarChart3 className="h-4 w-4 text-white" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="text-sm font-semibold text-slate-800">
+              RAG Component Compatibility &amp; Ingestion Readiness
+            </h3>
+            <span className="rounded-full bg-sky-100 px-2 py-0.5 text-[10px] font-bold text-sky-700">
+              Phase 1
+            </span>
+          </div>
+          <p className="text-xs text-slate-400 mt-0.5">
+            Live compatibility check across all pipeline components — Embedder · Tokenizer · Chunking · VectorDB · Reranker · LLM
+          </p>
+        </div>
+        <button
+          onClick={onRefresh}
+          disabled={loading}
+          className="ml-auto rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50 flex items-center gap-1.5 shrink-0"
+        >
+          <RefreshCw className={cn("h-3.5 w-3.5", loading && "animate-spin")} />
+          Refresh
+        </button>
+      </div>
+
+      {/* ─── Body ───────────────────────────────────────────────────────── */}
+      <div className="px-6 py-5 space-y-5">
+
+        {/* Loading */}
+        {loading && (
+          <div className="flex items-center gap-2 text-slate-500 text-sm py-4">
+            <Loader2 className="h-4 w-4 animate-spin text-sky-500" />
+            Checking pipeline compatibility…
+          </div>
+        )}
+
+        {/* Fetch error */}
+        {!loading && error && (
+          <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+            <XCircle className="h-4 w-4 flex-shrink-0 mt-0.5" />
+            <span>{error}</span>
+          </div>
+        )}
+
+        {/* Data available */}
+        {!loading && !error && data && (
+          <>
+            {/* ── Row 1: Score Gauge + Component Grid ────────────────── */}
+            <div className="flex flex-col sm:flex-row gap-5 items-start">
+
+              {/* Gauge column */}
+              <div className="flex flex-col items-center gap-3 shrink-0 w-full sm:w-32">
+                <ReadinessGauge score={score} label={rlabel} />
+
+                {/* Ingestion go/no-go pill */}
+                <div className={cn(
+                  "flex items-center gap-1.5 rounded-full px-3 py-1.5 text-[11px] font-bold w-full justify-center",
+                  data.ingestion_ready
+                    ? "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300"
+                    : "bg-red-100 text-red-800 ring-1 ring-red-300"
+                )}>
+                  {data.ingestion_ready
+                    ? <><ShieldCheck className="h-3.5 w-3.5" /> Ready to Ingest</>
+                    : <><XCircle className="h-3.5 w-3.5" /> Fix Issues First</>
+                  }
+                </div>
+
+                {/* Fingerprint */}
+                {data.embedding_fingerprint && (
+                  <p className="font-mono text-[10px] text-slate-400 text-center break-all">
+                    fp: {data.embedding_fingerprint}
+                  </p>
+                )}
+              </div>
+
+              {/* Component grid */}
+              <div className="flex-1 grid grid-cols-2 gap-2 sm:grid-cols-3 w-full">
+                {(data.component_checks.length > 0
+                  ? data.component_checks
+                  : Array(6).fill({ component: "embedder", label: "—", status: "info", message: "No data" })
+                ).map((check) => (
+                  <ComponentCard key={check.component} check={check} />
+                ))}
+              </div>
+            </div>
+
+            {/* ── Row 2: Safe chunk size recommendation ──────────────── */}
+            {data.safe_chunk_size != null && (
+              <div className={cn(
+                "rounded-lg border px-4 py-3 flex items-start gap-3",
+                isSizeUnsafe ? "border-amber-200 bg-amber-50" : "border-emerald-200 bg-emerald-50"
+              )}>
+                <Link2 className={cn(
+                  "h-4 w-4 flex-shrink-0 mt-0.5",
+                  isSizeUnsafe ? "text-amber-500" : "text-emerald-600"
+                )}/>
+                <div className="space-y-0.5 flex-1 min-w-0">
+                  <p className={cn(
+                    "text-xs font-semibold flex flex-wrap gap-x-3 gap-y-0.5",
+                    isSizeUnsafe ? "text-amber-800" : "text-emerald-800"
+                  )}>
+                    <span>
+                      Recommended&nbsp;
+                      <code className={cn("rounded px-1 font-mono", isSizeUnsafe ? "bg-amber-100" : "bg-emerald-100")}>
+                        CHUNK_SIZE={data.safe_chunk_size}
+                      </code>
+                    </span>
+                    {data.recommended_chunk_overlap != null && (
+                      <span>
+                        <code className={cn("rounded px-1 font-mono", isSizeUnsafe ? "bg-amber-100" : "bg-emerald-100")}>
+                          CHUNK_OVERLAP={data.recommended_chunk_overlap}
+                        </code>
+                      </span>
+                    )}
+                  </p>
+                  {isSizeUnsafe && chunkSizeNum != null ? (
+                    <p className="text-xs text-amber-700">
+                      Your <code className="bg-amber-100 rounded px-1">CHUNK_SIZE={chunkSizeNum}</code> exceeds the safe
+                      limit of <strong>{data.safe_chunk_size}</strong> — chunks will overflow the embedder context window (F-02).
+                    </p>
+                  ) : chunkSizeNum != null ? (
+                    <p className="text-xs text-emerald-700">
+                      <code className="bg-emerald-100 rounded px-1">CHUNK_SIZE={chunkSizeNum}</code> is within safe bounds.
+                    </p>
+                  ) : (
+                    <p className="text-xs text-slate-500">
+                      CHUNK_SIZE not set — use the safe default above to prevent silent token overflow.
+                    </p>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* ── Row 3: Issues accordion (collapsible) ──────────────── */}
+            {hasIssues && (
+              <details className="group rounded-lg border border-slate-200 overflow-hidden">
+                <summary className="flex items-center gap-2 cursor-pointer select-none bg-slate-50 px-4 py-2.5 text-xs font-semibold text-slate-600 hover:bg-slate-100 transition-colors">
+                  <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                  Pipeline Issues
+                  <span className="ml-auto rounded-full bg-slate-200 px-2 py-0.5 text-[10px] font-bold text-slate-600">
+                    {data.errors.length + data.warnings.length}
+                  </span>
+                </summary>
+                <div className="px-4 py-3 space-y-1.5 bg-white">
+                  {data.errors.map((e, i) => (
+                    <div key={`e${i}`} className="flex items-start gap-2 rounded border border-red-100 bg-red-50 px-3 py-2 text-xs text-red-700">
+                      <XCircle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
+                      <span className="break-words">{e}</span>
+                    </div>
+                  ))}
+                  {data.warnings.map((w, i) => (
+                    <div key={`w${i}`} className="flex items-start gap-2 rounded border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                      <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0 mt-0.5" />
+                      <span className="break-words">{w}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            {/* ── Row 4: tokenizer alignment footer ─────────────────── */}
+            <p className="text-[11px] text-slate-400 border-t border-slate-100 pt-3 leading-relaxed">
+              When{" "}
+              <code className="rounded bg-slate-100 px-1">USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING=true</code>{" "}
+              (default), <strong className="text-slate-600">all</strong> chunking strategies use{" "}
+              <strong className="text-slate-600">
+                {data.tokenizer_family ?? "the model's native tokenizer"}
+              </strong>{" "}
+              for accurate token counts —{" "}
+              <code className="rounded bg-slate-100 px-1">token_aware</code> uses it for hard
+              limits; all others use it for quality scoring and metadata.{" "}
+              <code className="rounded bg-slate-100 px-1">DEFAULT_TOKENIZER_BACKEND</code>{" "}
+              is the fallback when no embedder bundle is available.
+            </p>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
 /* ─── SECTION CARD ─── */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 function SectionCard({
@@ -891,9 +1292,32 @@ export default function SettingsPage() {
   const [lastRefreshStr, setLastRefreshStr] = useState("");
   const [toast, setToast] = useState<{ type: "success" | "error"; msg: string } | null>(null);
 
+  /* ── Phase 1 Alignment state ── */
+  const [alignmentData, setAlignmentData] = useState<AlignmentData | null>(null);
+  const [alignmentLoading, setAlignmentLoading] = useState(false);
+  const [alignmentError, setAlignmentError] = useState<string | null>(null);
+
   /* ── Category & search state ── */
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
+
+  /* ── Fetch alignment status from backend (Phase 1) ── */
+  const fetchAlignment = useCallback(async () => {
+    setAlignmentLoading(true);
+    setAlignmentError(null);
+    try {
+      const res = await apiClient.get(API.EMBEDDING_ALIGNMENT());
+      setAlignmentData(res.data as AlignmentData);
+    } catch (err: any) {
+      const msg =
+        err?.response?.status === 403
+          ? "Admin role required to view alignment status."
+          : err?.response?.data?.detail || "Failed to load alignment status.";
+      setAlignmentError(msg);
+    } finally {
+      setAlignmentLoading(false);
+    }
+  }, []);
 
   /* ── Fetch config from backend ── */
   const fetchConfig = useCallback(async () => {
@@ -915,6 +1339,7 @@ export default function SettingsPage() {
 
   useEffect(() => {
     fetchConfig();
+    fetchAlignment();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -933,8 +1358,8 @@ export default function SettingsPage() {
   const filteredSections = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     return SECTIONS.filter((section) => {
-      // Category filter
-      if (activeCategory !== "all" && section.category !== activeCategory) return false;
+      // Category filter (uses concept-aware matcher)
+      if (!sectionMatchesCategory(section, activeCategory)) return false;
       // Search filter — match section title, description, or any key/label
       if (q) {
         const inTitle = section.title.toLowerCase().includes(q);
@@ -951,8 +1376,9 @@ export default function SettingsPage() {
   /* ── Count per category (for badges) ── */
   const categoryCounts = useMemo(() => {
     const counts: Record<string, number> = { all: SECTIONS.length };
-    for (const s of SECTIONS) {
-      counts[s.category] = (counts[s.category] || 0) + 1;
+    for (const cat of CATEGORIES) {
+      if (cat.id === "all") continue;
+      counts[cat.id] = SECTIONS.filter(s => sectionMatchesCategory(s, cat.id)).length;
     }
     return counts;
   }, []);
@@ -962,10 +1388,15 @@ export default function SettingsPage() {
     if (!editing) return {};
     const counts: Record<string, number> = {};
     for (const s of SECTIONS) {
-      const c = s.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length;
-      if (c > 0) {
-        counts[s.category] = (counts[s.category] || 0) + c;
-        counts["all"] = (counts["all"] || 0) + c;
+      const changed = s.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length;
+      if (changed > 0) {
+        // Increment all categories this section belongs to
+        for (const cat of CATEGORIES) {
+          if (sectionMatchesCategory(s, cat.id)) {
+            counts[cat.id] = (counts[cat.id] || 0) + changed;
+          }
+        }
+        counts["all"] = (counts["all"] || 0) + changed;
       }
     }
     return counts;
@@ -1039,6 +1470,30 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-5">
+      {/* ── Pipeline Builder Banner ── */}
+      <Link
+        href="/settings/pipeline"
+        className="group flex items-center justify-between rounded-xl border border-primary-200 bg-gradient-to-r from-primary-50 to-violet-50 px-5 py-3.5 shadow-sm hover:shadow-md hover:border-primary-300 transition-all duration-200"
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-gradient-to-br from-primary-500 to-violet-600 text-white shadow-sm">
+            <Wand2 className="h-4 w-4" />
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-slate-800">
+              New — Pipeline Builder
+              <span className="ml-2 rounded-full bg-primary-600 px-2 py-0.5 text-[10px] font-bold text-white">GUIDED</span>
+            </p>
+            <p className="text-xs text-slate-500">
+              Pick an embedding model and we auto-fill compatible tokenizer, VectorDB, reranker, LLM, and chunk size.
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-1 text-xs font-semibold text-primary-600 group-hover:gap-2 transition-all">
+          Open Builder <ArrowRight className="h-4 w-4" />
+        </div>
+      </Link>
+
       {/* ── Toast notification ── */}
       {toast && (
         <div className={cn(
@@ -1243,6 +1698,17 @@ export default function SettingsPage() {
           <p className="text-sm font-medium text-slate-500">No settings found</p>
           <p className="text-xs text-slate-400 mt-1">Try a different search term or category</p>
         </div>
+      )}
+
+      {/* ── Phase 1 Embedding Alignment Card ── */}
+      {!loading && (activeCategory === "all" || activeCategory === "pipeline" || activeCategory === "embedding") && !searchQuery && (
+        <EmbeddingAlignmentCard
+          data={alignmentData}
+          loading={alignmentLoading}
+          error={alignmentError}
+          onRefresh={fetchAlignment}
+          chunkSizeEnvVal={config["CHUNK_SIZE"] ?? ""}
+        />
       )}
 
       {/* ── Config Sections Grid ── */}

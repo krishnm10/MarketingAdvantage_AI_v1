@@ -625,6 +625,15 @@ class RetrievalRepository:
             )
         
         # -------------------------------------------------
+        # Determine trust state: "unvalidated" when no real
+        # trust signals exist (missing validation_layer or all zeros)
+        # -------------------------------------------------
+        _all_trust_zero = all(
+            s == 0.0 for s in [tap_trust_score, agentic_validation_score, reasoning_quality_score]
+        )
+        _trust_state = "unvalidated" if (not validation_layer or _all_trust_zero) else "validated"
+
+        # -------------------------------------------------
         # Construct Candidate
         # -------------------------------------------------
         candidate = RetrievalCandidate(
@@ -641,6 +650,7 @@ class RetrievalRepository:
                 reasoning_quality_score=float(reasoning_quality_score),
                 conflict_modifier=float(conflict_modifier),
                 temporal_decay=float(temporal_decay),
+                trust_state=_trust_state,
             ),
         )
         

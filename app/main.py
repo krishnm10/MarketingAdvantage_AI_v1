@@ -52,9 +52,10 @@ except ImportError:
     sentry_sdk = None  # type: ignore[assignment]
     _sentry_available = False
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from app.utils.instrumentation import RequestIDMiddleware
 try:
     from slowapi import Limiter, _rate_limit_exceeded_handler
     from slowapi.errors import RateLimitExceeded
@@ -140,6 +141,8 @@ from app.api.v2.ingestion_ws_api        import router as ingestion_ws_router
 from app.api.v2.ingestion_health        import router as ingestion_health_router
 from app.api.v2.config_api              import router as config_router
 from app.api.v2.retrieve_api            import router as retrieve_router
+from app.api.v2.retrieve_chat_api       import router as retrieve_chat_router
+from app.api.v2.model_discovery_api     import router as model_discovery_router
 
 # ─────────────────────────────────────────────────────────────────────────────
 # New Pluggable RAG Router (NEW — additive only)
@@ -147,9 +150,22 @@ from app.api.v2.retrieve_api            import router as retrieve_router
 from app.api.v2.rag_api import router as rag_router
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Phase 1 — Embedding Alignment Router (NEW — additive only)
+# ─────────────────────────────────────────────────────────────────────────────
+from app.api.v2.embedding_alignment_api import router as embedding_alignment_router
+from app.api.v2.pipeline_recommendation_api import router as pipeline_recommendation_router
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 2 — Reranker Config + Prompt Template Routers (NEW — additive only)
+# ─────────────────────────────────────────────────────────────────────────────
+from app.api.v2.rag_config_api       import router as rag_config_router
+from app.api.v2.prompt_template_api  import router as prompt_template_router
+
+# ─────────────────────────────────────────────────────────────────────────────
 # New Kafka Management Router (NEW — additive only)
 # ─────────────────────────────────────────────────────────────────────────────
 from app.api.v2.kafka_api import router as kafka_router
+from app.api.v2.ingestion_audit_api import router as ingestion_audit_router
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Existing Services (ALL PRESERVED)
@@ -210,6 +226,24 @@ async def lifespan(app: FastAPI):
     logger.info("=" * 70)
     logger.info("🚀 Marketing Advantage AI v2 — Starting Up...")
     logger.info("=" * 70)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 0: Startup environment validation — fail fast for critical vars
+    # ─────────────────────────────────────────────────────────────────
+    logger.info("\n[Startup] STEP 0: Environment validation...")
+    _ai_profile = os.getenv("AI_PROFILE", "cpu").lower()
+    _required_by_profile = {
+        "api": ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY"],
+    }
+    _needed = _required_by_profile.get(_ai_profile, [])
+    if _needed and not any(os.getenv(v) for v in _needed):
+        logger.error(
+            "❌ AI_PROFILE=%s requires at least one of: %s — set in .env before starting",
+            _ai_profile, _needed,
+        )
+        # Non-fatal: log and continue so the app starts (API calls will fail at request time)
+    else:
+        logger.info("✅ Environment validation passed (AI_PROFILE=%s)", _ai_profile)
 
     # ─────────────────────────────────────────────────────────────────
     active_vectordb = os.getenv("MAI_VECTORDB", "chroma").lower()
@@ -399,6 +433,22 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  Kafka events unavailable — ingestion still works via Celery/inline")
 
     # ─────────────────────────────────────────────────────────────────
+    # STEP 7: Ingestion Worker (event-driven background processor)
+    # ─────────────────────────────────────────────────────────────────
+    logger.info("\n[Startup] STEP 7: Ingestion Worker...")
+    try:
+        from app.services.ingestion.ingestion_worker import get_ingestion_worker
+        _ingestion_worker = get_ingestion_worker()
+        await _ingestion_worker.start()
+        logger.info(
+            "✅ Ingestion worker started (concurrency=%s)",
+            os.getenv("INGESTION_WORKER_CONCURRENCY", "4"),
+        )
+    except Exception as e:
+        logger.error("❌ Ingestion Worker Failed: %s", e)
+        logger.warning("⚠️  Ingestion will fall back to synchronous processing")
+
+    # ─────────────────────────────────────────────────────────────────
     # STARTUP COMPLETE
     # ─────────────────────────────────────────────────────────────────
     logger.info("\n" + "=" * 70)
@@ -458,6 +508,17 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("❌ Error clearing pipeline caches: %s", e)
 
+    # Stop ingestion worker (NEW — drain current batch)
+    try:
+        from app.services.ingestion.ingestion_worker import get_ingestion_worker
+        _worker = get_ingestion_worker()
+        if _worker._running:
+            logger.info("[Shutdown] Stopping ingestion worker...")
+            await _worker.stop()
+            logger.info("✅ Ingestion worker stopped")
+    except Exception as e:
+        logger.error("❌ Error stopping ingestion worker: %s", e)
+
     # Shutdown Kafka producer (NEW — flush pending events)
     try:
         from app.services.kafka import kafka_service
@@ -497,21 +558,54 @@ if _slowapi_available and limiter is not None:
 
 
 # =============================================================================
-# CORS (env-driven for production safety)
+# REQUEST ID MIDDLEWARE — must be added BEFORE CORS and other middleware
 # =============================================================================
+app.add_middleware(RequestIDMiddleware)
 
-# In production: set CORS_ORIGINS="https://app.yourdomain.com,https://admin.yourdomain.com"
-# In dev: leave unset → defaults to ["*"]
-_raw_origins = os.getenv("CORS_ORIGINS", "*")
-_cors_origins: List[str] = (
-    ["*"] if _raw_origins.strip() == "*"
-    else [o.strip() for o in _raw_origins.split(",") if o.strip()]
-)
+
+# =============================================================================
+# CORS (env-driven for production safety)
+#
+# SECURITY FIX: The CORS spec forbids allow_origins=["*"] together with
+# allow_credentials=True. Browsers reject such responses, and if ever
+# replaced with real origins, credentials would be forwarded to every listed
+# origin. In production, CORS_ORIGINS must be set explicitly.
+#
+# Dev default: localhost:3000 and localhost:8000 (explicit, not wildcard)
+# Production: set CORS_ORIGINS="https://app.yourdomain.com,..." in .env
+# =============================================================================
+_env = os.getenv("ENVIRONMENT", "production").lower()
+_raw_origins = os.getenv("CORS_ORIGINS", "").strip()
+
+if _raw_origins and _raw_origins != "*":
+    _cors_origins: List[str] = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    _cors_allow_credentials = True
+elif _env in ("development", "dev", "local", "test"):
+    _cors_origins = [
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8000",
+    ]
+    _cors_allow_credentials = True
+    logger.warning(
+        "[CORS] CORS_ORIGINS not set in dev env — using localhost defaults. "
+        "Set CORS_ORIGINS explicitly before deploying."
+    )
+else:
+    # Production with no CORS_ORIGINS: allow wildcard WITHOUT credentials
+    # (wildcard + credentials is invalid per CORS spec and rejected by browsers)
+    _cors_origins = ["*"]
+    _cors_allow_credentials = False
+    logger.warning(
+        "[CORS] CORS_ORIGINS not set in production — using wildcard without credentials. "
+        "Set CORS_ORIGINS to explicit origins in production."
+    )
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_credentials=_cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -532,13 +626,45 @@ app.include_router(ingestion_health_router,    tags=["Health"])
 app.include_router(ingestion_ws_router,        tags=["WebSocket"])
 app.include_router(config_router,              tags=["Configuration"])
 app.include_router(retrieve_router,            tags=["Retrieval"])
+app.include_router(retrieve_chat_router,       tags=["Retrieval Chat"])
+app.include_router(model_discovery_router,     tags=["Model Discovery"])
 app.include_router(kafka_router,               tags=["Kafka"])
+app.include_router(ingestion_audit_router,     tags=["Ingestion Audit"])
 
 # ── New pluggable RAG router (EXISTING — preserved) ─────────────────────────
 app.include_router(
     rag_router,
     prefix="/api/v2/rag",
     tags=["RAG Pipeline (Pluggable)"],
+)
+
+# ── Phase 1 Embedding Alignment Router (NEW — additive only) ─────────────────
+app.include_router(
+    embedding_alignment_router,
+    tags=["Embedding Alignment"],
+)
+
+# ── Pipeline Recommendations Router (catalog-driven, read-only) ───────────────
+app.include_router(
+    pipeline_recommendation_router,
+    tags=["Pipeline Recommendations"],
+)
+
+# ── Phase 2 — RAG Config + Prompt Templates + Evaluation ─────────────────────
+app.include_router(
+    rag_config_router,
+    tags=["RAG Configuration"],
+)
+
+app.include_router(
+    prompt_template_router,
+    tags=["Prompt Templates"],
+)
+
+from app.api.v2.rag_eval_api import router as rag_eval_router
+app.include_router(
+    rag_eval_router,
+    tags=["RAG Evaluation"],
 )
 
 
@@ -706,6 +832,76 @@ async def health_check():
         health_status["phantom"]["status"] = f"error: {str(e)[:100]}"
 
     return health_status
+
+
+# =============================================================================
+# SPLIT HEALTH ENDPOINTS
+#
+# /health/live  — Kubernetes liveness probe: is the process up?
+#                 Public endpoint, returns minimal data (no infra leak).
+# /health/ready — Kubernetes readiness probe + deep diagnostic.
+#                 Requires X-Internal-Token header to prevent reconnaissance.
+# =============================================================================
+
+@app.get("/health/live", tags=["System"])
+async def health_live():
+    """
+    Liveness probe — fast, public, minimal.
+    Returns 200 if the process is running; no infra details.
+    Safe to expose externally (no GPU VRAM, storage paths, or plugin info).
+    """
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat() + "Z"}
+
+
+def _check_internal_token(request: Request):
+    """Dependency: require X-Internal-Token for sensitive readiness endpoint."""
+    expected = os.getenv("INTERNAL_HEALTH_TOKEN", "")
+    if not expected:
+        # Token not configured — allow (dev/staging mode)
+        return
+    provided = request.headers.get("X-Internal-Token", "")
+    if provided != expected:
+        raise HTTPException(status_code=403, detail="Forbidden: invalid internal token")
+
+
+@app.get("/health/ready", tags=["System"])
+async def health_ready(request: Request, _: None = Depends(_check_internal_token)):
+    """
+    Readiness probe — deep diagnostic with full infra details.
+    Protected by X-Internal-Token header when INTERNAL_HEALTH_TOKEN is set.
+    Exposes GPU VRAM, storage paths, plugin registry, and scheduler internals.
+    """
+    ready_status: dict = {
+        "status": "ready",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+    }
+    try:
+        from app.services.ingestion.ingestion_service_v2 import get_chroma_collection
+        _, collection = get_chroma_collection(skip_count=True)
+        ready_status["vectordb"] = {"status": "ok", "collection": collection.name}
+    except Exception as e:
+        ready_status["vectordb"] = {"status": "error", "detail": str(e)[:100]}
+
+    scheduler = get_validation_scheduler()
+    ready_status["scheduler"] = {
+        "status": "running" if scheduler and getattr(scheduler, "_running", False) else "stopped"
+    }
+
+    try:
+        if phantom_cfg._initialized:
+            ready_status["phantom"] = {
+                "tier": phantom_cfg.tier,
+                "gpu": phantom_cfg.gpu_name,
+                "gpu_vram_gb": phantom_cfg.gpu_vram_gb,
+                "ram_gb": phantom_cfg.system_ram_gb,
+                "embed_batch": phantom_cfg.embed_batch_size,
+                "workers": phantom_cfg.ingest_workers,
+                "is_rocm": phantom_cfg.is_rocm,
+            }
+    except Exception:
+        pass
+
+    return ready_status
 
 
 # =============================================================================
@@ -930,3 +1126,52 @@ async def phantom_stats():
             "PHANTOM_BLOOM_CAPACITY":    os.getenv("PHANTOM_BLOOM_CAPACITY", "not set"),
         },
     }
+
+
+# =============================================================================
+# COST TRACKING ENDPOINT (NEW — per-tenant token usage)
+# =============================================================================
+
+@app.get("/api/v2/stats/token-usage", tags=["Stats"])
+async def token_usage_stats(tenant_id: str = "", month: str = ""):
+    """
+    Get token usage summary for cost tracking.
+
+    Query params:
+        tenant_id: Filter by specific tenant (empty = all tenants)
+        month:     "YYYY-MM" format (empty = current month)
+    """
+    from app.utils.cost_tracker import get_usage, get_all_usage
+    if tenant_id:
+        usage = get_usage(tenant_id, month=month or None)
+        return {
+            "tenant_id": tenant_id,
+            "month": month or __import__("datetime").datetime.utcnow().strftime("%Y-%m"),
+            "usage": usage,
+        }
+    return {
+        "month": month or __import__("datetime").datetime.utcnow().strftime("%Y-%m"),
+        "all_tenants": get_all_usage(month=month or None),
+    }
+
+
+# =============================================================================
+# INGESTION WORKER STATS ENDPOINT (NEW)
+# =============================================================================
+
+@app.get("/api/v2/stats/ingestion-worker", tags=["Stats"])
+async def ingestion_worker_stats():
+    """
+    Get ingestion worker queue statistics.
+    """
+    try:
+        from app.services.ingestion.ingestion_worker import get_ingestion_queue, get_ingestion_worker
+        queue = get_ingestion_queue()
+        worker = get_ingestion_worker()
+        return {
+            "status": "running" if worker._running else "stopped",
+            "queue": queue.stats,
+            "dead_letter": queue.dead_letter_items(),
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)[:200]}

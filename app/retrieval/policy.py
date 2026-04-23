@@ -1,7 +1,7 @@
 # app/retrieval/policy.py
 
 from enum import Enum
-from app.retrieval.types_retrieve import RetrievalCandidate
+from app.retrieval.types_retrieve import RetrievalCandidate, TrustSignals
 
 
 # =========================================================
@@ -15,19 +15,6 @@ class TrustDecision(Enum):
 
 
 # =========================================================
-# Helper Functions
-# =========================================================
-
-def compute_policy_trust_score(trust_obj) -> float:
-    """
-    Unified calculator for governance trust.
-    Logic should match your enterprise requirements.
-    """
-    # Assuming trust_obj has a score attribute; adjust as per your types_retrieve.py
-    return getattr(trust_obj, 'score', 0.0)
-
-
-# =========================================================
 # Core Retrieval Policy
 # =========================================================
 
@@ -36,8 +23,8 @@ class RetrievalPolicy:
     Enterprise-grade retrieval policy.
 
     Distinguishes between:
-    - TRUSTED: Explicit governance validation exists
-    - PROVISIONAL: Semantic relevance strong, governance pending
+    - TRUSTED: Explicit governance validation exists and meets threshold
+    - PROVISIONAL: Semantic relevance strong but trust unvalidated or below threshold
     - REJECTED: Weak relevance or negative governance
     """
 
@@ -45,33 +32,32 @@ class RetrievalPolicy:
     PROVISIONAL_SEMANTIC_SCORE = 0.35
     MIN_TRUSTED_SCORE = 0.60
 
-    # Runtime operational limits
-    max_results = 5            # final answers returned to user
-    min_results = 1            # minimum acceptable answers
+    max_results = 5
+    min_results = 1
 
     def decide(self, candidate: RetrievalCandidate) -> TrustDecision:
-        """
-        Make trust decision using unified trust calculator.
-        """
         semantic_score = candidate.semantic.score
         trust = candidate.trust
 
-        # 1. Hard semantic rejection
         if semantic_score < self.MIN_SEMANTIC_SCORE:
             return TrustDecision.REJECTED
 
-        # 2. Compute governance trust score (UNIFIED CALCULATOR)
-        policy_trust_score = compute_policy_trust_score(trust)
+        # Unvalidated content is always PROVISIONAL (never zero-scored)
+        if getattr(trust, "is_unvalidated", False):
+            if semantic_score >= self.PROVISIONAL_SEMANTIC_SCORE:
+                return TrustDecision.PROVISIONAL
+            return TrustDecision.REJECTED
 
-        # 3. Trusted
+        # Use the canonical trust calculator for validated content
+        from app.retrieval.trust_calculator import compute_policy_trust_score as _calc_trust
+        policy_trust_score = _calc_trust(trust)
+
         if policy_trust_score >= self.MIN_TRUSTED_SCORE:
             return TrustDecision.TRUSTED
 
-        # 4. Provisional
         if semantic_score >= self.PROVISIONAL_SEMANTIC_SCORE:
             return TrustDecision.PROVISIONAL
 
-        # 5. Reject
         return TrustDecision.REJECTED
 
 

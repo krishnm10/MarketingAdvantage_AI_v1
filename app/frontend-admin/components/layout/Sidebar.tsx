@@ -16,6 +16,10 @@ import {
   ChevronLeft,
   ChevronRight,
   Eye,
+  Wand2,
+  SlidersHorizontal,
+  Sparkles,
+  BarChart3,
 } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
@@ -39,23 +43,27 @@ const NAV_SECTIONS = [
   {
     label: "Retrieval",
     items: [
-      { href: "/dashboard/retrieve", label: "Retrieve", icon: Search },
+      { href: "/dashboard/retrieve/chat", label: "RAG Chat", icon: Search },
+      { href: "/dashboard/retrieve", label: "Retrieve (Advanced)", icon: SlidersHorizontal },
     ],
   },
   {
     label: "Administration",
     items: [
-      { href: "/integrity", label: "Integrity", icon: ShieldCheck },
-      { href: "/audit", label: "Audit Log", icon: ScrollText },
-      { href: "/settings", label: "Configuration", icon: Settings },
+      { href: "/integrity",        label: "Integrity",          icon: ShieldCheck },
+      { href: "/audit",            label: "Audit Log",          icon: ScrollText },
+      { href: "/audit/ingestion",  label: "Ingestion Audit",    icon: BarChart3 },
+      { href: "/settings",         label: "Configuration",      icon: Settings },
     ],
   },
   {
     label: "Infrastructure",
     items: [
-      { href: "/settings/pipeline", label: "Pipeline", icon: Zap },
-      { href: "/settings/databases", label: "Databases", icon: Database },
-      { href: "/settings/vision-encoder", label: "Vision Encoder", icon: Eye },
+      { href: "/settings/pipeline",       label: "Pipeline Builder",    icon: Wand2 },
+      { href: "/settings/reranking",      label: "Reranking & Rules",   icon: SlidersHorizontal },
+      { href: "/settings/prompt-builder", label: "Prompt Library",      icon: Sparkles },
+      { href: "/settings/databases",      label: "Databases",           icon: Database },
+      { href: "/settings/vision-encoder", label: "Vision Encoder",      icon: Eye },
     ],
   },
 ];

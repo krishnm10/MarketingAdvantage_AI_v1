@@ -48,7 +48,8 @@
 import re
 import asyncio
 from collections import deque
-from typing import Any, Dict, Generator, List, Optional
+from contextvars import ContextVar
+from typing import Any, Callable, Dict, Generator, List, Optional
 from datetime import datetime
 
 from app.services.ingestion.deduplication_engine_v2 import create_normalized_hash
@@ -96,20 +97,44 @@ _SENTENCE_SPLITTER: re.Pattern = re.compile(r"(?<=[.!?]) +")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TOKEN COUNTER
+#
+# _ACTIVE_TOKEN_COUNTER is an async-task-scoped ContextVar set by
+# ingestion_service_v2._chunk_text_with_strategy() when a model-native
+# ChunkingTokenCounter is available.
+#
+# When set, count_tokens() uses the injected counter (model-native tokenizer).
+# When not set, count_tokens() falls back to the configured factory backend
+# (DEFAULT_TOKENIZER_BACKEND env var).
+#
+# This design allows ALL chunking strategies to transparently use the
+# embedding model's native tokenizer without any change to their signatures
+# or internal logic.
 # ─────────────────────────────────────────────────────────────────────────────
+
+_ACTIVE_TOKEN_COUNTER: ContextVar[Optional[Callable[[str], int]]] = ContextVar(
+    "_active_token_counter", default=None
+)
+
 
 def count_tokens(text: str) -> int:
     """
-    Token count using the configured tokenizer backend (DEFAULT_TOKENIZER_BACKEND
-    env var: huggingface | spacy | nltk | whitespace).
+    Token count for chunking decisions.
+
+    Resolution order:
+      1. Model-native counter injected via _ACTIVE_TOKEN_COUNTER (set by the
+         ingestion dispatcher when an EmbedderBundle is available).
+      2. Factory tokenizer backend (DEFAULT_TOKENIZER_BACKEND env var:
+         huggingface | spacy | nltk | whitespace).
+      3. Whitespace word-split fallback (when no backend is available).
 
     All chunking strategies (semantic, recursive, overlap, recursive_overlap,
-    rust, smart_check, structure_aware, document_aware) import this function,
-    so changing DEFAULT_TOKENIZER_BACKEND in .env upgrades measurement accuracy
-    for every strategy simultaneously.
-
-    Falls back to whitespace word-split when no backend is available.
+    rust, smart_check, structure_aware, document_aware) import this function.
+    Injecting an accurate counter in step 1 upgrades measurement accuracy for
+    every strategy simultaneously without touching their signatures.
     """
+    injected = _ACTIVE_TOKEN_COUNTER.get()
+    if injected is not None:
+        return injected(text)
     if _USE_FACTORY_TOKENIZER:
         return _factory_count_tokens(text)
     return len(text.split())

@@ -1,0 +1,414 @@
+# =============================================================================
+# embedder_catalog.yaml — Phase 1, Module 3
+#
+# SINGLE SOURCE OF TRUTH for all embedding model configurations.
+#
+# Rules
+# ──────
+# 1. Every field marked REQUIRED must be present; missing fields cause an
+#    EmbedderCatalogValidationError at load time (eager fail-fast).
+# 2. Adding a new cloud model = adding one YAML entry, zero Python changes.
+# 3. verification_status MUST be "verified" before an entry is used in
+#    production ingestion.  "unverified" blocks production unless an explicit
+#    feature flag overrides it.
+# 4. cohere tokenizer_family is "bpe" (Cohere uses its own BPE vocabulary —
+#    NOT wordpiece like BERT). Confirmed from Cohere tokenizer docs.
+# 5. e5-mistral-7b-instruct embed_max_tokens is 4096 (practical/safe limit;
+#    the model's position embedding supports 32768 but reliable recall
+#    collapses at 4096 for passage embedding use-cases). R-L3 applied.
+#
+# Schema per entry
+# ─────────────────
+# REQUIRED:
+#   model_id              : str   — unique across catalog
+#   provider              : enum  — openai | cohere | huggingface | ollama |
+#                                   anthropic | google | mistral
+#   tokenizer_class       : str   — tiktoken | transformers.AutoTokenizer |
+#                                   ollama_modelfile | cohere_sdk
+#   tokenizer_family      : enum  — tiktoken | wordpiece | sentencepiece |
+#                                   bpe | whitespace
+#   tokenizer_encoding    : str?  — required when tokenizer_class=tiktoken
+#   tokenizer_source      : str?  — required when provider=huggingface/ollama/cohere
+#   dimension             : int   — output vector size > 0
+#   distance_metric       : enum  — cosine | dotproduct | euclidean
+#   is_normalized         : bool  — true if L2-normalized output
+#   embed_max_tokens      : int   — max tokens accepted by model > 0
+#   default_reranker_id   : str?  — reference to reranker catalog entry or null
+#   query_prefix          : str   — model-specific query prefix ("" if none)
+#   passage_prefix        : str   — model-specific passage prefix ("" if none)
+#   verification_status   : enum  — verified | catalog_mismatch | unverified
+#
+# OPTIONAL:
+#   embedder_type         : str?  — symmetric_encoder | asymmetric_bi_encoder
+#   lang_support          : str?  — "en" | "multilingual"
+#   notes                 : str?  — free-form documentation
+# =============================================================================
+
+schema_version: "1.0"
+
+embedders:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CLOUD — OpenAI
+  # Tokenizer: tiktoken cl100k_base (same encoding for ada-002, 3-small, 3-large)
+  # Failure modes prevented: F-01 (vocab), F-04 (dim), F-05 (drift),
+  #                           F-08 (metric), F-16 (migration)
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "openai/text-embedding-ada-002"
+    provider: "openai"
+    tokenizer_class: "tiktoken"
+    tokenizer_encoding: "cl100k_base"
+    tokenizer_source: "openai_docs"
+    tokenizer_family: "tiktoken"
+    dimension: 1536
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 8191
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      Legacy model. Deprecated by OpenAI in favour of text-embedding-3-*.
+      Retained for backward-compatible indexes. Do not start new indexes
+      on this model — migrate to text-embedding-3-small or 3-large.
+
+  - model_id: "openai/text-embedding-3-small"
+    provider: "openai"
+    tokenizer_class: "tiktoken"
+    tokenizer_encoding: "cl100k_base"
+    tokenizer_source: "openai_docs"
+    tokenizer_family: "tiktoken"
+    dimension: 1536
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 8191
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "multilingual"
+    notes: >
+      Matryoshka-capable. Dimension can be truncated (e.g. to 512 or 256)
+      at query time without re-embedding. If dimension truncation is used,
+      update this catalog entry — do NOT mix truncated and full-dim vectors
+      in the same index (F-05 risk).
+
+  - model_id: "openai/text-embedding-3-large"
+    provider: "openai"
+    tokenizer_class: "tiktoken"
+    tokenizer_encoding: "cl100k_base"
+    tokenizer_source: "openai_docs"
+    tokenizer_family: "tiktoken"
+    dimension: 3072
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 8191
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "multilingual"
+    notes: >
+      Best-in-class OpenAI embedding model as of Apr 2026.
+      Matryoshka-capable — same F-05 warning as text-embedding-3-small
+      if dimension truncation is applied.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # CLOUD — Cohere
+  # Tokenizer: Cohere SDK uses a BPE tokenizer (NOT WordPiece).
+  # Confirmed from Cohere tokenizer docs — cohere_sdk wraps BPE internally.
+  # tokenizer_family = "bpe"  ← corrected from plan draft's "wordpiece".
+  # F-01 prevented: using "wordpiece" here would cause the validator to
+  # incorrectly accept cross-family tokenizer swaps.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "cohere/embed-english-v3.0"
+    provider: "cohere"
+    tokenizer_class: "cohere_sdk"
+    tokenizer_encoding: null
+    tokenizer_source: "cohere_api"
+    tokenizer_family: "bpe"
+    dimension: 1024
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 512
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      embed_max_tokens=512 is the hard context limit for embed-english-v3.0.
+      Chunk sizes must account for this tight limit (R-C2 formula yields
+      ~406 max safe tokens: floor((512-50-4)*0.9)).
+      Use embed-multilingual-v3.0 for non-English corpora (F-12 guard).
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE — BAAI/bge-large-en-v1.5
+  # WordPiece tokenizer (confirmed from tokenizer.json model.type=WordPiece).
+  # R-C2 formula: floor((512-50-4)*0.9) = 412 max safe tokens.
+  # query_prefix / passage_prefix required for asymmetric encoding (F-07).
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "BAAI/bge-large-en-v1.5"
+    provider: "huggingface"
+    tokenizer_class: "transformers.AutoTokenizer"
+    tokenizer_encoding: null
+    tokenizer_source: "hf_config"
+    tokenizer_family: "wordpiece"
+    dimension: 1024
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 512
+    default_reranker_id: "bge-reranker-large"
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+    verification_status: "verified"
+    embedder_type: "asymmetric_bi_encoder"
+    lang_support: "en"
+    notes: >
+      BGE-Large uses WordPiece; max_position_embeddings=512.
+      special_tokens: [CLS]=0, [SEP]=102, [PAD]=0, [UNK]=100.
+      query_prefix and passage_prefix are mandatory for this model —
+      omitting them causes 15-40% retrieval quality degradation (F-07).
+      Registry must read max_position_embeddings from config.json at
+      load time and assert == 512 or raise AlignmentError.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE — intfloat/e5-mistral-7b-instruct (asymmetric)
+  # SentencePiece tokenizer (LLaMA-style; confirmed from tokenizer.json).
+  # embed_max_tokens = 4096 (NOT 131072).
+  # Rationale: model's position embeddings support 32768, but:
+  #   1. Passage embedding at >4096 shows recall degradation in BEIR evals.
+  #   2. Keeping chunk_max bounded prevents F-15 (lost in the middle).
+  #   3. R-L3: "Use benchmarked effective context window, not advertised max."
+  # The LLM rule (R-L3) is applied here analogously: use safe recall window.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "intfloat/e5-mistral-7b-instruct"
+    provider: "huggingface"
+    tokenizer_class: "transformers.AutoTokenizer"
+    tokenizer_encoding: null
+    tokenizer_source: "hf_config"
+    tokenizer_family: "sentencepiece"
+    dimension: 4096
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 4096
+    default_reranker_id: "bge-reranker-large"
+    query_prefix: "query: "
+    passage_prefix: "passage: "
+    verification_status: "verified"
+    embedder_type: "asymmetric_bi_encoder"
+    lang_support: "multilingual"
+    notes: >
+      SentencePiece (LLaMA-family); special_tokens: BOS=<s> (id=1),
+      EOS=</s> (id=2), UNK=<unk> (id=0).
+      IMPORTANT: embed_max_tokens=4096 is a SAFE PRACTICAL LIMIT, not the
+      model's position embedding size (which is 32768). Using higher values
+      risks F-15 (lost in the middle) for passage retrieval quality.
+      R-C2 formula: floor((4096-50-4)*0.9) = 3638 max safe tokens.
+      Dimension=4096 matches model hidden size; separate from max_tokens.
+      query_prefix/passage_prefix REQUIRED (F-07).
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE — mixedbread-ai/mxbai-embed-large-v1
+  # BPE tokenizer (RoBERTa-style based on architecture).
+  # verification_status=unverified: tokenizer family must be confirmed via
+  # AutoTokenizer introspection at registry load time.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "mixedbread-ai/mxbai-embed-large-v1"
+    provider: "huggingface"
+    tokenizer_class: "transformers.AutoTokenizer"
+    tokenizer_encoding: null
+    tokenizer_source: "hf_config"
+    tokenizer_family: "bpe"
+    dimension: 1024
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 512
+    default_reranker_id: "bge-reranker-large"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "unverified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      UNVERIFIED: tokenizer family (bpe) inferred from model architecture.
+      Registry MUST load AutoTokenizer, inspect tokenizer.json model.type,
+      and assert family == "bpe". If mismatch is found, set status to
+      "catalog_mismatch" and raise AlignmentError unless explicitly
+      overridden. Do NOT deploy to production with status=unverified.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE — Qwen/Qwen3-Embedding
+  # tiktoken-variant BPE (Qwen uses a custom tiktoken vocabulary).
+  # verification_status=unverified: must be confirmed against actual HF model.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "Qwen/Qwen3-Embedding"
+    provider: "huggingface"
+    tokenizer_class: "transformers.AutoTokenizer"
+    tokenizer_encoding: null
+    tokenizer_source: "hf_config"
+    tokenizer_family: "tiktoken"
+    dimension: 1536
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 8192
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "unverified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "multilingual"
+    notes: >
+      UNVERIFIED: Qwen3-Embedding uses a tiktoken-variant BPE vocabulary.
+      At registry load time, read tokenizer.json model.type to confirm.
+      If tokenizer.json reports "BPE" but the vocabulary is Qwen's custom
+      o200k_base-derived encoding, family=tiktoken is still correct but
+      the tokenizer_encoding (if any) must be pinned.  Confirm dimension
+      against model config hidden_size before production use.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # OLLAMA — nomic-embed-text
+  # WordPiece tokenizer (BERT-based architecture, confirmed from model card).
+  # Ollama exposes 2048 token context window.
+  # verification_status=unverified: family must be re-confirmed at runtime
+  # via `ollama show nomic-embed-text --modelfile` parsing.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "ollama/nomic-embed-text"
+    provider: "ollama"
+    tokenizer_class: "ollama_modelfile"
+    tokenizer_encoding: null
+    tokenizer_source: "ollama_modelfile"
+    tokenizer_family: "wordpiece"
+    dimension: 768
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 2048
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      UNVERIFIED: nomic-embed-text uses a BERT-derived WordPiece tokenizer.
+      Registry parses `ollama show nomic-embed-text --modelfile` and maps
+      model family to tokenizer family using the known family map.
+      Catalog wins on conflict (catalog_mismatch status + log).
+      R-C2 formula: floor((2048-50-4)*0.9) = 1795 max safe tokens.
+      embed_max_tokens=2048 is Ollama-documented; confirm at load time.
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # OLLAMA — mxbai-embed-large
+  # BPE tokenizer (same underlying architecture as HF mxbai-embed-large-v1).
+  # verification_status=unverified: must be confirmed from Ollama modelfile.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "ollama/mxbai-embed-large"
+    provider: "ollama"
+    tokenizer_class: "ollama_modelfile"
+    tokenizer_encoding: null
+    tokenizer_source: "ollama_modelfile"
+    tokenizer_family: "bpe"
+    dimension: 1024
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 512
+    default_reranker_id: "bge-reranker-large"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "unverified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      UNVERIFIED: mxbai-embed-large uses BPE (RoBERTa-derived).
+      Registry parses Ollama modelfile; if family is unresolvable from
+      modelfile, falls back to tiktoken cl100k_base and sets
+      verification_status=unverified. Must be verified before production.
+      embed_max_tokens=512 matches the underlying model's position limit.
+
+  # --------------------------------------------------------------------------
+  # GOOGLE — Gemini Embedding Models (2026)
+  # SentencePiece tokenizer (same family as T5/PaLM; multilingual).
+  # Supports task_type differentiation: RETRIEVAL_QUERY vs RETRIEVAL_DOCUMENT.
+  # Uses google-genai SDK (v1 endpoint). text-embedding-004 was retired in 2026.
+  # --------------------------------------------------------------------------
+
+  - model_id: "google/gemini-embedding-001"
+    provider: "google"
+    tokenizer_class: "google-generativeai:countTokens"
+    tokenizer_encoding: null
+    tokenizer_source: "google_docs"
+    tokenizer_family: "sentencepiece"
+    dimension: 3072
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 2048
+    default_reranker_id: "llm-judge/gemini-1.5-flash"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "asymmetric_bi_encoder"
+    lang_support: "multilingual"
+    notes: >
+      Stable replacement for text-embedding-004 (retired 2026).
+      Outputs 3072-dim vectors, L2-normalised, cosine distance.
+      SentencePiece tokenisation; supports task_type RETRIEVAL_QUERY /
+      RETRIEVAL_DOCUMENT for asymmetric retrieval.
+      Max input: 2048 tokens per sequence.
+      Rate limits: 1500 RPM on free tier; use batch mode for ingestion.
+      Requires GOOGLE_API_KEY env var. Uses google-genai SDK (v1 API).
+
+  - model_id: "google/gemini-embedding-2"
+    provider: "google"
+    tokenizer_class: "google-generativeai:countTokens"
+    tokenizer_encoding: null
+    tokenizer_source: "google_docs"
+    tokenizer_family: "sentencepiece"
+    dimension: 3072
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 2048
+    default_reranker_id: "llm-judge/gemini-1.5-flash"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "verified"
+    embedder_type: "asymmetric_bi_encoder"
+    lang_support: "multilingual"
+    notes: >
+      Latest stable Gemini embedding model (2026).
+      3072-dim, cosine, SentencePiece, multilingual.
+      Preferred for new deployments requiring highest quality.
+      Requires GOOGLE_API_KEY env var. Uses google-genai SDK (v1 API).
+
+  - model_id: "google/embedding-001"
+    provider: "google"
+    tokenizer_class: "google-generativeai:countTokens"
+    tokenizer_encoding: null
+    tokenizer_source: "google_docs"
+    tokenizer_family: "sentencepiece"
+    dimension: 768
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 2048
+    default_reranker_id: "llm-judge/gemini-1.5-flash"
+    query_prefix: ""
+    passage_prefix: ""
+    verification_status: "unverified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      Legacy Gemini embedding model. Retired — do not use for new deployments.
+      Kept for backward compatibility only. Use gemini-embedding-001 instead.

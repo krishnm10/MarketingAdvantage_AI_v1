@@ -2,6 +2,7 @@ import logging
 import os
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
+from typing import Any
 import asyncio
 
 # ----------------------------------
@@ -151,21 +152,59 @@ def _safe_async_run(async_fn, *args):
             pass
 
 # ----------------------------------
+# INTERNAL FORMATTING HELPER
+# ----------------------------------
+
+def _format_log_message(msg: str, *args: Any, **kwargs: Any) -> str:
+    """
+    Safely format a log message that may use printf-style positional args or
+    keyword args, or may already be a fully-formatted f-string (no extra args).
+
+    Rules:
+    - If neither args nor kwargs are provided the message is returned as-is.
+    - If args are provided, attempt ``msg % args`` (printf-style).
+    - If only kwargs are provided, attempt ``msg % kwargs``.
+    - On any formatting error the raw message plus the arguments are returned
+      as a fallback string; a direct logger.warning is emitted so the failure
+      is visible without ever raising back to the caller.
+    """
+    if not args and not kwargs:
+        return msg
+    try:
+        if args:
+            return msg % args
+        return msg % kwargs
+    except Exception as fmt_exc:
+        # Emit a direct warning — do NOT call log_warning() to avoid recursion.
+        logger.warning(
+            "[Logger] Message formatting failed (%s). "
+            "raw_msg=%r args=%r kwargs=%r",
+            fmt_exc, msg, args, kwargs,
+        )
+        extras = " | ".join(str(a) for a in args) if args else str(kwargs)
+        return f"{msg} | {extras}"
+
+
+# ----------------------------------
 # PUBLIC LOG FUNCTIONS (with WS broadcast)
 # ----------------------------------
 
-def log_info(msg: str):
-    logger.info(msg)
-    _safe_async_run(_broadcast_log, "INFO", msg)
+def log_info(msg: str, *args: Any, **kwargs: Any) -> None:
+    formatted = _format_log_message(msg, *args, **kwargs)
+    logger.info(formatted)
+    _safe_async_run(_broadcast_log, "INFO", formatted)
 
-def log_warning(msg: str):
-    logger.warning(msg)
-    _safe_async_run(_broadcast_log, "WARNING", msg)
+def log_warning(msg: str, *args: Any, **kwargs: Any) -> None:
+    formatted = _format_log_message(msg, *args, **kwargs)
+    logger.warning(formatted)
+    _safe_async_run(_broadcast_log, "WARNING", formatted)
 
-def log_error(msg: str):
-    logger.error(msg)
-    _safe_async_run(_broadcast_log, "ERROR", msg)
+def log_error(msg: str, *args: Any, **kwargs: Any) -> None:
+    formatted = _format_log_message(msg, *args, **kwargs)
+    logger.error(formatted)
+    _safe_async_run(_broadcast_log, "ERROR", formatted)
 
-def log_debug(msg: str):
-    logger.debug(msg)
-    _safe_async_run(_broadcast_log, "DEBUG", msg)
+def log_debug(msg: str, *args: Any, **kwargs: Any) -> None:
+    formatted = _format_log_message(msg, *args, **kwargs)
+    logger.debug(formatted)
+    _safe_async_run(_broadcast_log, "DEBUG", formatted)

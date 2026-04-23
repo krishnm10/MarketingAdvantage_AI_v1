@@ -61,6 +61,12 @@ class TrustSignals:
     reasoning_quality_score: float
     conflict_modifier: float
     temporal_decay: float
+    # "validated" = real trust scores present; "unvalidated" = no validation_layer found
+    trust_state: str = "validated"
+
+    @property
+    def is_unvalidated(self) -> bool:
+        return self.trust_state == "unvalidated"
 
 
 # ---------------------------------------------------------

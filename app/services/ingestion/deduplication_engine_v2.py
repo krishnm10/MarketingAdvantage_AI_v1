@@ -221,15 +221,34 @@ def normalize_for_hash(text: str) -> str:
     return text
 
 
-def create_normalized_hash(text: str) -> str:
+def create_normalized_hash(text: str, embedding_model: str = "") -> str:
     """
-    SHA-256 of normalized text.
-    "Hello World" == "hello world" == "HELLO  WORLD" == "Hello World!"
+    SHA-256 of normalized text, optionally scoped to an embedding model.
+
+    WHY THE MODEL PARAM MATTERS:
+    Two chunks with identical text but different embedding_model values have
+    different vector representations. Without the model in the hash, a model
+    change silently causes dedup to treat the new embeddings as duplicates of
+    the old ones and skips re-embedding — leaving stale vectors in VectorDB.
+
+    When embedding_model is provided:
+      hash = SHA-256( "<model>::<normalized_text>" )
+
+    When omitted (default ""):
+      hash = SHA-256( "<normalized_text>" )   ← backward-compatible
+
+    Callers in ingestion set embedding_model from pipeline.embedder.info.model
+    to ensure correctness across model migrations.
     """
     normalized = normalize_for_hash(text)
     if not normalized:
-        return hashlib.sha256(b"").hexdigest()
-    return hashlib.sha256(normalized.encode('utf-8')).hexdigest()
+        payload = (embedding_model + "::").encode("utf-8") if embedding_model else b""
+        return hashlib.sha256(payload).hexdigest()
+    if embedding_model:
+        payload = f"{embedding_model}::{normalized}".encode("utf-8")
+    else:
+        payload = normalized.encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 # =============================================

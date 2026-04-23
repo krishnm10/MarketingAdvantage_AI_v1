@@ -17,6 +17,7 @@ from app.core.tokenization.factory import (
     count_tokens,
     tokenize,
     list_backends,
+    get_bridge_for_contract,
 )
 
 __all__ = [
@@ -26,4 +27,6 @@ __all__ = [
     "count_tokens",
     "tokenize",
     "list_backends",
+    # Phase A bridge — wrap TokenizerContract as BaseTokenizer
+    "get_bridge_for_contract",
 ]

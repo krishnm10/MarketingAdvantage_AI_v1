@@ -92,6 +92,8 @@ def build_explanation(
         "interpretation": {
             "semantic_pass": semantic.score >= policy.MIN_SEMANTIC_SCORE,
             "trusted": breakdown.policy_trust_score >= policy.MIN_TRUSTED_SCORE,
+            "unvalidated": getattr(trust, "is_unvalidated", False),
+            "trust_state": getattr(trust, "trust_state", "validated"),
             "conflict_present": trust.conflict_modifier < 1.0,
             "stale": trust.temporal_decay < 0.5,
         },

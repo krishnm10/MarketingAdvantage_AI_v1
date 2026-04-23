@@ -21,6 +21,21 @@ import os
 
 router = APIRouter(prefix="/api/v2/ingestion", tags=["Ingestion v2"])
 
+
+def _is_quota_exceeded(exc: Exception) -> bool:
+    """Return True when the OpenAI account has no remaining billing credits."""
+    exc_code = getattr(exc, "code", None)
+    if exc_code == "insufficient_quota":
+        return True
+    body = getattr(exc, "body", None) or {}
+    if isinstance(body, dict):
+        err = body.get("error", {})
+        if isinstance(err, dict) and err.get("code") == "insufficient_quota":
+            return True
+    # Fallback: inspect string representation (older SDK versions)
+    return "insufficient_quota" in str(exc)
+
+
 # -----------------------------------------------------------
 # MEDIA UPLOAD CONSTANTS
 # -----------------------------------------------------------
@@ -94,6 +109,16 @@ async def ingest_file(
     except HTTPException as e:
         raise e
     except Exception as e:
+        if _is_quota_exceeded(e):
+            log_warning(f"[ingestion_api_v2] OpenAI quota exceeded during upload: {e}")
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Embedding failed: your OpenAI account has no remaining credits. "
+                    "Please add billing credits at https://platform.openai.com/settings/organization/billing "
+                    "or check your project spending limit at https://platform.openai.com/settings/organization/limits"
+                ),
+            )
         log_warning(f"[ingestion_api_v2] Upload failed: {e}")
         raise HTTPException(status_code=500, detail=f"File ingestion failed: {e}")
 
@@ -150,6 +175,15 @@ async def ingest_external(
     except HTTPException as e:
         raise e
     except Exception as e:
+        if _is_quota_exceeded(e):
+            log_warning(f"[ingestion_api_v2] OpenAI quota exceeded during external ingestion: {e}")
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Embedding failed: your OpenAI account has no remaining credits. "
+                    "Please add billing credits at https://platform.openai.com/settings/organization/billing"
+                ),
+            )
         log_warning(f"[ingestion_api_v2] External ingestion failed: {e}")
         raise HTTPException(status_code=500, detail=f"External ingestion failed: {e}")
 
@@ -425,12 +459,20 @@ async def ingest_media(
         
     except Exception as e:
         log_warning(f"[ingestion_api_v2] Media ingestion exception: {e}")
-        
+
         # Clean up on exception
         try:
             if 'file_path' in locals() and os.path.exists(file_path):
                 os.remove(file_path)
         except Exception:
             pass
-        
+
+        if _is_quota_exceeded(e):
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "Embedding failed: your OpenAI account has no remaining credits. "
+                    "Please add billing credits at https://platform.openai.com/settings/organization/billing"
+                ),
+            )
         raise HTTPException(status_code=500, detail=f"Media ingestion failed: {e}")

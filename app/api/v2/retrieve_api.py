@@ -40,6 +40,9 @@ class RetrieveRequest(BaseModel):
     enable_hyde: bool = Field(False, description="Enable HyDE query expansion (requires LLM)")
     hybrid_alpha: float = Field(0.7, ge=0.0, le=1.0, description="Semantic vs keyword weight (1.0=semantic, 0.0=keyword)")
     similarity_threshold: float = Field(0.0, ge=0.0, le=1.0, description="Minimum similarity score filter")
+    # LLM generation (optional — if true, retrieved context is sent to the configured LLM)
+    generate_answer: bool = Field(False, description="Generate an LLM answer from retrieved context")
+    max_context_chunks: int = Field(5, ge=1, le=15, description="Max retrieved chunks to pass to LLM")
 
 
 class SignalDetail(BaseModel):
@@ -69,6 +72,14 @@ class RetrieveResponse(BaseModel):
     total_dropped: int
     latency_ms: float
     results: List[ResultItem]
+    # LLM generation (present only when generate_answer=True was requested)
+    answer: Optional[str] = None
+    answer_model: Optional[str] = None
+    answer_latency_ms: Optional[float] = None
+    # Explicit error message when generation was requested but failed
+    answer_error: Optional[str] = None
+    # Pipeline debug metadata (always populated — used by debug panel)
+    debug_info: Optional[Dict[str, Any]] = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -116,15 +127,28 @@ async def retrieve_query(
             detail=f"Invalid intent '{req.intent}'. Must be one of: answer, explore, audit",
         )
 
+    import os as _os_module
+
     start = time.perf_counter()
+
+    # ── Security gate: PII redaction + prompt injection detection ─────────────
+    # Must run before ANY external call (embed, LLM) so raw PII never leaves
+    # the service boundary. Injection-detected queries are hard-blocked (400).
+    from app.middleware.security_middleware import scan_text as _security_scan_text
+    _scan_result = _security_scan_text(req.query, context="retrieve_query")
+    if _scan_result.injection_detected:
+        raise HTTPException(
+            status_code=400,
+            detail="Query rejected: potential prompt injection detected.",
+        )
+    # Use the PII-redacted version for all downstream processing
+    embed_text = _scan_result.redacted_text
 
     # 1. Optional HyDE expansion — use LLM to generate hypothetical answer,
     #    then embed that instead of the raw query for better retrieval.
-    embed_text = req.query
     if req.enable_hyde:
         try:
-            import os
-            llm_provider = os.getenv("MAI_LLM", "ollama").lower()
+            llm_provider = _os_module.getenv("MAI_LLM", "ollama").lower()
             llm = None
             if llm_provider == "ollama":
                 from app.core.llms.ollama_v1 import OllamaLLM
@@ -132,9 +156,25 @@ async def retrieve_query(
             elif llm_provider == "openai":
                 from app.core.llms.openai_v1 import OpenAILLM
                 llm = OpenAILLM()
-            elif llm_provider == "groq":
+            elif llm_provider in ("groq", "grok"):
                 from app.core.llms.groq_v1 import GroqLLM
                 llm = GroqLLM()
+            elif llm_provider in ("gemini", "google"):
+                _api_key = _os_module.getenv("GEMINI_API_KEY", "")
+                if _api_key:
+                    from app.core.llms.gemini_v1 import GeminiLLM
+                    llm = GeminiLLM(
+                        model=_os_module.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
+                        api_key=_api_key,
+                    )
+            elif llm_provider == "anthropic":
+                _api_key = _os_module.getenv("ANTHROPIC_API_KEY", "")
+                if _api_key:
+                    from app.core.llms.anthropic_v1 import AnthropicLLM
+                    llm = AnthropicLLM(
+                        model=_os_module.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
+                        api_key=_api_key,
+                    )
 
             if llm is not None:
                 hyde_prompt = (
@@ -232,6 +272,52 @@ async def retrieve_query(
         except Exception as e:
             logger.warning("[RetrieveAPI] Hybrid/keyword search failed, using semantic order: %s", e)
 
+    # 4b. Optional cross-encoder reranker — re-scores top-K candidates using a
+    #     cross-attention model for higher precision before threshold filtering.
+    #     Driven by MAI_RERANKER env var (default: none). Failures are non-fatal.
+    _reranker_name = _os_module.getenv("MAI_RERANKER", "none").strip().lower()
+    reranker_used = "none"
+
+    if _reranker_name not in ("none", "", "disabled") and ranked_results:
+        try:
+            import app.core.rerankers.register as _rr_register  # noqa: F401 — side-effect registration
+            from app.core.plugin_registry import reranker_registry as _rr_registry
+            from app.core.rerankers.base import RerankCandidate as _RerankCandidate
+
+            _rr_model = _os_module.getenv("MAI_RERANKER_MODEL", "").strip()
+            _rr_build_kwargs: Dict[str, Any] = {}
+            if _rr_model:
+                _rr_build_kwargs["model_name"] = _rr_model
+
+            _reranker = _rr_registry.build(_reranker_name, **_rr_build_kwargs)
+            _rr_candidates = [
+                _RerankCandidate(
+                    id=r.chunk_id,
+                    text=r.text,
+                    vector_score=r.score,
+                    metadata={},
+                )
+                for r in ranked_results
+            ]
+            _rr_top_k = req.top_k or 10
+            _rr_scored = _reranker.rerank(req.query, _rr_candidates, top_k=_rr_top_k)
+            # Re-order ranked_results to match reranker's ordering
+            _rr_score_map = {c.id: (c.rerank_score or 0.0) for c in _rr_scored}
+            ranked_results = [r for r in ranked_results if r.chunk_id in _rr_score_map]
+            ranked_results.sort(
+                key=lambda r: _rr_score_map.get(r.chunk_id, 0.0), reverse=True
+            )
+            reranker_used = _reranker_name
+            logger.info(
+                "[RetrieveAPI] Reranker '%s' applied | %d → %d candidates",
+                _reranker_name, len(_rr_candidates), len(ranked_results),
+            )
+        except Exception as _rr_err:
+            logger.warning(
+                "[RetrieveAPI] Reranker '%s' failed, using original order: %s",
+                _reranker_name, _rr_err,
+            )
+
     # 5. Apply similarity_threshold filter
     if req.similarity_threshold > 0:
         ranked_results = [r for r in ranked_results if r.score >= req.similarity_threshold]
@@ -268,6 +354,166 @@ async def retrieve_query(
         f"results={len(results)} dropped={len(dropped)} latency={elapsed_ms}ms"
     )
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # 7. Optional LLM answer generation (RAG completion step)
+    #    Uses the top-N chunks as context and calls the configured LLM.
+    #    Supports all providers: openai, ollama, groq, gemini, anthropic.
+    #    Failures surface as answer_error — never silently swallowed.
+    # ─────────────────────────────────────────────────────────────────────────
+    answer: Optional[str] = None
+    answer_model: Optional[str] = None
+    answer_latency_ms: Optional[float] = None
+    answer_error: Optional[str] = None
+
+    _llm_provider_name = _os_module.getenv("MAI_LLM", "openai").lower()
+    _rag_min_score = float(_os_module.getenv("RAG_ANSWER_MIN_SCORE", "0.25"))
+
+    if req.generate_answer:
+        if not results:
+            answer_error = "No results retrieved — cannot generate a grounded answer without context."
+        else:
+            _max_score = max(r.score for r in results)
+            if _max_score < _rag_min_score:
+                answer_error = (
+                    f"Retrieved context confidence is too low "
+                    f"(best score={_max_score:.3f} < threshold={_rag_min_score:.2f}). "
+                    "Try a more specific query or lower the 'Min Score' filter."
+                )
+            else:
+                try:
+                    _llm_gen_start = time.perf_counter()
+                    _llm = None
+
+                    if _llm_provider_name == "openai":
+                        from app.core.llms.openai_v1 import OpenAILLM
+                        _llm = OpenAILLM()
+                        answer_model = _os_module.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+
+                    elif _llm_provider_name == "ollama":
+                        from app.core.llms.ollama_v1 import OllamaLLM
+                        _llm = OllamaLLM()
+                        answer_model = _os_module.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
+
+                    elif _llm_provider_name in ("groq", "grok"):
+                        from app.core.llms.groq_v1 import GroqLLM
+                        _llm = GroqLLM()
+                        answer_model = _os_module.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile")
+
+                    elif _llm_provider_name in ("gemini", "google"):
+                        _gemini_key = _os_module.getenv("GEMINI_API_KEY", "")
+                        if not _gemini_key:
+                            answer_error = (
+                                "LLM generation failed: GEMINI_API_KEY is not set. "
+                                "Add it to your .env file."
+                            )
+                        else:
+                            from app.core.llms.gemini_v1 import GeminiLLM
+                            answer_model = _os_module.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash")
+                            _llm = GeminiLLM(model=answer_model, api_key=_gemini_key)
+
+                    elif _llm_provider_name == "anthropic":
+                        _anthropic_key = _os_module.getenv("ANTHROPIC_API_KEY", "")
+                        if not _anthropic_key:
+                            answer_error = (
+                                "LLM generation failed: ANTHROPIC_API_KEY is not set. "
+                                "Add it to your .env file."
+                            )
+                        else:
+                            from app.core.llms.anthropic_v1 import AnthropicLLM
+                            answer_model = _os_module.getenv(
+                                "ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"
+                            )
+                            _llm = AnthropicLLM(model=answer_model, api_key=_anthropic_key)
+
+                    else:
+                        answer_error = (
+                            f"LLM provider '{_llm_provider_name}' is not wired for answer generation. "
+                            "Supported: openai, ollama, groq, gemini, anthropic. "
+                            "Update MAI_LLM in your .env file."
+                        )
+
+                    if _llm is not None:
+                        _top_chunks = results[: req.max_context_chunks]
+                        _context_parts = []
+                        for _ci, _chunk in enumerate(_top_chunks, start=1):
+                            _context_parts.append(
+                                f"[Source {_ci}] (relevance={_chunk.score:.3f})\n{_chunk.text.strip()}"
+                            )
+                        _context_str = "\n\n---\n\n".join(_context_parts)
+
+                        # Enterprise-grade RAG prompt: strict grounding, citation, no hallucination
+                        _rag_prompt = (
+                            "You are a precise, grounded enterprise assistant.\n"
+                            "Your task: answer the user's question using ONLY the retrieved passages below.\n\n"
+                            "Rules:\n"
+                            "  1. Cite every source you use with its number: [Source 1], [Source 2], etc.\n"
+                            "  2. If the passages lack sufficient information to answer confidently, "
+                            "respond EXACTLY with: "
+                            "'I could not find a reliable answer in the available documents.'\n"
+                            "  3. Never invent facts. Do not add information not present in the sources.\n"
+                            "  4. Keep the answer factual, concise, and professional.\n\n"
+                            f"QUESTION: {req.query}\n\n"
+                            f"RETRIEVED PASSAGES:\n{_context_str}\n\n"
+                            "ANSWER (grounded, with citations):"
+                        )
+
+                        _resp = _llm.generate(_rag_prompt, temperature=0.0, max_tokens=700)
+                        _raw_answer = (_resp.text or "").strip()
+                        if _raw_answer:
+                            answer = _raw_answer
+                        else:
+                            answer_error = "LLM returned an empty response."
+
+                        answer_latency_ms = round(
+                            (time.perf_counter() - _llm_gen_start) * 1000, 2
+                        )
+                        logger.info(
+                            "[RetrieveAPI] LLM answer | model=%s chunks=%d latency=%.0fms ok=%s",
+                            answer_model,
+                            len(_top_chunks),
+                            answer_latency_ms,
+                            answer is not None,
+                        )
+
+                except Exception as _gen_err:
+                    logger.warning(
+                        "[RetrieveAPI] LLM answer generation failed: %s", _gen_err,
+                        exc_info=True,
+                    )
+                    answer_error = (
+                        f"LLM generation error ({type(_gen_err).__name__}): "
+                        f"{str(_gen_err)[:300]}"
+                    )
+                    answer = None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 8. Build debug metadata (always populated — used by the debug panel)
+    # ─────────────────────────────────────────────────────────────────────────
+    debug_info: Dict[str, Any] = {
+        "embedder":               _os_module.getenv("MAI_EMBEDDER", "unknown"),
+        "llm_provider":           _llm_provider_name,
+        "vectordb":               _os_module.getenv("MAI_VECTORDB", "unknown"),
+        "chunking_strategy":      _os_module.getenv("CHUNKING_STRATEGY", "unknown"),
+        "collection":             _os_module.getenv("MAI_COLLECTION", "ingested_content"),
+        "search_mode":            search_mode,
+        "intent":                 req.intent,
+        "top_k_requested":        req.top_k,
+        "top_k_returned":         len(results),
+        "total_dropped":          len(dropped),
+        "generate_answer":        req.generate_answer,
+        "answer_generated":       answer is not None,
+        "score_gate_threshold":   _rag_min_score,
+        "max_score":              round(max(r.score for r in results), 4) if results else None,
+        "min_score":              round(min(r.score for r in results), 4) if results else None,
+        "hyde_enabled":           req.enable_hyde,
+        "hybrid_alpha":           req.hybrid_alpha if search_mode == "hybrid" else None,
+        "reranker_used":          reranker_used,
+        "security_scan": {
+            "pii_detected":       _scan_result.has_pii,
+            "injection_detected": _scan_result.injection_detected,
+        },
+    }
+
     return RetrieveResponse(
         query=req.query,
         intent=req.intent,
@@ -276,6 +522,11 @@ async def retrieve_query(
         total_dropped=len(dropped),
         latency_ms=elapsed_ms,
         results=results,
+        answer=answer,
+        answer_model=answer_model,
+        answer_latency_ms=answer_latency_ms,
+        answer_error=answer_error,
+        debug_info=debug_info,
     )
 
 
@@ -287,6 +538,52 @@ async def list_intents(_user=Depends(require_role("admin"))):
         {"value": "explore", "label": "Explore", "description": "Broader recall for exploratory queries"},
         {"value": "audit", "label": "Audit", "description": "No filtering — full transparency for auditing"},
     ]
+
+
+@router.get("/pipeline-config")
+async def retrieve_pipeline_config(_user=Depends(require_role("admin"))):
+    """
+    Return the active retrieval pipeline configuration from environment.
+    Used by the Retrieve page debug panel to show what was active for each query.
+    """
+    import os as _os
+    llm_provider = _os.getenv("MAI_LLM", "openai").lower()
+    llm_key_set = {
+        "openai":    bool(_os.getenv("OPENAI_API_KEY")),
+        "groq":      bool(_os.getenv("GROQ_API_KEY")),
+        "grok":      bool(_os.getenv("GROQ_API_KEY")),
+        "anthropic": bool(_os.getenv("ANTHROPIC_API_KEY")),
+        "gemini":    bool(_os.getenv("GEMINI_API_KEY")),
+        "google":    bool(_os.getenv("GEMINI_API_KEY")),
+        "ollama":    True,
+    }
+    llm_model_map = {
+        "openai":    _os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
+        "groq":      _os.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile"),
+        "grok":      _os.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile"),
+        "anthropic": _os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
+        "gemini":    _os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
+        "google":    _os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
+        "ollama":    _os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b"),
+    }
+    return {
+        "embedder":             _os.getenv("MAI_EMBEDDER", "unknown"),
+        "embedder_model": (
+            _os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+            if _os.getenv("MAI_EMBEDDER", "").lower() in ("google", "gemini")
+            else _os.getenv("OPENAI_EMBED_MODEL", "")
+            if _os.getenv("MAI_EMBEDDER", "").lower() == "openai"
+            else _os.getenv("HF_EMBED_MODEL", "")
+        ),
+        "llm_provider":         llm_provider,
+        "llm_model":            llm_model_map.get(llm_provider, "unknown"),
+        "llm_api_key_set":      llm_key_set.get(llm_provider, False),
+        "vectordb":             _os.getenv("MAI_VECTORDB", "unknown"),
+        "collection":           _os.getenv("MAI_COLLECTION", "ingested_content"),
+        "chunking_strategy":    _os.getenv("CHUNKING_STRATEGY", "unknown"),
+        "rag_min_score":        float(_os.getenv("RAG_ANSWER_MIN_SCORE", "0.25")),
+        "supported_providers":  ["openai", "ollama", "groq", "gemini", "anthropic"],
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

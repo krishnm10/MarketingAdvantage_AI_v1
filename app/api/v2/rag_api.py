@@ -33,6 +33,7 @@ _CONFIG_DIRS = [
     _REPO_ROOT / "app" / "core" / "configs",
     _REPO_ROOT / "configs",  # backward-compatible fallback
 ]
+_PROMPTS_DIR = _REPO_ROOT / "app" / "core" / "configs" / "prompts"
 
 
 def _find_client_config(client_id: str) -> Optional[Path]:
@@ -44,6 +45,32 @@ def _find_client_config(client_id: str) -> Optional[Path]:
         if yaml_path.exists():
             return yaml_path
     return None
+
+
+def _resolve_prompt_template(template_id: str) -> Optional[str]:
+    """
+    Load a prompt template by ID from the prompts store and return
+    the system_instructions string for use as the LLM system prompt.
+    Returns None if the template is not found or cannot be loaded.
+    """
+    import json as _json
+
+    template_path = _PROMPTS_DIR / f"{template_id}.json"
+    if not template_path.exists():
+        logger.warning(
+            "[rag_api] Prompt template '%s' not found at %s",
+            template_id, template_path,
+        )
+        return None
+    try:
+        with template_path.open() as f:
+            data = _json.load(f)
+        return data.get("system_instructions") or data.get("content") or None
+    except Exception as e:
+        logger.warning(
+            "[rag_api] Failed to load prompt template '%s': %s", template_id, e
+        )
+        return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -137,12 +164,30 @@ async def rag_query(req: RAGQueryRequest):
                 detail=f"Pipeline for '{req.client_id}' not in cache after build.",
             )
 
+        # Resolve effective system prompt:
+        # 1. Per-request override takes precedence.
+        # 2. If not overridden, look up the prompt_template_id from the
+        #    pipeline's retrieval config (saved in the client's config file).
+        effective_system_prompt = req.system_prompt
+        if not effective_system_prompt:
+            retrieval_cfg = getattr(
+                getattr(pipeline, "config", None), "retrieval", None
+            )
+            template_id = getattr(retrieval_cfg, "prompt_template_id", None)
+            if template_id:
+                effective_system_prompt = _resolve_prompt_template(template_id)
+                if effective_system_prompt:
+                    logger.info(
+                        "[rag_api] Using prompt template '%s' for client '%s'.",
+                        template_id, req.client_id,
+                    )
+
         result = pipeline.query(
             req.query,
             metadata_filters=req.metadata_filters,
             top_k_retrieval=req.top_k_retrieval,
             top_k_final=req.top_k_final,
-            system_prompt=req.system_prompt,
+            system_prompt=effective_system_prompt,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
         )

@@ -76,6 +76,7 @@ interface SystemConfig {
   redis_prefix: string;
   openai_embed_model: string;
   cohere_embed_model: string;
+  gemini_embed_model: string;
   openai_llm_model: string;
   groq_llm_model: string;
   anthropic_llm_model: string;
@@ -276,6 +277,7 @@ export default function UnifiedDashboard() {
         redis_prefix: env.REDIS_PREFIX || "vec:",
         openai_embed_model: env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
         cohere_embed_model: env.COHERE_EMBED_MODEL || "embed-english-v3.0",
+        gemini_embed_model: env.GEMINI_EMBED_MODEL || "gemini-embedding-001",
         openai_llm_model: env.OPENAI_LLM_MODEL || "gpt-4o-mini",
         groq_llm_model: env.GROQ_LLM_MODEL || "llama-3.1-8b-instant",
         anthropic_llm_model: env.ANTHROPIC_LLM_MODEL || "claude-3-5-sonnet-20241022",
@@ -451,8 +453,18 @@ export default function UnifiedDashboard() {
                   <ConfigRow label="Embedder" value={config.embedder} icon={Brain} />
                   <ConfigRow label="LLM Provider" value={config.llm} icon={Zap} />
                   <ConfigRow label="Collection" value={config.collection} icon={HardDrive} />
-                  <ConfigRow label="HuggingFace Model" value={config.hf_model} icon={Brain} />
-                  <ConfigRow label="Ollama Model" value={config.ollama_model} icon={Server} />
+                  {/* Only show the active embedder's model details */}
+                  {config.embedder === "huggingface" && <ConfigRow label="HuggingFace Model" value={config.hf_model} icon={Brain} />}
+                  {config.embedder === "ollama" && <ConfigRow label="Ollama Embed URL" value={config.ollama_base} icon={Server} />}
+                  {config.embedder === "openai" && <ConfigRow label="OpenAI Embed Model" value={config.openai_embed_model} icon={Brain} />}
+                  {config.embedder === "cohere" && <ConfigRow label="Cohere Embed Model" value={config.cohere_embed_model} icon={Brain} />}
+                  {(config.embedder === "google" || config.embedder === "gemini") && <ConfigRow label="Gemini Embed Model" value={config.gemini_embed_model} icon={Brain} />}
+                  {/* Only show the active LLM's model details */}
+                  {config.llm === "ollama" && <ConfigRow label="Ollama LLM Model" value={config.ollama_model} icon={Server} />}
+                  {config.llm === "openai" && <ConfigRow label="OpenAI LLM Model" value={config.openai_llm_model} icon={Zap} />}
+                  {(config.llm === "groq" || config.llm === "grok") && <ConfigRow label="Groq LLM Model" value={config.groq_llm_model} icon={Zap} />}
+                  {config.llm === "anthropic" && <ConfigRow label="Anthropic Model" value={config.anthropic_llm_model} icon={Zap} />}
+                  {(config.llm === "gemini" || config.llm === "google") && <ConfigRow label="Gemini LLM Model" value={config.gemini_llm_model} icon={Zap} />}
                 </div>
               ) : (
                 <p className="text-sm text-slate-400">Loading configuration...</p>
@@ -724,6 +736,7 @@ export default function UnifiedDashboard() {
             {config.embedder === "ollama" && <ConfigRow label="Ollama Embed Server" value={config.ollama_base} icon={Server} />}
             {config.embedder === "openai" && <ConfigRow label="OpenAI Embed Model" value={config.openai_embed_model} icon={Brain} />}
             {config.embedder === "cohere" && <ConfigRow label="Cohere Embed Model" value={config.cohere_embed_model} icon={Brain} />}
+            {(config.embedder === "google" || config.embedder === "gemini") && <ConfigRow label="Google Gemini Embed Model" value={config.gemini_embed_model} icon={Brain} />}
 
             {config.llm === "ollama" && (
               <>

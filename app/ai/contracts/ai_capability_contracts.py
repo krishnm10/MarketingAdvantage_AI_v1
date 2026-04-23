@@ -1,10 +1,11 @@
 # =============================================
-# contracts.py
+# app/ai/contracts/ai_capability_contracts.py
 #
 # AI Capability Interfaces
 #
-# This file defines WHAT the system needs,
-# not HOW it is implemented.
+# Migrated from app/ai/contracts.py when the contracts module was
+# promoted to a package (Phase 1). All public names remain identical
+# so existing callers require no changes.
 #
 # Rules:
 # - No model imports
@@ -14,7 +15,7 @@
 # =============================================
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 
 # -------------------------------------------------

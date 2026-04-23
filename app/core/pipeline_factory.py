@@ -111,6 +111,7 @@ class AssembledPipeline:
         llm:        Optional[Union[BaseLLM, LLMChain]],
         reranker:   Optional[BaseReranker],
         config:     ClientConfig,
+        embedder_bundle: "Optional[Any]" = None,
     ):
         self.client_id = client_id
         self.config    = config
@@ -121,6 +122,11 @@ class AssembledPipeline:
         self.embedder  = embedder
         self.llm       = llm
         self.reranker  = reranker
+
+        # ── Phase 1 EmbedderBundle (None for models not yet in catalog) ──
+        # Consumers (ingestion, API, UI) read this to get tokenizer_contract,
+        # embed_max_tokens, safe_chunk_size, and embedding_fingerprint.
+        self.embedder_bundle = embedder_bundle
 
         # ── Wire everything into a live RAGPipeline ─────────────────────
         # From this point, callers only need to call .query()
@@ -312,6 +318,47 @@ class PipelineFactory:
             embedding_dim,
         )
 
+        # ── Phase 1: Resolve EmbedderBundle and validate alignment ──────
+        # Non-blocking: if the model is not in embedder_catalog.yaml, or Phase 1
+        # dependencies are unavailable, we log a warning and continue with
+        # legacy BaseEmbedder behavior.  No existing pipeline is disrupted.
+        embedder_bundle = None
+        try:
+            from app.ai.pipeline.embedder_bundle_resolver import try_resolve_embedder_bundle
+            from app.ai.validation import tokenizer_validator as _tv
+
+            embedder_bundle = try_resolve_embedder_bundle(config.embedder)
+            if embedder_bundle is not None:
+                report = _tv.validate_pipeline_alignment(
+                    embedder_bundle=embedder_bundle,
+                    reranker_bundle=None,    # reranker RerankerView integration is Phase 2
+                    vector_db_config=config.vectordb,
+                )
+                if not report.ok:
+                    logger.warning(
+                        "[PipelineFactory] Phase 1 alignment issues for client '%s' "
+                        "[model=%s]: %s",
+                        client_id,
+                        embedder_bundle.model_id,
+                        "; ".join(report.errors),
+                    )
+                else:
+                    logger.info(
+                        "[PipelineFactory] Phase 1 alignment OK | client=%s | "
+                        "model=%s | family=%s | max_tokens=%d | fingerprint=%s",
+                        client_id,
+                        embedder_bundle.model_id,
+                        embedder_bundle.tokenizer_family.value,
+                        embedder_bundle.embed_max_tokens,
+                        embedder_bundle.embedding_fingerprint_short(),
+                    )
+        except Exception as _bundle_exc:
+            logger.warning(
+                "[PipelineFactory] Phase 1 bundle resolution skipped for client '%s': %s",
+                client_id,
+                _bundle_exc,
+            )
+
         # ── Assemble and cache ────────────────────────────────────────
         pipeline = AssembledPipeline(
             client_id=client_id,
@@ -320,6 +367,7 @@ class PipelineFactory:
             llm=llm,
             reranker=reranker,
             config=config,
+            embedder_bundle=embedder_bundle,
         )
         pipeline._collection_ensured = True
         pipeline._embedding_dim = embedding_dim
@@ -546,6 +594,15 @@ class PipelineFactory:
                 normalize=c.normalize,
             )
 
+        elif t == EmbedderType.GEMINI:
+            c = cfg.gemini
+            raw = embedder_registry.build(
+                "gemini",
+                api_key=_env(c.api_key_env),
+                model=c.model,
+                normalize=c.normalize,
+            )
+
         else:
             raise ValueError(
                 f"[PipelineFactory] Unknown embedder type '{t}'. "
@@ -732,6 +789,30 @@ class PipelineFactory:
             if model:
                 kwargs["model_name"] = model
             return reranker_registry.build("colbert", **kwargs)
+
+        if t == RerankerType.LLM_JUDGE:
+            # Provider-agnostic LLM-as-Judge reranker
+            # Supports provider='openai' (default) or provider='gemini'
+            judge_provider = getattr(cfg, "judge_provider", None) or "openai"
+            judge_strategy = getattr(cfg, "judge_strategy", None) or "pointwise"
+            try:
+                from app.ai.connectors.rerankers.llm_judge_connector import (
+                    GenericLLMJudgeReranker,
+                    JudgeStrategy,
+                )
+                strategy = JudgeStrategy(judge_strategy)
+                return GenericLLMJudgeReranker(
+                    provider=judge_provider,
+                    model_id=model or ("gpt-4o-mini" if judge_provider == "openai" else "gemini-1.5-flash"),
+                    strategy=strategy,
+                    api_key=api_key or "",
+                )
+            except Exception as e:
+                logger.warning(
+                    "[PipelineFactory] LLM-Judge reranker init failed (%s); "
+                    "falling back to no reranker.", e,
+                )
+                return None
 
         raise ValueError(
             f"[PipelineFactory] Unknown reranker type '{t}'. "

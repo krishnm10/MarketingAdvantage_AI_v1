@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from app.core.tokenization.base import BaseTokenizer, TokenizerBackend
 from app.utils.logger import log_info, log_warning
@@ -138,3 +138,43 @@ def list_backends() -> List[str]:
 def clear_tokenizer_cache() -> None:
     """Invalidate the backend LRU cache. Useful for testing."""
     _build_backend.cache_clear()
+
+
+def get_bridge_for_contract(contract: "Any") -> BaseTokenizer:
+    """
+    Wrap a ``TokenizerContract`` in a ``ChunkingTokenizerBridge`` so that it
+    can be passed to any caller that expects a ``BaseTokenizer``.
+
+    This is the single entry-point for the Phase A migration bridge.
+    Callers that receive the returned object are transparently using the
+    embedding model's native tokenizer for token counting, replacing the
+    generic ``bert-base-multilingual-cased`` approximation.
+
+    Parameters
+    ----------
+    contract : TokenizerContract
+        A fully-initialised ``TokenizerContract`` instance, typically
+        sourced from ``EmbedderBundle.tokenizer`` via ``EmbedderRegistry``.
+
+    Returns
+    -------
+    BaseTokenizer
+        A ``ChunkingTokenizerBridge`` instance (subclass of ``BaseTokenizer``)
+        that delegates all calls to ``contract``.
+
+    Raises
+    ------
+    TypeError
+        If ``contract`` is not a ``TokenizerContract`` instance.
+
+    Example
+    -------
+    >>> from app.ai.registry import embedder_registry
+    >>> from app.core.tokenization.factory import get_bridge_for_contract
+    >>>
+    >>> bundle = embedder_registry.get("BAAI/bge-large-en-v1.5")
+    >>> tokenizer = get_bridge_for_contract(bundle.tokenizer)
+    >>> n = tokenizer.count_tokens("Hello world")  # uses BGE's native tokenizer
+    """
+    from app.ai.contracts.chunking_bridge import ChunkingTokenizerBridge  # lazy — prevents circular import at module load
+    return ChunkingTokenizerBridge(contract)

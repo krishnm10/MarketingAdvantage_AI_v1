@@ -365,11 +365,30 @@ async def _check_emb_cohere() -> dict:
     return _fail(f"HTTP {code}")
 
 
+async def _check_emb_google() -> dict:
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return _skip("GEMINI_API_KEY not set")
+    model = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+    # Use the embedContent endpoint to validate the model and key
+    code, data = await _http_post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}",
+        json={"content": {"parts": [{"text": "health"}]}, "model": f"models/{model}"},
+        timeout=_T + 5,
+    )
+    if code == 200 and data:
+        dim = len((data.get("embedding") or {}).get("values") or [])
+        return _ok(f"{model} | dim={dim}")
+    return _fail(f"HTTP {code}" if code else "Google API unreachable")
+
+
 _EMBEDDER_CHECKS = {
     "huggingface": _check_emb_huggingface,
     "ollama":      _check_emb_ollama,
     "openai":      _check_emb_openai,
     "cohere":      _check_emb_cohere,
+    "google":      _check_emb_google,    # Google Gemini embedder
+    "gemini":      _check_emb_google,    # alias used by some configs
 }
 
 
@@ -460,6 +479,7 @@ _LLM_CHECKS = {
     "grok":      _check_llm_groq,       # alias
     "anthropic": _check_llm_anthropic,
     "gemini":    _check_llm_gemini,
+    "google":    _check_llm_gemini,     # alias — google maps to Gemini LLM
 }
 
 
@@ -482,14 +502,18 @@ _EMB_CONFIGURED = {
     "ollama":      lambda: True,
     "openai":      lambda: bool(os.getenv("OPENAI_API_KEY")),
     "cohere":      lambda: bool(os.getenv("COHERE_API_KEY")),
+    "google":      lambda: bool(os.getenv("GEMINI_API_KEY")),
+    "gemini":      lambda: bool(os.getenv("GEMINI_API_KEY")),
 }
 
 _LLM_CONFIGURED = {
     "ollama":    lambda: True,
     "openai":    lambda: bool(os.getenv("OPENAI_API_KEY")),
     "groq":      lambda: bool(os.getenv("GROQ_API_KEY")),
+    "grok":      lambda: bool(os.getenv("GROQ_API_KEY")),
     "anthropic": lambda: bool(os.getenv("ANTHROPIC_API_KEY")),
     "gemini":    lambda: bool(os.getenv("GEMINI_API_KEY")),
+    "google":    lambda: bool(os.getenv("GEMINI_API_KEY")),
 }
 
 

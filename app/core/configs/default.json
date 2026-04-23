@@ -1,0 +1,44 @@
+{
+  "client_id": "default",
+  "client_name": "Default",
+  "version": "1.0",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingested_content",
+    "chroma": {
+      "persist_directory": "./pluggable_db"
+    }
+  },
+  "embedder": {
+    "type": "huggingface",
+    "huggingface": {
+      "model": "BAAI/bge-large-en-v1.5",
+      "device": "auto"
+    }
+  },
+  "retrieval": {
+    "search_mode": "hybrid",
+    "enable_token_budget": true,
+    "token_budget_context_fraction": 0.6,
+    "enable_threshold_gate": false,
+    "threshold_min_score": 0.0,
+    "threshold_min_results": 1,
+    "enable_hyde": true,
+    "enable_multi_query": true,
+    "multi_query_count": 3,
+    "hybrid_alpha": 0.7
+  },
+  "llm": {
+    "single": {
+      "type": "gemini",
+      "model": "gemini-1.5-flash",
+      "api_key_env": "GOOGLE_API_KEY",
+      "base_url": "https://generativelanguage.googleapis.com/v1"
+    }
+  },
+  "reranker": {
+    "model": "llm-judge/gemini-1.5-pro",
+    "type": "llm_judge",
+    "top_k": 5
+  }
+}

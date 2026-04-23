@@ -41,7 +41,10 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from app.ai.contracts.tokenizer_contract import TokenizerContract
 
 from app.core.chunking_stratagies.chunking_registry import Chunker, register_chunker
 from app.core.chunking_stratagies.text_preprocessor import preprocess_document_text
@@ -131,12 +134,14 @@ class TokenChunkingService:
 
     def __init__(
         self,
-        tokenizer: Optional[BaseTokenizer] = None,
+        tokenizer: "Optional[Union[BaseTokenizer, TokenizerContract]]" = None,
         chunk_size: Optional[int] = None,
         chunk_overlap: Optional[int] = None,
         min_chunk_tokens: Optional[int] = None,
     ):
-        self._tokenizer = tokenizer
+        # Stores BaseTokenizer, TokenizerContract, or None.
+        # Resolved to BaseTokenizer on first access via the tokenizer property.
+        self._tokenizer: Optional[Any] = tokenizer
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
         self._min_chunk_tokens = min_chunk_tokens
@@ -145,7 +150,23 @@ class TokenChunkingService:
     def tokenizer(self) -> BaseTokenizer:
         if self._tokenizer is None:
             self._tokenizer = get_tokenizer()
-        return self._tokenizer
+
+        # Phase A bridge: if a TokenizerContract was injected, wrap it so
+        # the rest of the service always works against BaseTokenizer.
+        # The isinstance check is performed lazily; on the second call the
+        # stored value is already a ChunkingTokenizerBridge (a BaseTokenizer)
+        # so the check is skipped at zero cost.
+        try:
+            from app.ai.contracts.tokenizer_contract import (
+                TokenizerContract as _TC,
+            )
+            from app.ai.contracts.chunking_bridge import ChunkingTokenizerBridge
+            if isinstance(self._tokenizer, _TC):
+                self._tokenizer = ChunkingTokenizerBridge(self._tokenizer)
+        except ImportError:
+            pass  # Phase 1 contracts not installed — use stored tokenizer as-is
+
+        return self._tokenizer  # type: ignore[return-value]
 
     @property
     def chunk_size(self) -> int:
@@ -465,27 +486,57 @@ async def token_aware_chunk(
     source_type: Optional[str] = None,
     embedding_model: Optional[str] = None,
     tokenizer_backend: Optional[str] = None,
+    tokenizer_contract: "Optional[TokenizerContract]" = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
     """
     Convenience async function for token-aware chunking.
 
-    Usage:
+    Parameters
+    ----------
+    tokenizer_contract : TokenizerContract, optional
+        A model-native ``TokenizerContract`` (e.g. from
+        ``EmbedderBundle.tokenizer``).  When provided, takes priority over
+        ``tokenizer_backend`` — chunking will use the embedding model's own
+        vocabulary for accurate token counting (F-02 safe).
+
+    tokenizer_backend : str, optional
+        Legacy backend name ("huggingface", "spacy", "nltk", "whitespace").
+        Ignored when ``tokenizer_contract`` is supplied.
+
+    Usage
+    -----
+        # Phase A: pass the embedding model's native tokenizer
+        bundle = embedder_registry.get("BAAI/bge-large-en-v1.5")
         chunks = await token_aware_chunk(
             text,
             db_session=db,
             file_id="abc-123",
             source_type="pdf",
             embedding_model="BAAI/bge-large-en-v1.5",
-            tokenizer_backend="huggingface",
+            tokenizer_contract=bundle.tokenizer,
             chunk_size=512,
             chunk_overlap=64,
         )
+
+        # Legacy: use a generic backend string (unchanged behaviour)
+        chunks = await token_aware_chunk(
+            text,
+            tokenizer_backend="huggingface",
+            chunk_size=512,
+        )
     """
-    tokenizer = get_tokenizer(tokenizer_backend) if tokenizer_backend else None
+    # tokenizer_contract takes priority; fall back to backend string.
+    if tokenizer_contract is not None:
+        resolved_tokenizer: Optional[Any] = tokenizer_contract
+    elif tokenizer_backend:
+        resolved_tokenizer = get_tokenizer(tokenizer_backend)
+    else:
+        resolved_tokenizer = None
+
     service = TokenChunkingService(
-        tokenizer=tokenizer,
+        tokenizer=resolved_tokenizer,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )

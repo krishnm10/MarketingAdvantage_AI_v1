@@ -58,6 +58,7 @@ class EmbedderType(str, Enum):
     OPENAI      = "openai"
     HUGGINGFACE = "huggingface"
     COHERE      = "cohere"
+    GEMINI      = "gemini"
 
 
 class LLMType(str, Enum):
@@ -74,6 +75,7 @@ class RerankerType(str, Enum):
     FLASHRANK     = "flashrank"
     COHERE        = "cohere"
     COLBERT       = "colbert"
+    LLM_JUDGE     = "llm_judge"   # Provider-agnostic LLM-as-Judge (OpenAI, Gemini, etc.)
 
 
 class ChunkStrategy(str, Enum):
@@ -301,6 +303,19 @@ class CohereEmbedderConfig(BaseModel):
     normalize:   bool = True
 
 
+class GeminiEmbedderConfig(BaseModel):
+    """Google Gemini embedding model via google-genai SDK (v1 API)."""
+    model:       str = Field(
+        "gemini-embedding-001",
+        description="Gemini embedding model ID (e.g. 'gemini-embedding-001').",
+    )
+    api_key_env: str = Field(
+        "GOOGLE_API_KEY",
+        description="Env var NAME holding the Google AI API key.",
+    )
+    normalize:   bool = True
+
+
 class EmbedderConfig(BaseModel):
     """
     Top-level Embedder config.
@@ -315,6 +330,7 @@ class EmbedderConfig(BaseModel):
     openai:      Optional[OpenAIEmbedderConfig]       = None
     huggingface: Optional[HuggingFaceEmbedderConfig] = None
     cohere:      Optional[CohereEmbedderConfig]       = None
+    gemini:      Optional[GeminiEmbedderConfig]       = None
 
     @model_validator(mode="after")
     def validate_sub_config_present(self) -> "EmbedderConfig":
@@ -323,6 +339,7 @@ class EmbedderConfig(BaseModel):
             EmbedderType.OPENAI:      "openai",
             EmbedderType.HUGGINGFACE: "huggingface",
             EmbedderType.COHERE:      "cohere",
+            EmbedderType.GEMINI:      "gemini",
         }
         field = mapping[self.type]
         if getattr(self, field) is None:
@@ -386,11 +403,14 @@ class RerankerConfig(BaseModel):
     If absent, reranking is skipped for this client.
     """
     type:        RerankerType  = Field(..., description="REQUIRED if reranker block present.")
-    model:       Optional[str] = Field(None, description="Model path or HF model ID.")
-    api_key_env: Optional[str] = Field(None, description="Env var NAME (Cohere only).")
+    model:       Optional[str] = Field(None, description="Model path, HF model ID, or LLM model name for llm_judge.")
+    api_key_env: Optional[str] = Field(None, description="Env var NAME for API key (Cohere, OpenAI LLM judge, Gemini LLM judge).")
     device:      str           = "cpu"
     top_k:       int           = Field(5, description="Final results returned after reranking.")
     batch_size:  int           = 32
+    # LLM judge-specific settings (used when type=llm_judge)
+    judge_provider: Optional[str] = Field(None, description="LLM provider for judge: 'openai' | 'gemini'. Defaults to 'openai'.")
+    judge_strategy: Optional[str] = Field(None, description="Judge strategy: 'pointwise' | 'listwise'. Defaults to 'pointwise'.")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -405,13 +425,77 @@ class RetrievalConfig(BaseModel):
     similarity_threshold: float                  = Field(0.0, description="Minimum similarity score.")
     metadata_filters:     Optional[Dict[str, Any]] = None
     enable_trust_scoring: bool                   = True
-    # Hybrid search weights (only used when search_mode=hybrid)
+
+    # ── Hybrid search ─────────────────────────────────────────────────────────
     hybrid_alpha:         float                  = Field(
         0.7, description="Weight for semantic vs keyword. 1.0=semantic only, 0.0=keyword only."
     )
-    # HyDE — Hypothetical Document Embeddings (requires LLM to be configured)
+
+    # ── HyDE — Hypothetical Document Embeddings ───────────────────────────────
     enable_hyde:          bool                   = Field(
         False, description="Generate a hypothetical answer to embed instead of the raw query."
+    )
+
+    # ── Multi-query expansion ─────────────────────────────────────────────────
+    enable_multi_query:   bool                   = Field(
+        False,
+        description=(
+            "Generate N diverse query variants, retrieve for each, "
+            "and fuse results via RRF. Increases recall at the cost of extra "
+            "LLM + VectorDB calls."
+        ),
+    )
+    multi_query_count:    int                    = Field(
+        3,
+        ge=2, le=8,
+        description="Number of query variants to generate (2–8).",
+    )
+
+    # ── Post-processing: Threshold Gate ──────────────────────────────────────
+    enable_threshold_gate: bool                  = Field(
+        False,
+        description=(
+            "Filter candidates below a calibrated rerank score threshold. "
+            "Threshold should be derived from evaluation data, not hard-coded."
+        ),
+    )
+    threshold_min_score:  float                  = Field(
+        0.0,
+        ge=0.0, le=1.0,
+        description=(
+            "Minimum rerank score to retain a candidate. "
+            "Calibrate this from golden-set evaluation; 0.0 = disabled."
+        ),
+    )
+    threshold_min_results: int                   = Field(
+        1, ge=1,
+        description="Always retain at least this many candidates even if below threshold.",
+    )
+
+    # ── Post-processing: Token Budget ─────────────────────────────────────────
+    enable_token_budget:  bool                   = Field(
+        True,
+        description=(
+            "Adaptively trim context to fit within the generator's context window. "
+            "Budget is computed from generator max_context_tokens and context_fraction."
+        ),
+    )
+    token_budget_context_fraction: float         = Field(
+        0.6,
+        ge=0.1, le=0.95,
+        description=(
+            "Fraction of the generator context window reserved for retrieved context. "
+            "Remaining fraction covers system prompt, question, and generated answer."
+        ),
+    )
+
+    # ── Prompt template ───────────────────────────────────────────────────────
+    prompt_template_id:   Optional[str]          = Field(
+        None,
+        description=(
+            "ID of a saved PromptTemplate from the prompt library. "
+            "None uses the system default RAG prompt."
+        ),
     )
 
 

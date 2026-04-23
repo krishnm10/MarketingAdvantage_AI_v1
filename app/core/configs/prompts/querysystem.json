@@ -1,0 +1,19 @@
+{
+  "template_id": "querysystem",
+  "name": "Q&A",
+  "system_instructions": "Core Objective: Extract structured data from the provided invoice PDF content, focusing on identifying the vendor (From), the client (To), financial totals, and line-item details.Extraction SchemaFor every invoice processed, identify and format the following fields:\nInvoice Metadata:\nInvoice Number: \nThe unique identifier (e.g., INV-9922).Order Number: The associated purchase order or reference (e.g., RL-0042).Dates: Both the Invoice Date and the Due Date.Entity Identification:Vendor (From): Name and address of the issuing company (e.g., Core Components Ltd in Bangalore).Client (To): Name and address of the recipient (e.g., Research Lab Z).Line Items:Capture Quantity, Service Description, Unit Price, and Subtotal for each row in the service table.Financial Summary:Sub Total: Total before taxes.Tax: The calculated tax amount (typically 10% in these samples).Total Due: The final amount to be paid.Payment Details:Extract the Bank Name, Account Number, and relevant routing/IFSC/Sort codes.",
+  "context_format": "[1] Sliced Invoices From: DEMO - Sliced Invoices, Suite 5A-1204, 123 Somewhere Street, Your City AZ 12345 \n[Source: Invoice_1.pdf, p.1][2] Invoice Number INV-3337, Order Number 12345, Date January 25, 2016, Total Due $93.50 \n[Source: Invoice_1.pdf, p.1][3] Service: Web Design (1.00 qty) at $85.00 rate; Sub Total $85.00, Tax $8.50 \n[Source: Invoice_1.pdf, p.1][4] Sliced Invoices From: Growth Hackers Inc, 77 Media Square, London, UK E1 6AN \n[Source: Invoice_INV-5580.pdf, p.1][5] Invoice Number INV-5580, Order Number RG-2024, Date April 15, 2026, Total Due $1,320.00 \n[Source: Invoice_INV-5580.pdf, p.1][6] Service: Social Media Ad Management (1.00 qty) at $1,200.00 rate; Sub Total $1,200.00, Tax $120.00 \n[Source: Invoice_INV-5580.pdf, p.1][7] Sliced Invoices From: Core Components Ltd, 12 Silicon Drive, Bangalore, KA 560001 \n[Source: Invoice_INV-9922.pdf, p.1][8] Invoice Number INV-9922, Order Number RL-0042, Date April 12, 2026, Total Due $704.00 \n[Source: Invoice_INV-9922.pdf, p.1][9] Service: 8-Core CPU Units (2.00 qty) at $320.00 rate; Sub Total $640.00, Tax $64.00 \n[Source: Invoice_INV-9922.pdf, p.1][10] Sliced Invoices From: Studio Nexus, 45 Design Way, San Francisco, CA 94103 \n[Source: Invoice_INV-4001.pdf, p.1][11] Invoice Number INV-4001, Order Number 67890, Date April 10, 2026, Total Due $825.00 \n[Source: Invoice_INV-4001.pdf, p.1][12] Service: UX Consulting (5.00 qty) at $150.00 rate; Sub Total $750.00, Tax $75.00 \n[Source: Invoice_INV-4001.pdf, p.1][13] Sliced Invoices From: Reliable Ops Group, 99 Uptime Plaza, New York, NY 10001 \n[Source: Invoice_INV-7731.pdf, p.1][14] Invoice Number INV-7731, Order Number FFB-8800, Date April 20, 2026, Total Due $2,750.00 \n[Source: Invoice_INV-7731.pdf, p.1][15] Service: Annual Server Maintenance (1.00 qty) at $2,500.00 rate; Sub Total $2,500.00, Tax $250.00 \n[Source: Invoice_INV-7731.pdf, p.1][16] Sliced Invoices From: SaaS Flow Systems, 202 Cloud Tower, Seattle, WA 98101 \n[Source: Invoice_INV-2114.pdf, p.1][17] Invoice Number INV-2114, Order Number MME-0099, Date April 18, 2026, Total Due $495.00 \n[Source: Invoice_INV-2114.pdf, p.1][18] Service: Enterprise License Seats (10.00 qty) at $45.00 rate; Sub Total $450.00, Tax $45.00 \n[Source: Invoice_INV-2114.pdf, p.1]",
+  "question_prefix": "Question: Fetch the Invoice number",
+  "answer_prefix": "Answer: ",
+  "citation_style": "inline_numeric",
+  "max_context_chars": null,
+  "version": "1.0.0",
+  "tags": [
+    "Invoices",
+    "Question and Answer",
+    "Factual and simple 2 line Answer"
+  ],
+  "metadata": {},
+  "created_at": 1776894046,
+  "updated_at": 1776894214
+}

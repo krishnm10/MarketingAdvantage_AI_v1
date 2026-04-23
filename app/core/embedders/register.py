@@ -12,6 +12,7 @@ from app.core.embedders.huggingface_st_v1 import HuggingFaceSTEmbedder
 from app.core.embedders.ollama_v1 import OllamaEmbedder
 from app.core.embedders.openai_v1 import OpenAIEmbedder
 from app.core.embedders.cohere_v1 import CohereEmbedder
+from app.core.embedders.gemini_v1 import GeminiEmbedder
 
 embedder_registry.register(
     "huggingface",
@@ -35,4 +36,10 @@ embedder_registry.register(
     "cohere",
     CohereEmbedder,
     description="Cohere embeddings (input_type-aware).",
+)
+
+embedder_registry.register(
+    "gemini",
+    GeminiEmbedder,
+    description="Google Gemini embeddings (gemini-embedding-001). Multilingual, 3072-dim.",
 )

@@ -130,6 +130,10 @@ _VALID_CHUNKING_STRATEGIES = {
     "rust",
     "structure_aware",
     "document_aware",
+    "elite",
+    "enterprise_v2",
+    "elite_v2",
+    "enterprise_v3",
     "token_aware",
 }
 
