@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -308,9 +307,11 @@ async def ingestion_audit(
     ))
 
     # ── 3. Bounded DB queries ────────────────────────────────────────────────
-    now = datetime.now(timezone.utc)
-    cutoff_24h = (now - timedelta(hours=24)).isoformat()
-    cutoff_7d  = (now - timedelta(days=7)).isoformat()
+    # ingested_file.created_at is TIMESTAMP without time zone (naive UTC). Bind naive
+    # UTC cutoffs so asyncpg does not mix offset-naive column values with aware params.
+    now_utc = datetime.now(timezone.utc)
+    cutoff_24h = (now_utc - timedelta(hours=24)).replace(tzinfo=None)
+    cutoff_7d = (now_utc - timedelta(days=7)).replace(tzinfo=None)
 
     file_stats = FileStats(total=0, completed=0, failed=0, processing=0, pending=0,
                            last_24h=0, last_7d=0)
@@ -356,14 +357,26 @@ async def ingestion_audit(
         """))
         file_stats.by_file_type = {row[0]: int(row[1]) for row in r2.fetchall() if row[0]}
 
-        # Chunk-level stats
+        # Chunk-level stats (no trust_decision column; use latest validationLayer tap_trust_score)
         r3 = await db.execute(text("""
             SELECT
-                COUNT(*)                                                    AS total,
-                COUNT(*) FILTER (WHERE trust_decision = 'trusted')          AS trusted,
-                COUNT(*) FILTER (WHERE trust_decision = 'provisional')      AS provisional,
-                COUNT(*) FILTER (WHERE trust_decision = 'rejected')         AS rejected
-            FROM ingested_content
+                COUNT(*) AS total,
+                COUNT(*) FILTER (
+                    WHERE s.tap IS NOT NULL AND s.tap >= 0.65) AS trusted,
+                COUNT(*) FILTER (
+                    WHERE s.tap IS NULL OR (s.tap >= 0.35 AND s.tap < 0.65)) AS provisional,
+                COUNT(*) FILTER (
+                    WHERE s.tap IS NOT NULL AND s.tap < 0.35) AS rejected
+            FROM (
+                SELECT
+                    CASE
+                        WHEN ic.validation_layer IS NULL THEN NULL
+                        WHEN coalesce(jsonb_typeof(ic.validation_layer), '') <> 'array' THEN NULL
+                        WHEN jsonb_array_length(COALESCE(ic.validation_layer, '[]'::jsonb)) < 1 THEN NULL
+                        ELSE (ic.validation_layer->-1->>'tap_trust_score')::double precision
+                    END AS tap
+                FROM ingested_content AS ic
+            ) AS s
         """))
         row3 = r3.fetchone()
         if row3:

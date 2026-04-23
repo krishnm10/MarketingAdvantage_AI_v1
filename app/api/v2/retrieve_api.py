@@ -152,7 +152,8 @@ async def retrieve_query(
             llm = None
             if llm_provider == "ollama":
                 from app.core.llms.ollama_v1 import OllamaLLM
-                llm = OllamaLLM()
+                _ollama_model = _os_module.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
+                llm = OllamaLLM(model=_ollama_model)
             elif llm_provider == "openai":
                 from app.core.llms.openai_v1 import OpenAILLM
                 llm = OpenAILLM()
@@ -391,8 +392,8 @@ async def retrieve_query(
 
                     elif _llm_provider_name == "ollama":
                         from app.core.llms.ollama_v1 import OllamaLLM
-                        _llm = OllamaLLM()
                         answer_model = _os_module.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
+                        _llm = OllamaLLM(model=answer_model)
 
                     elif _llm_provider_name in ("groq", "grok"):
                         from app.core.llms.groq_v1 import GroqLLM

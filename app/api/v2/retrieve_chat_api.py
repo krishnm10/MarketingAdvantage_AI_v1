@@ -114,7 +114,7 @@ def _resolve_llm(provider: str, model: Optional[str] = None):
     if provider == "ollama":
         from app.core.llms.ollama_v1 import OllamaLLM
         m = model or os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
-        return OllamaLLM(), m
+        return OllamaLLM(model=m), m
 
     if provider in ("groq", "grok"):
         from app.core.llms.groq_v1 import GroqLLM

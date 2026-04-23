@@ -37,7 +37,7 @@
     }
   },
   "reranker": {
-    "model": "llm-judge/gemini-1.5-pro",
+    "model": "llm-judge/gpt-4o-mini",
     "type": "llm_judge",
     "top_k": 5
   }
