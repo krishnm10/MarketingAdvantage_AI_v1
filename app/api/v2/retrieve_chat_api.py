@@ -402,6 +402,18 @@ async def chat_retrieve(
                     ]
                     context_str = "\n\n---\n\n".join(context_parts)
 
+                    # ── Context sanitization: PII redaction on retrieved text ─
+                    _ctx_scan = _security_scan_text(
+                        context_str, context="retrieved_context",
+                    )
+                    _sanitized_context = _ctx_scan.redacted_text
+                    if _sanitized_context != context_str:
+                        logger.info(
+                            "[ChatRetrieve] Context sanitized before LLM — "
+                            "PII redacted from retrieved chunks"
+                        )
+                        context_str = _sanitized_context
+
                     rag_prompt = (
                         "You are a precise, grounded enterprise assistant.\n"
                         "Answer the user's question using ONLY the retrieved passages below.\n\n"

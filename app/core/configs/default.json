@@ -40,5 +40,35 @@
     "model": "llm-judge/gpt-4o-mini",
     "type": "llm_judge",
     "top_k": 5
+  },
+  "security": {
+    "pii_middleware": {
+      "enabled": true,
+      "positions": [
+        "pre_embedding",
+        "pre_llm",
+        "post_llm"
+      ],
+      "action": "REDACT",
+      "block_on_severity": "CRITICAL",
+      "trust_score_penalty": 0.15,
+      "audit_log_enabled": true
+    }
+  },
+  "prompt": {
+    "enabled": true,
+    "prompt_type": "rag_context",
+    "max_tokens_warning": 3000
+  },
+  "formatter": {
+    "enabled": true,
+    "response_format": "plain_text",
+    "min_trust_score": 0.3,
+    "block_on_low_trust": true
+  },
+  "context_window": {
+    "enabled": true,
+    "truncation_strategy": "least_relevant",
+    "response_reserve_tokens": 1024
   }
 }

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query
@@ -398,6 +399,114 @@ def _resolve_client_config(client_id: str):
 
 
 # =============================================================================
+# PII middleware status check
+# =============================================================================
+
+def _check_pii_middleware_status(client_id: str) -> Dict[str, Any]:
+    """
+    Check PII middleware alignment status for a client.
+    Returns status and component check dict.
+    """
+    status = "disabled"
+    detail = "PII middleware is not configured."
+
+    try:
+        # Try to load client config
+        config_dirs = [
+            Path(__file__).resolve().parents[2] / "core" / "configs",
+            Path(__file__).resolve().parents[3] / "configs",
+        ]
+
+        config_data = None
+        for base in config_dirs:
+            for ext in ("json", "yaml"):
+                p = base / f"{client_id}.{ext}"
+                if p.exists():
+                    if ext == "json":
+                        import json
+                        config_data = json.loads(p.read_text())
+                    else:
+                        import yaml
+                        config_data = yaml.safe_load(p.read_text())
+                    break
+            if config_data:
+                break
+
+        if not config_data:
+            # Check env-based config
+            pii_enabled = os.getenv("MAI_PII_MIDDLEWARE_ENABLED", "false").lower() == "true"
+            if pii_enabled:
+                status = "partial"
+                detail = "PII middleware enabled via env but no positions configured."
+            return {
+                "status": status,
+                "check": {
+                    "component": "pii_middleware",
+                    "label": "PII Middleware",
+                    "status": "info" if status == "disabled" else "warning",
+                    "message": status.title(),
+                    "detail": detail,
+                },
+            }
+
+        security_cfg = config_data.get("security", {})
+        pii_cfg = security_cfg.get("pii_middleware", {})
+
+        if not pii_cfg.get("enabled", False):
+            return {
+                "status": "disabled",
+                "check": {
+                    "component": "pii_middleware",
+                    "label": "PII Middleware",
+                    "status": "warning",
+                    "message": "Disabled",
+                    "detail": "PII middleware is disabled. Enable in security config for production safety.",
+                },
+            }
+
+        positions = pii_cfg.get("positions", [])
+        required = {"pre_embedding", "pre_llm", "post_llm"}
+        active = set(positions)
+        missing = required - active
+
+        if not missing:
+            status = "aligned"
+            detail = f"All positions active: {', '.join(sorted(active))}"
+            check_status = "ok"
+        elif active:
+            status = "partial"
+            detail = f"Active: {', '.join(sorted(active))}. Missing: {', '.join(sorted(missing))}"
+            check_status = "warning"
+        else:
+            status = "disabled"
+            detail = "Enabled but no positions configured."
+            check_status = "error"
+
+        return {
+            "status": status,
+            "check": {
+                "component": "pii_middleware",
+                "label": "PII Middleware",
+                "status": check_status,
+                "message": status.title(),
+                "detail": detail,
+            },
+        }
+    except Exception as e:
+        logger.warning("[embedding_alignment_api] PII status check failed: %s", e)
+        return {
+            "status": "error",
+            "check": {
+                "component": "pii_middleware",
+                "label": "PII Middleware",
+                "status": "error",
+                "message": "Error",
+                "detail": f"Failed to check PII middleware status: {str(e)[:100]}",
+            },
+        }
+
+
+# =============================================================================
 # Endpoint
 # =============================================================================
 
@@ -499,7 +608,11 @@ async def get_embedding_alignment(
             )
             is_aligned = report.ok
             errors = report.errors
-            warnings = report.warnings
+            raw_warnings = report.warnings
+            warnings = [
+                warning for warning in raw_warnings
+                if "[W-F-14/F-15] REMINDER" not in warning
+            ]
             failure_modes = report.failure_modes
         except Exception as exc:
             logger.warning(
@@ -518,6 +631,10 @@ async def get_embedding_alignment(
         warnings=warnings,
         safe_chunk_size=safe_chunk_size,
     )
+
+    # PII middleware alignment check
+    pii_result = _check_pii_middleware_status(client_id)
+    checks.append(pii_result["check"])
 
     # ── 6. Assemble response ──────────────────────────────────────────────────
     resp = _base_response()
@@ -543,5 +660,6 @@ async def get_embedding_alignment(
         "overall_score": overall_score,
         "ingestion_ready": ingestion_ready,
         "readiness_label": readiness_label,
+        "pii_middleware_status": pii_result["status"],
     })
     return resp

@@ -1,0 +1,27 @@
+{
+  "template_id": "self_rag",
+  "name": "Self-RAG",
+  "description": "Self-reflective RAG with trust-based output gating. The LLM evaluates its own answer quality.",
+  "tags": ["advanced", "rag", "self-rag"],
+  "pii_enabled": false,
+  "recommended_default": false,
+  "version": "1.0",
+  "created_by": "system",
+  "config_patch": {
+    "retrieval": {
+      "search_mode": "hybrid",
+      "top_k_retrieval": 20,
+      "top_k_final": 5,
+      "enable_trust_scoring": true
+    },
+    "prompt": {
+      "enabled": true,
+      "prompt_type": "cot"
+    },
+    "formatter": {
+      "enabled": true,
+      "min_trust_score": 0.5,
+      "block_on_low_trust": true
+    }
+  }
+}

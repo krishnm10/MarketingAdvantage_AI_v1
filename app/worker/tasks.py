@@ -9,7 +9,7 @@
 # INGESTION TASKS
 #   run_ingestion_pipeline(file_id, saved_path, file_ext)
 #       → Parses a file that is already saved on disk and pushes it through
-#         IngestionServiceV2.ingest_parsed_output().
+#         IngestionOrchestrator (PII sanitization → IngestionServiceV2).
 #         Dispatched by file_router_v2 after the file is saved and the DB
 #         record is created (status='uploaded').
 #
@@ -111,7 +111,7 @@ if celery_app is not None:
             file_ext    — Lowercase extension including dot, e.g. ".pdf".
         """
         from app.services.ingestion.file_router_v2 import PARSER_MAP
-        from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
+        from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
         from app.utils.logger import log_info, log_warning
 
         try:
@@ -123,7 +123,9 @@ if celery_app is not None:
             parsed_output = _run(parser_func(saved_path))
 
             log_info(f"[celery/ingestion] Running ingestion pipeline for file_id={file_id}")
-            _run(IngestionServiceV2.ingest_parsed_output(file_id, parsed_output))
+            _run(IngestionOrchestrator().ingest_parsed_output(
+                file_id=file_id, parsed=parsed_output,
+            ))
 
             log_info(f"[celery/ingestion] ✅ Done — file_id={file_id}")
             return {"status": "ingested", "file_id": file_id}

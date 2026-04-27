@@ -23,6 +23,7 @@ from app.services.ingestion.xml_parser_v2 import parse_xml
 
 
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
+from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
 from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.session_v2 import async_engine
@@ -221,7 +222,9 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         # ── Inline fallback (no Celery / broker not running) ──────────────────
         parsed_output = await parser_func(saved_path)
         _write_log(f"[PARSED] {original_file_name} using {parser_func.__name__}")
-        await IngestionServiceV2.ingest_parsed_output(file_id, parsed_output)
+        await IngestionOrchestrator().ingest_parsed_output(
+            file_id=file_id, parsed=parsed_output,
+        )
         _write_log(f"[INGESTED] {original_file_name} successfully processed.")
         log_info(f"[file_router_v2] ✅ Ingestion complete (inline) for {original_file_name}")
 
@@ -378,7 +381,9 @@ async def route_external_ingestion(source_type: str, source_url: str, business_i
         # ✅ Direct ingestion for pre-parsed payload
         if parsed_output and isinstance(parsed_output, dict):
             log_info(f"[file_router_v2] Passing parsed {source_type.upper()} output directly to ingestion pipeline...")
-            await IngestionServiceV2.ingest_parsed_output(source_id, parsed_output)
+            await IngestionOrchestrator().ingest_parsed_output(
+                file_id=source_id, parsed=parsed_output,
+            )
         else:
             log_warning(f"[file_router_v2] No valid chunks found in parsed {source_type.upper()} output. Skipping ingestion.")
             return {"status": "skipped", "reason": "no_chunks"}

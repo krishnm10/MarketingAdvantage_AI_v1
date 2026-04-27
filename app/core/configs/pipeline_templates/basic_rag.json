@@ -1,0 +1,25 @@
+{
+  "template_id": "basic_rag",
+  "name": "Basic RAG",
+  "description": "Simple retrieval-augmented generation with vector search and LLM answer.",
+  "tags": ["basic", "rag", "starter"],
+  "pii_enabled": false,
+  "recommended_default": false,
+  "version": "1.0",
+  "created_by": "system",
+  "config_patch": {
+    "retrieval": {
+      "search_mode": "semantic",
+      "top_k_retrieval": 20,
+      "top_k_final": 5,
+      "enable_hyde": false,
+      "enable_multi_query": false
+    },
+    "security": {
+      "pii_middleware": { "enabled": false }
+    },
+    "prompt": { "enabled": false },
+    "formatter": { "enabled": false },
+    "context_window": { "enabled": false }
+  }
+}

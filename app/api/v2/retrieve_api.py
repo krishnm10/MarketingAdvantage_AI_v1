@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
 from app.services.ingestion.ingestion_service_v2 import get_embedder
+from app.utils.pipeline_logger import PipelineLogger
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,14 @@ async def retrieve_query(
     Flow: embed query → semantic recall → governance scoring → ranked results.
     Mirrors retrieve_cli.py but exposed as an HTTP API.
     """
+    import os as _os_plog
+    plog = PipelineLogger(
+        request_path="retrieve_api",
+        embedder_model=_os_plog.getenv("MAI_EMBEDDER", "unknown"),
+        vectordb_backend=_os_plog.getenv("MAI_VECTORDB", "unknown"),
+    )
+    plog.info("Retrieve query received", query_length=len(req.query), intent=req.intent)
+
     from app.retrieval.runtime import RetrievalRuntime
     from app.retrieval.repository import RetrievalRepository
     from app.retrieval.types_retrieve import QueryContext, RetrievalIntent
@@ -442,6 +451,18 @@ async def retrieve_query(
                             )
                         _context_str = "\n\n---\n\n".join(_context_parts)
 
+                        # ── Context sanitization: PII redaction on retrieved text ─
+                        _ctx_scan = _security_scan_text(
+                            _context_str, context="retrieved_context",
+                        )
+                        _sanitized_context = _ctx_scan.redacted_text
+                        if _sanitized_context != _context_str:
+                            logger.info(
+                                "[RetrieveAPI] Context sanitized before LLM — "
+                                "PII redacted from retrieved chunks"
+                            )
+                            _context_str = _sanitized_context
+
                         # Enterprise-grade RAG prompt: strict grounding, citation, no hallucination
                         _rag_prompt = (
                             "You are a precise, grounded enterprise assistant.\n"
@@ -514,6 +535,15 @@ async def retrieve_query(
             "injection_detected": _scan_result.injection_detected,
         },
     }
+
+    plog.query_complete(
+        chunks_used=len(results),
+        reranked=reranker_used != "none",
+        total_ms=elapsed_ms,
+        search_mode=search_mode,
+        generate_answer=req.generate_answer,
+        answer_model=answer_model,
+    )
 
     return RetrieveResponse(
         query=req.query,

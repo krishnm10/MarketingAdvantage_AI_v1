@@ -36,6 +36,11 @@ import app.core.embedders.register   # noqa: F401
 import app.core.llms.register        # noqa: F401  ← NEW
 import app.core.rerankers.register   # noqa: F401  ← NEW
 
+try:
+    import app.core.pipeline_nodes.register  # noqa: F401
+except ImportError:
+    pass  # Pipeline nodes are optional
+
 # ── Config schema ───────────────────────────────────────────────────────────
 from app.core.config.client_config_schema import (
     ClientConfig,
@@ -112,6 +117,7 @@ class AssembledPipeline:
         reranker:   Optional[BaseReranker],
         config:     ClientConfig,
         embedder_bundle: "Optional[Any]" = None,
+        nodes: "Optional[Any]" = None,
     ):
         self.client_id = client_id
         self.config    = config
@@ -128,6 +134,9 @@ class AssembledPipeline:
         # embed_max_tokens, safe_chunk_size, and embedding_fingerprint.
         self.embedder_bundle = embedder_bundle
 
+        # ── Pipeline nodes (PII middleware, prompt node, etc.) ──
+        self.nodes = nodes
+
         # ── Wire everything into a live RAGPipeline ─────────────────────
         # From this point, callers only need to call .query()
         self.rag = RAGPipeline(
@@ -136,6 +145,7 @@ class AssembledPipeline:
             llm=llm,
             reranker=reranker,
             config=config,
+            nodes=nodes,
         )
 
         logger.info(
@@ -359,6 +369,9 @@ class PipelineFactory:
                 _bundle_exc,
             )
 
+        # ── Build optional pipeline nodes (PII, Prompt, etc.) ──────────
+        nodes = self._build_pipeline_nodes(config)
+
         # ── Assemble and cache ────────────────────────────────────────
         pipeline = AssembledPipeline(
             client_id=client_id,
@@ -368,6 +381,7 @@ class PipelineFactory:
             reranker=reranker,
             config=config,
             embedder_bundle=embedder_bundle,
+            nodes=nodes,
         )
         pipeline._collection_ensured = True
         pipeline._embedding_dim = embedding_dim
@@ -818,6 +832,57 @@ class PipelineFactory:
             f"[PipelineFactory] Unknown reranker type '{t}'. "
             f"Registered: {reranker_registry.list()}"
         )
+
+    # ── Pipeline Nodes (PII middleware, Prompt node, etc.) ────────────────
+
+    def _build_pipeline_nodes(self, config):
+        """Build optional pipeline nodes from config."""
+        try:
+            from app.core.pipeline_nodes.node_set import PipelineNodeSet
+        except ImportError:
+            return None
+
+        nodes = PipelineNodeSet()
+
+        # PII Middleware
+        try:
+            security_cfg = getattr(config, 'security', None)
+            if security_cfg and getattr(security_cfg, 'pii_middleware', None):
+                pii_cfg = security_cfg.pii_middleware
+                if pii_cfg.enabled:
+                    from app.core.pipeline_nodes.pii_middleware import RegexPIIMiddleware
+                    nodes.pii_middleware = RegexPIIMiddleware(config={
+                        "position": pii_cfg.positions,
+                        "action": pii_cfg.action,
+                        "block_on_severity": pii_cfg.block_on_severity,
+                        "trust_score_penalty": pii_cfg.trust_score_penalty,
+                        "custom_patterns": [
+                            {"name": p.name, "pattern": p.pattern, "severity": p.severity}
+                            for p in pii_cfg.custom_patterns
+                        ],
+                        "audit_log_enabled": pii_cfg.audit_log_enabled,
+                    })
+                    logger.info("[PipelineFactory] PII middleware enabled | positions=%s", pii_cfg.positions)
+        except Exception as e:
+            logger.warning("[PipelineFactory] Failed to build PII middleware: %s", e)
+
+        # Prompt Node
+        try:
+            prompt_cfg = getattr(config, 'prompt', None)
+            if prompt_cfg and getattr(prompt_cfg, 'enabled', False):
+                from app.core.pipeline_nodes.prompt_node import PromptNode
+                nodes.prompt_node = PromptNode(
+                    prompt_type=prompt_cfg.prompt_type,
+                    template=prompt_cfg.template,
+                    template_id=prompt_cfg.template_id,
+                    variable_map=dict(prompt_cfg.variable_map),
+                    max_tokens_warning=prompt_cfg.max_tokens_warning,
+                )
+                logger.info("[PipelineFactory] Prompt node enabled | type=%s", prompt_cfg.prompt_type)
+        except Exception as e:
+            logger.warning("[PipelineFactory] Failed to build prompt node: %s", e)
+
+        return nodes
 
 
 # =============================================================================

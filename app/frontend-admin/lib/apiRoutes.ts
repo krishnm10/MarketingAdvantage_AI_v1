@@ -100,6 +100,13 @@ export const API = {
     DEFAULTS:  () => "/api/v2/models/defaults",
   },
 
+  // Phase 3 — Pipeline Templates
+  PIPELINE_TEMPLATES: {
+    LIST:    (tag?: string) => tag ? `/api/v2/pipeline-templates/?tag=${encodeURIComponent(tag)}` : "/api/v2/pipeline-templates/",
+    GET:     (id: string) => `/api/v2/pipeline-templates/${encodeURIComponent(id)}`,
+    SAVE:    () => "/api/v2/pipeline-templates/",
+  },
+
   // RAG Query (production pipeline)
   RAG: {
     QUERY:           () => "/api/v2/rag/query",

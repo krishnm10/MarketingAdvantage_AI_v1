@@ -1,0 +1,58 @@
+{
+  "template_id": "secure_rag",
+  "name": "Secure RAG",
+  "description": "Production-grade RAG with PII middleware in all positions, reranking, context budgeting, trust gate, and output formatting.",
+  "tags": ["recommended", "secure", "rag", "production"],
+  "pii_enabled": true,
+  "recommended_default": true,
+  "version": "1.0",
+  "created_by": "system",
+  "config_patch": {
+    "retrieval": {
+      "search_mode": "hybrid",
+      "top_k_retrieval": 20,
+      "top_k_final": 5,
+      "hybrid_alpha": 0.7,
+      "enable_hyde": false,
+      "enable_multi_query": false,
+      "enable_trust_scoring": true,
+      "enable_token_budget": true,
+      "token_budget_context_fraction": 0.6,
+      "fusion_method": "rrf"
+    },
+    "reranker": {
+      "type": "crossencoder",
+      "model": "cross-encoder/ms-marco-MiniLM-L-12-v2",
+      "top_k": 5,
+      "device": "cpu"
+    },
+    "security": {
+      "pii_middleware": {
+        "enabled": true,
+        "positions": ["pre_embedding", "pre_llm", "post_llm"],
+        "strategies": ["regex"],
+        "action": "REDACT",
+        "block_on_severity": "CRITICAL",
+        "trust_score_penalty": 0.15,
+        "audit_log_enabled": true
+      }
+    },
+    "prompt": {
+      "enabled": true,
+      "prompt_type": "rag_context",
+      "max_tokens_warning": 3000
+    },
+    "formatter": {
+      "enabled": true,
+      "response_format": "plain_text",
+      "min_trust_score": 0.3,
+      "block_on_low_trust": true
+    },
+    "context_window": {
+      "enabled": true,
+      "truncation_strategy": "least_relevant",
+      "response_reserve_tokens": 1024,
+      "token_budget_context_fraction": 0.6
+    }
+  }
+}

@@ -154,6 +154,7 @@ embedder_registry: PluginRegistry[Any] = PluginRegistry(domain="embedder")
 llm_registry: PluginRegistry[Any] = PluginRegistry(domain="llm")
 reranker_registry: PluginRegistry[Any] = PluginRegistry(domain="reranker")
 ingestor_registry: PluginRegistry[Any] = PluginRegistry(domain="ingestor")
+pipeline_node_registry: PluginRegistry[Any] = PluginRegistry(domain="pipeline_node")
 
 # ---------------------------------------------------------------------
 # Bootstrap built-in connectors into ingestor_registry

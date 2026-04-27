@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from app.utils.pipeline_logger import PipelineLogger
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +165,7 @@ class InMemoryIngestionQueue:
 class IngestionWorker:
     """
     Background worker that consumes IngestionCommand objects and invokes
-    IngestionServiceV2.process_file() for each.
+    IngestionOrchestrator.ingest_file() for each (PII sanitization enforced).
 
     Features:
       - Configurable concurrency (INGESTION_WORKER_CONCURRENCY env var)
@@ -220,27 +222,43 @@ class IngestionWorker:
 
     async def _process_command(self, command: IngestionCommand, worker_id: int) -> None:
         t0 = time.monotonic()
+        plog = PipelineLogger(
+            request_path="ingestion",
+            client_id=command.business_id,
+            pipeline_id=command.command_id,
+            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
+            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+        )
         try:
-            from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
-            logger.info(
-                "[IngestionWorker %d] Processing file_id=%s attempt=%d",
-                worker_id, command.file_id, command.attempt,
-            )
-            await IngestionServiceV2.process_file(
+            from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
+            plog.info(
+                "Processing ingestion command",
                 file_id=command.file_id,
+                worker_id=worker_id,
+                attempt=command.attempt,
+                source_type=command.source_type,
+            )
+            await IngestionOrchestrator().ingest_file(
+                file_id=command.file_id,
+                client_id=command.business_id,
                 file_path=command.file_path,
-                business_id=command.business_id,
             )
             elapsed_ms = (time.monotonic() - t0) * 1000
-            logger.info(
-                "[IngestionWorker %d] Completed file_id=%s in %.1fms",
-                worker_id, command.file_id, elapsed_ms,
+            plog.info(
+                "Ingestion command completed",
+                file_id=command.file_id,
+                worker_id=worker_id,
+                duration_ms=round(elapsed_ms, 2),
             )
         except Exception as e:
             elapsed_ms = (time.monotonic() - t0) * 1000
-            logger.error(
-                "[IngestionWorker %d] Failed file_id=%s attempt=%d error=%s in %.1fms",
-                worker_id, command.file_id, command.attempt, e, elapsed_ms,
+            plog.error(
+                "Ingestion command failed",
+                file_id=command.file_id,
+                worker_id=worker_id,
+                attempt=command.attempt,
+                error=str(e)[:300],
+                duration_ms=round(elapsed_ms, 2),
             )
             if command.attempt < _MAX_RETRY_ATTEMPTS:
                 delay = _RETRY_DELAY_BASE_S * (2 ** command.attempt)

@@ -71,6 +71,37 @@ from app.ai.contracts.generator_contract import (
     GeneratorContract,
 )
 
+# ── Phase 3 — Pipeline Node contracts ────────────────────────────────────────
+from app.ai.contracts.pipeline_node_contract import (
+    NodePosition,
+    TrustSignal,
+    NodeResult,
+    PipelineNodeContract,
+)
+
+from app.ai.contracts.prompt_node_contract import (
+    PromptRenderResult,
+    TemplateValidationResult,
+    PromptNodeContract,
+)
+
+from app.ai.contracts.output_formatter_contract import (
+    FormatResult,
+    OutputFormatterContract,
+)
+
+from app.ai.contracts.context_window_contract import (
+    ContextBudgetResult,
+    ContextWindowContract,
+)
+
+from app.ai.contracts.pii_middleware_contract import (
+    PIIAction,
+    PIISeverity,
+    PIIScanResult,
+    PIIMiddlewareContract,
+)
+
 __all__ = [
     # AI Capability ABCs
     "SpeechToText",
@@ -113,4 +144,24 @@ __all__ = [
     "GenerationRequest",
     "GenerationResult",
     "GeneratorContract",
+    # Phase 3 — Pipeline Node
+    "NodePosition",
+    "TrustSignal",
+    "NodeResult",
+    "PipelineNodeContract",
+    # Phase 3 — Prompt Node
+    "PromptRenderResult",
+    "TemplateValidationResult",
+    "PromptNodeContract",
+    # Phase 3 — Output Formatter
+    "FormatResult",
+    "OutputFormatterContract",
+    # Phase 3 — Context Window
+    "ContextBudgetResult",
+    "ContextWindowContract",
+    # Phase 3 — PII Middleware
+    "PIIAction",
+    "PIISeverity",
+    "PIIScanResult",
+    "PIIMiddlewareContract",
 ]

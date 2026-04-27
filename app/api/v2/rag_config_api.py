@@ -36,6 +36,8 @@ import yaml
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.utils.path_sanitizer import sanitize_client_id
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
@@ -71,9 +73,16 @@ def _load_reranker_catalog() -> dict:
 
 def _get_client_config_path(client_id: str) -> Optional[Path]:
     """Search all config dirs for {client_id}.json or .yaml."""
+    safe_id = sanitize_client_id(client_id)
     for base in _CONFIG_DIRS:
         for ext in ("json", "yaml"):
-            p = base / f"{client_id}.{ext}"
+            p = (base / f"{safe_id}.{ext}").resolve()
+            if not str(p).startswith(str(base.resolve())):
+                logger.warning(
+                    "[rag_config_api] Path containment violation for client_id=%.20s",
+                    client_id[:20],
+                )
+                continue
             if p.exists():
                 return p
     return None
@@ -271,6 +280,10 @@ class RerankerConfigUpdate(BaseModel):
     search_mode:              Optional[str]   = None
     hybrid_alpha:             Optional[float] = Field(None, ge=0.0, le=1.0)
     prompt_template_id:       Optional[str]   = None
+    security:                 Optional[Dict[str, Any]] = None
+    prompt:                   Optional[Dict[str, Any]] = None
+    formatter:                Optional[Dict[str, Any]] = None
+    context_window:           Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +474,10 @@ async def get_reranker_rules():
 
 
 @router.put("/pipeline/{client_id}", response_model=dict)
-async def update_pipeline_config(client_id: str, req: RerankerConfigUpdate):
+async def update_pipeline_config(
+    client_id: str,
+    req: RerankerConfigUpdate,
+):
     """
     Update reranking and query-transform settings for a client pipeline.
     Writes changes back to the client's config file and invalidates the
@@ -475,9 +491,12 @@ async def update_pipeline_config(client_id: str, req: RerankerConfigUpdate):
 
     if config_path is None:
         # No existing file — create one from env-based defaults
+        safe_id = sanitize_client_id(client_id)
         _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
-        config_path = _CONFIGS_DIR / f"{client_id}.json"
-        config_data = _build_default_config_dict(client_id)
+        config_path = (_CONFIGS_DIR / f"{safe_id}.json").resolve()
+        if not str(config_path).startswith(str(_CONFIGS_DIR.resolve())):
+            raise HTTPException(status_code=400, detail="Invalid client_id.")
+        config_data = _build_default_config_dict(safe_id)
         logger.info(
             "[rag_config_api] Creating new config file for client '%s' at %s",
             client_id, config_path,
@@ -531,6 +550,24 @@ async def update_pipeline_config(client_id: str, req: RerankerConfigUpdate):
         if "retrieval" not in config_data or config_data["retrieval"] is None:
             config_data["retrieval"] = {}
         config_data["retrieval"].update(retrieval_updates)
+
+    def _deep_update(target: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
+        for key, value in patch.items():
+            if isinstance(value, dict) and isinstance(target.get(key), dict):
+                _deep_update(target[key], value)
+            else:
+                target[key] = value
+        return target
+
+    # Advanced pipeline node sections are structured ClientConfig patches.
+    for section in ("security", "prompt", "formatter", "context_window"):
+        section_update = updates.get(section)
+        if isinstance(section_update, dict):
+            if "custom_template" in section_update and "template" not in section_update:
+                section_update["template"] = section_update.pop("custom_template")
+            if section not in config_data or not isinstance(config_data.get(section), dict):
+                config_data[section] = {}
+            _deep_update(config_data[section], section_update)
 
     # Write back
     with config_path.open("w") as f:

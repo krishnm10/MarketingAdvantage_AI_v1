@@ -1,0 +1,19 @@
+{
+  "template_id": "hyde_rag",
+  "name": "HyDE RAG",
+  "description": "Hypothetical Document Embeddings — generates a hypothetical answer first, then retrieves with it.",
+  "tags": ["advanced", "rag", "hyde"],
+  "pii_enabled": false,
+  "recommended_default": false,
+  "version": "1.0",
+  "created_by": "system",
+  "config_patch": {
+    "retrieval": {
+      "search_mode": "semantic",
+      "top_k_retrieval": 20,
+      "top_k_final": 5,
+      "enable_hyde": true,
+      "enable_multi_query": false
+    }
+  }
+}

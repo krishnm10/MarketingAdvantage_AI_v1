@@ -7,7 +7,8 @@ import {
   Database, Brain, Zap, Server, AlertTriangle, Info,
   Globe, User, CheckCheck, XCircle, Loader2, RefreshCw,
   Layers, ArrowRight, Cpu, Cloud, Home, Sparkles, Lock,
-  ShieldCheck, Hash, Scissors, Tag,
+  ShieldCheck, Hash, Scissors, Tag, FileText, LayoutTemplate,
+  SlidersHorizontal,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
@@ -76,6 +77,82 @@ interface PreviewResult {
   error: string | null;
 }
 
+/* ─── Advanced Node Config Types ─── */
+interface PIIConfig {
+  enabled: boolean;
+  positions: string[];
+  action: string;
+  block_on_severity: string;
+  trust_score_penalty: number;
+  audit_log_enabled: boolean;
+}
+
+interface PromptConfig {
+  enabled: boolean;
+  prompt_type: string;
+  custom_template: string;
+  max_tokens_warning: number;
+}
+
+interface FormatterConfig {
+  enabled: boolean;
+  response_format: string;
+  min_trust_score: number;
+  block_on_low_trust: boolean;
+}
+
+interface ContextWindowConfig {
+  enabled: boolean;
+  truncation_strategy: string;
+  response_reserve_tokens: number;
+}
+
+interface AdvancedConfig {
+  pii: PIIConfig;
+  prompt: PromptConfig;
+  formatter: FormatterConfig;
+  context_window: ContextWindowConfig;
+}
+
+interface TemplateSummary {
+  template_id: string;
+  name: string;
+  description: string;
+  tags: string[];
+  pii_enabled: boolean;
+  recommended_default: boolean;
+  version: string;
+  created_by: string;
+}
+
+const DEFAULT_ADVANCED_CONFIG: AdvancedConfig = {
+  pii: {
+    enabled: true,
+    positions: ["pre_embedding", "pre_llm", "post_llm"],
+    action: "REDACT",
+    block_on_severity: "CRITICAL",
+    trust_score_penalty: 0.15,
+    audit_log_enabled: true,
+  },
+  prompt: {
+    enabled: true,
+    prompt_type: "rag_context",
+    custom_template: "",
+    max_tokens_warning: 3000,
+  },
+  formatter: {
+    enabled: true,
+    response_format: "plain_text",
+    min_trust_score: 0.3,
+    block_on_low_trust: true,
+  },
+  context_window: {
+    enabled: true,
+    truncation_strategy: "least_relevant",
+    response_reserve_tokens: 1024,
+  },
+};
+
 /* ─── Quick presets ─── */
 const QUICK_PRESETS = [
   {
@@ -138,7 +215,9 @@ const STEPS = [
   { n: 2, label: "Tokenization" },
   { n: 3, label: "Storage" },
   { n: 4, label: "LLM" },
-  { n: 5, label: "Review" },
+  { n: 5, label: "Security & Nodes" },
+  { n: 6, label: "Templates" },
+  { n: 7, label: "Review" },
 ];
 
 function StepIndicator({ current }: { current: number }) {
@@ -172,7 +251,7 @@ function StepIndicator({ current }: { current: number }) {
             {i < STEPS.length - 1 && (
               <div
                 className={cn(
-                  "h-0.5 w-12 mx-1 mb-5 transition-all duration-300",
+                  "h-0.5 w-8 mx-0.5 mb-5 transition-all duration-300",
                   s.n < current ? "bg-emerald-400" : "bg-slate-200"
                 )}
               />
@@ -448,6 +527,16 @@ export default function PipelineBuilderPage() {
   const [searchQuery, setSearchQuery] = useState("");
   const [providerFilter, setProviderFilter] = useState<string | null>(null);
 
+  /* ── Advanced node config state ── */
+  const [advancedConfig, setAdvancedConfig] = useState<AdvancedConfig>(
+    () => structuredClone(DEFAULT_ADVANCED_CONFIG)
+  );
+  const [templates, setTemplates] = useState<TemplateSummary[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
+  const [templateApplied, setTemplateApplied] = useState<string | null>(null);
+  const [advancedSaveResult, setAdvancedSaveResult] = useState<{ ok: boolean; msg: string } | null>(null);
+
   /* ── Fetch models ── */
   const fetchModels = useCallback(async () => {
     setModelsLoading(true);
@@ -473,7 +562,69 @@ export default function PipelineBuilderPage() {
     }
   }, []);
 
-  useEffect(() => { fetchModels(); fetchCurrentConfig(); }, [fetchModels, fetchCurrentConfig]);
+  const fetchTemplates = useCallback(async () => {
+    setTemplatesLoading(true);
+    try {
+      const res = await apiClient.get(API.PIPELINE_TEMPLATES.LIST());
+      setTemplates(res.data?.templates ?? []);
+    } catch (e) {
+      console.error("Failed to fetch templates", e);
+    } finally {
+      setTemplatesLoading(false);
+    }
+  }, []);
+
+  const applyTemplate = useCallback(async (templateId: string) => {
+    try {
+      const res = await apiClient.get(API.PIPELINE_TEMPLATES.GET(templateId));
+      const patch = res.data?.config_patch;
+      if (!patch) return;
+      setAdvancedConfig(prev => {
+        const next = structuredClone(prev);
+        if (patch.security?.pii_middleware) {
+          const p = patch.security.pii_middleware;
+          next.pii = {
+            enabled:              p.enabled ?? next.pii.enabled,
+            positions:            p.positions ?? next.pii.positions,
+            action:               p.action ?? next.pii.action,
+            block_on_severity:    p.block_on_severity ?? next.pii.block_on_severity,
+            trust_score_penalty:  p.trust_score_penalty ?? next.pii.trust_score_penalty,
+            audit_log_enabled:    p.audit_log_enabled ?? next.pii.audit_log_enabled,
+          };
+        }
+        if (patch.prompt) {
+          next.prompt = {
+            enabled:            patch.prompt.enabled ?? next.prompt.enabled,
+            prompt_type:        patch.prompt.prompt_type ?? next.prompt.prompt_type,
+            custom_template:    next.prompt.custom_template,
+            max_tokens_warning: patch.prompt.max_tokens_warning ?? next.prompt.max_tokens_warning,
+          };
+        }
+        if (patch.formatter) {
+          next.formatter = {
+            enabled:           patch.formatter.enabled ?? next.formatter.enabled,
+            response_format:   patch.formatter.response_format ?? next.formatter.response_format,
+            min_trust_score:   patch.formatter.min_trust_score ?? next.formatter.min_trust_score,
+            block_on_low_trust: patch.formatter.block_on_low_trust ?? next.formatter.block_on_low_trust,
+          };
+        }
+        if (patch.context_window) {
+          next.context_window = {
+            enabled:                 patch.context_window.enabled ?? next.context_window.enabled,
+            truncation_strategy:     patch.context_window.truncation_strategy ?? next.context_window.truncation_strategy,
+            response_reserve_tokens: patch.context_window.response_reserve_tokens ?? next.context_window.response_reserve_tokens,
+          };
+        }
+        return next;
+      });
+      setTemplateApplied(templateId);
+      setSelectedTemplate(templateId);
+    } catch (e) {
+      console.error("Failed to apply template", e);
+    }
+  }, []);
+
+  useEffect(() => { fetchModels(); fetchCurrentConfig(); fetchTemplates(); }, [fetchModels, fetchCurrentConfig, fetchTemplates]);
 
   /* ── Fetch recommendation preview when model selected ── */
   const fetchPreview = useCallback(async (modelId: string) => {
@@ -557,11 +708,55 @@ export default function PipelineBuilderPage() {
   const applyConfig = useCallback(async () => {
     setApplying(true);
     setApplyResult(null);
+    setAdvancedSaveResult(null);
     try {
+      // 1) Save base .env deltas
       const updates = { ...buildFinalDeltas(), ...buildTenantDeltas() };
       await apiClient.put(API.CONFIG.PUT(), { updates });
+
+      // 2) Save advanced node config via RAG_CONFIG API
+      const advPayload: Record<string, any> = {};
+      advPayload.security = {
+        pii_middleware: {
+          enabled: advancedConfig.pii.enabled,
+          positions: advancedConfig.pii.positions,
+          action: advancedConfig.pii.action,
+          block_on_severity: advancedConfig.pii.block_on_severity,
+          trust_score_penalty: advancedConfig.pii.trust_score_penalty,
+          audit_log_enabled: advancedConfig.pii.audit_log_enabled,
+        },
+      };
+      advPayload.prompt = {
+        enabled: advancedConfig.prompt.enabled,
+        prompt_type: advancedConfig.prompt.prompt_type,
+        max_tokens_warning: advancedConfig.prompt.max_tokens_warning,
+        ...(advancedConfig.prompt.custom_template
+          ? { template: advancedConfig.prompt.custom_template }
+          : {}),
+      };
+      advPayload.formatter = {
+        enabled: advancedConfig.formatter.enabled,
+        response_format: advancedConfig.formatter.response_format,
+        min_trust_score: advancedConfig.formatter.min_trust_score,
+        block_on_low_trust: advancedConfig.formatter.block_on_low_trust,
+      };
+      advPayload.context_window = {
+        enabled: advancedConfig.context_window.enabled,
+        truncation_strategy: advancedConfig.context_window.truncation_strategy,
+        response_reserve_tokens: advancedConfig.context_window.response_reserve_tokens,
+      };
+
+      if (Object.keys(advPayload).length > 0) {
+        try {
+          await apiClient.put(API.RAG_CONFIG.PUT_PIPELINE(clientId), advPayload);
+        } catch (advErr: any) {
+          const advMsg = advErr?.response?.data?.detail ?? advErr?.message ?? "Failed to save advanced config.";
+          setAdvancedSaveResult({ ok: false, msg: advMsg });
+          throw new Error(`Base config saved, but advanced pipeline nodes failed: ${advMsg}`);
+        }
+      }
+
       setApplyResult({ ok: true, msg: "Configuration applied successfully! The pipeline is now updated." });
-      // Refresh current config to reflect changes
       await fetchCurrentConfig();
     } catch (err: any) {
       const msg = err?.response?.data?.detail ?? err?.message ?? "Failed to apply configuration.";
@@ -569,7 +764,7 @@ export default function PipelineBuilderPage() {
     } finally {
       setApplying(false);
     }
-  }, [buildFinalDeltas, buildTenantDeltas, fetchCurrentConfig]);
+  }, [buildFinalDeltas, buildTenantDeltas, fetchCurrentConfig, advancedConfig, clientId]);
 
   /* ── Can advance ── */
   const canAdvance = useMemo(() => {
@@ -577,6 +772,8 @@ export default function PipelineBuilderPage() {
     if (step === 2) return chunkSize > 0 && chunkOverlap >= 0 && !!chunkingStrategy;
     if (step === 3) return !!selectedVectorDB;
     if (step === 4) return !!selectedLLM;
+    if (step === 5) return true; // advanced nodes are optional
+    if (step === 6) return true; // template selection is optional
     return true;
   }, [step, selectedModelId, previewLoading, chunkSize, chunkOverlap, chunkingStrategy, selectedVectorDB, selectedLLM]);
 
@@ -1020,12 +1217,444 @@ export default function PipelineBuilderPage() {
         </div>
       )}
 
-      {/* ─── STEP 5: Review & Apply ─── */}
-      {step === 5 && previewResult && (
+      {/* ─── STEP 5: Advanced Security & Pipeline Nodes ─── */}
+      {step === 5 && (
+        <div className="space-y-4">
+          {/* PII Middleware */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-red-100">
+                  <ShieldCheck className="h-4 w-4 text-red-600" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-800">PII Middleware</h3>
+                  <p className="text-[11px] text-slate-500">Detects and redacts sensitive data before it reaches embedding models or LLMs</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAdvancedConfig(c => ({
+                  ...c, pii: { ...c.pii, enabled: !c.pii.enabled }
+                }))}
+                className={cn(
+                  "relative h-5 w-9 rounded-full cursor-pointer transition-colors duration-200",
+                  advancedConfig.pii.enabled ? "bg-red-500" : "bg-slate-300"
+                )}
+              >
+                <span className={cn(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200",
+                  advancedConfig.pii.enabled ? "translate-x-4" : "translate-x-0.5"
+                )} />
+              </button>
+            </div>
+
+            {advancedConfig.pii.enabled && (
+              <div className="space-y-3 border-t border-slate-100 pt-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">Scan Positions</label>
+                  <div className="flex flex-wrap gap-2">
+                    {["pre_embedding", "pre_llm", "post_llm"].map(pos => (
+                      <button
+                        key={pos}
+                        onClick={() => setAdvancedConfig(c => {
+                          const positions = c.pii.positions.includes(pos)
+                            ? c.pii.positions.filter(p => p !== pos)
+                            : [...c.pii.positions, pos];
+                          return { ...c, pii: { ...c.pii, positions } };
+                        })}
+                        className={cn(
+                          "rounded-lg px-3 py-1.5 text-xs font-medium border transition-colors",
+                          advancedConfig.pii.positions.includes(pos)
+                            ? "border-red-300 bg-red-50 text-red-700"
+                            : "border-slate-200 bg-white text-slate-500 hover:border-red-200"
+                        )}
+                      >
+                        {pos === "pre_embedding" ? "Pre-Embedding" : pos === "pre_llm" ? "Pre-LLM" : "Post-LLM"}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">Action</label>
+                    <select
+                      value={advancedConfig.pii.action}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, pii: { ...c.pii, action: e.target.value } }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none"
+                    >
+                      {["REDACT", "MASK", "HASH", "BLOCK"].map(a => (
+                        <option key={a} value={a}>{a}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">Block on Severity</label>
+                    <select
+                      value={advancedConfig.pii.block_on_severity}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, pii: { ...c.pii, block_on_severity: e.target.value } }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none"
+                    >
+                      {["LOW", "MEDIUM", "HIGH", "CRITICAL"].map(s => (
+                        <option key={s} value={s}>{s}</option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-4">
+                  <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={advancedConfig.pii.audit_log_enabled}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, pii: { ...c.pii, audit_log_enabled: e.target.checked } }))}
+                      className="rounded border-slate-300 accent-red-600"
+                    />
+                    Enable Security Audit Log
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <label className="text-xs text-slate-600">Trust Penalty:</label>
+                    <input
+                      type="number"
+                      step={0.05}
+                      min={0}
+                      max={1}
+                      value={advancedConfig.pii.trust_score_penalty}
+                      onChange={e => setAdvancedConfig(c => ({
+                        ...c, pii: { ...c.pii, trust_score_penalty: parseFloat(e.target.value) || 0 }
+                      }))}
+                      className="w-20 h-7 rounded border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-primary-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                {advancedConfig.pii.positions.length === 0 && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-1.5">
+                    <AlertTriangle className="inline h-3.5 w-3.5 mr-1" />
+                    No scan positions selected — PII detection will not run at any stage.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Prompt Node */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-violet-100">
+                  <FileText className="h-4 w-4 text-violet-600" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-800">Prompt Selection</h3>
+                  <p className="text-[11px] text-slate-500">Controls how retrieved context is assembled into the LLM prompt</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAdvancedConfig(c => ({
+                  ...c, prompt: { ...c.prompt, enabled: !c.prompt.enabled }
+                }))}
+                className={cn(
+                  "relative h-5 w-9 rounded-full cursor-pointer transition-colors duration-200",
+                  advancedConfig.prompt.enabled ? "bg-violet-500" : "bg-slate-300"
+                )}
+              >
+                <span className={cn(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200",
+                  advancedConfig.prompt.enabled ? "translate-x-4" : "translate-x-0.5"
+                )} />
+              </button>
+            </div>
+
+            {advancedConfig.prompt.enabled && (
+              <div className="space-y-3 border-t border-slate-100 pt-3">
+                <div>
+                  <label className="text-xs font-semibold text-slate-600 mb-1 block">Prompt Strategy</label>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                    {[
+                      { value: "rag_context", label: "RAG Context", desc: "Standard grounded Q&A" },
+                      { value: "cot",         label: "Chain of Thought", desc: "Step-by-step reasoning" },
+                      { value: "refine",      label: "Refine",       desc: "Iterative refinement" },
+                      { value: "custom",      label: "Custom",       desc: "Your own template" },
+                    ].map(opt => (
+                      <button
+                        key={opt.value}
+                        onClick={() => setAdvancedConfig(c => ({ ...c, prompt: { ...c.prompt, prompt_type: opt.value } }))}
+                        className={cn(
+                          "rounded-lg border px-3 py-2 text-left transition-all",
+                          advancedConfig.prompt.prompt_type === opt.value
+                            ? "border-violet-400 bg-violet-50 shadow-sm"
+                            : "border-slate-200 bg-white hover:border-violet-200"
+                        )}
+                      >
+                        <span className="text-xs font-semibold text-slate-800">{opt.label}</span>
+                        <p className="text-[10px] text-slate-400 mt-0.5">{opt.desc}</p>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {advancedConfig.prompt.prompt_type === "custom" && (
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">
+                      Custom Template
+                      <span className="ml-1 font-normal text-slate-400">Use {"{{context}}"}, {"{{query}}"} as placeholders</span>
+                    </label>
+                    <textarea
+                      value={advancedConfig.prompt.custom_template}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, prompt: { ...c.prompt, custom_template: e.target.value } }))}
+                      rows={4}
+                      placeholder="You are a helpful assistant. Use the following context:\n\n{{context}}\n\nQuestion: {{query}}"
+                      className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 font-mono focus:border-violet-400 focus:outline-none resize-none"
+                    />
+                  </div>
+                )}
+
+                <div>
+                  <label className="text-xs text-slate-600">Max Token Warning Threshold:</label>
+                  <input
+                    type="number"
+                    value={advancedConfig.prompt.max_tokens_warning}
+                    onChange={e => setAdvancedConfig(c => ({
+                      ...c, prompt: { ...c.prompt, max_tokens_warning: parseInt(e.target.value) || 3000 }
+                    }))}
+                    className="ml-2 w-24 h-7 rounded border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-violet-400 focus:outline-none"
+                  />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Output Formatter & Security Gate */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-emerald-100">
+                  <SlidersHorizontal className="h-4 w-4 text-emerald-600" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-800">Output Formatter & Security Gate</h3>
+                  <p className="text-[11px] text-slate-500">Formats LLM responses and applies trust-based guardrails</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAdvancedConfig(c => ({
+                  ...c, formatter: { ...c.formatter, enabled: !c.formatter.enabled }
+                }))}
+                className={cn(
+                  "relative h-5 w-9 rounded-full cursor-pointer transition-colors duration-200",
+                  advancedConfig.formatter.enabled ? "bg-emerald-500" : "bg-slate-300"
+                )}
+              >
+                <span className={cn(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200",
+                  advancedConfig.formatter.enabled ? "translate-x-4" : "translate-x-0.5"
+                )} />
+              </button>
+            </div>
+
+            {advancedConfig.formatter.enabled && (
+              <div className="space-y-3 border-t border-slate-100 pt-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">Response Format</label>
+                    <select
+                      value={advancedConfig.formatter.response_format}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, formatter: { ...c.formatter, response_format: e.target.value } }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-emerald-400 focus:outline-none"
+                    >
+                      <option value="plain_text">Plain Text</option>
+                      <option value="markdown">Markdown</option>
+                      <option value="json">JSON</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">
+                      Min Trust Score
+                      <span className="ml-1 font-normal text-slate-400">(0–1)</span>
+                    </label>
+                    <input
+                      type="number"
+                      step={0.05}
+                      min={0}
+                      max={1}
+                      value={advancedConfig.formatter.min_trust_score}
+                      onChange={e => setAdvancedConfig(c => ({
+                        ...c, formatter: { ...c.formatter, min_trust_score: parseFloat(e.target.value) || 0 }
+                      }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-emerald-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <label className="flex items-center gap-2 text-xs text-slate-600 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={advancedConfig.formatter.block_on_low_trust}
+                    onChange={e => setAdvancedConfig(c => ({ ...c, formatter: { ...c.formatter, block_on_low_trust: e.target.checked } }))}
+                    className="rounded border-slate-300 accent-emerald-600"
+                  />
+                  Block response when trust score is below minimum
+                </label>
+              </div>
+            )}
+          </div>
+
+          {/* Context Window Manager */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-2">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-blue-100">
+                  <Layers className="h-4 w-4 text-blue-600" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-semibold text-slate-800">Context Window Manager</h3>
+                  <p className="text-[11px] text-slate-500">Controls how chunks are trimmed to fit the LLM context budget</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setAdvancedConfig(c => ({
+                  ...c, context_window: { ...c.context_window, enabled: !c.context_window.enabled }
+                }))}
+                className={cn(
+                  "relative h-5 w-9 rounded-full cursor-pointer transition-colors duration-200",
+                  advancedConfig.context_window.enabled ? "bg-blue-500" : "bg-slate-300"
+                )}
+              >
+                <span className={cn(
+                  "absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-transform duration-200",
+                  advancedConfig.context_window.enabled ? "translate-x-4" : "translate-x-0.5"
+                )} />
+              </button>
+            </div>
+
+            {advancedConfig.context_window.enabled && (
+              <div className="space-y-3 border-t border-slate-100 pt-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">Truncation Strategy</label>
+                    <select
+                      value={advancedConfig.context_window.truncation_strategy}
+                      onChange={e => setAdvancedConfig(c => ({ ...c, context_window: { ...c.context_window, truncation_strategy: e.target.value } }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+                    >
+                      <option value="least_relevant">Least Relevant First</option>
+                      <option value="oldest">Oldest First</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-600 mb-1 block">Response Reserve Tokens</label>
+                    <input
+                      type="number"
+                      step={128}
+                      min={256}
+                      max={8192}
+                      value={advancedConfig.context_window.response_reserve_tokens}
+                      onChange={e => setAdvancedConfig(c => ({
+                        ...c, context_window: { ...c.context_window, response_reserve_tokens: parseInt(e.target.value) || 1024 }
+                      }))}
+                      className="w-full h-8 rounded-lg border border-slate-200 bg-slate-50 px-2 text-xs text-slate-700 focus:border-blue-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Security info banner */}
+          <div className="rounded-xl border border-blue-200 bg-blue-50 p-4">
+            <p className="text-xs text-blue-800">
+              <Info className="inline h-3.5 w-3.5 mr-1" />
+              All settings on this page are <strong>optional</strong> and will be saved as part of your pipeline configuration.
+              The <strong>Secure RAG</strong> template in the next step provides recommended defaults for production use.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* ─── STEP 6: Pipeline Template Gallery ─── */}
+      {step === 6 && (
         <div className="space-y-4">
           <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
             <h2 className="text-base font-semibold text-slate-800 mb-1">
-              Step 5 — Review & Apply
+              Step 6 — Pipeline Template Gallery
+            </h2>
+            <p className="text-sm text-slate-500 mb-4">
+              Start from a pre-built template to quickly configure your pipeline. Applying a template will update the advanced node settings from the previous step.
+            </p>
+
+            {templatesLoading ? (
+              <div className="flex items-center justify-center py-10 text-slate-400">
+                <Loader2 className="h-5 w-5 animate-spin mr-2" /> Loading templates...
+              </div>
+            ) : templates.length === 0 ? (
+              <p className="py-6 text-center text-sm text-slate-400">No templates available.</p>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {templates.map(t => (
+                  <button
+                    key={t.template_id}
+                    onClick={() => applyTemplate(t.template_id)}
+                    className={cn(
+                      "rounded-xl border-2 p-4 text-left transition-all duration-200 relative",
+                      selectedTemplate === t.template_id
+                        ? "border-primary-500 bg-primary-50/50 shadow-md"
+                        : "border-slate-200 bg-white hover:border-primary-200 hover:shadow-sm"
+                    )}
+                  >
+                    <div className="flex items-start justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        <LayoutTemplate className={cn(
+                          "h-5 w-5",
+                          t.recommended_default ? "text-amber-500" : "text-slate-400"
+                        )} />
+                        <span className="text-sm font-semibold text-slate-800">{t.name}</span>
+                      </div>
+                      <div className="flex gap-1">
+                        {t.recommended_default && (
+                          <span className="rounded-full bg-amber-400 px-2 py-0.5 text-[9px] font-bold text-white uppercase tracking-wide flex items-center gap-0.5">
+                            <Sparkles className="h-2.5 w-2.5" /> Recommended
+                          </span>
+                        )}
+                        {t.pii_enabled && (
+                          <span className="rounded-full bg-red-100 px-2 py-0.5 text-[9px] font-bold text-red-700 uppercase tracking-wide">
+                            PII
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <p className="text-xs text-slate-500 mb-2">{t.description}</p>
+                    <div className="flex flex-wrap gap-1">
+                      {t.tags.map(tag => (
+                        <span key={tag} className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-500">{tag}</span>
+                      ))}
+                    </div>
+                    {selectedTemplate === t.template_id && (
+                      <div className="absolute top-3 right-3">
+                        <CheckCircle2 className="h-5 w-5 text-primary-600" />
+                      </div>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {templateApplied && (
+              <div className="mt-4 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs text-emerald-800">
+                <CheckCheck className="h-4 w-4 flex-shrink-0" />
+                Template <strong>{templateApplied}</strong> applied — advanced node settings have been updated. You can still customize them by going back to Step 5.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ─── STEP 7: Review & Apply ─── */}
+      {step === 7 && previewResult && (
+        <div className="space-y-4">
+          <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+            <h2 className="text-base font-semibold text-slate-800 mb-1">
+              Step 7 — Review & Apply
             </h2>
             <p className="text-sm text-slate-500 mb-4">
               Review the changes below before applying. Only the settings shown here will be updated — all other values remain unchanged.
@@ -1111,6 +1740,39 @@ export default function PipelineBuilderPage() {
               );
             })()}
 
+            {/* Advanced node summary */}
+            <div className="mt-5 border-t border-slate-100 pt-4">
+              <div className="flex items-center gap-2 mb-3">
+                <SlidersHorizontal className="h-4 w-4 text-slate-500" />
+                <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Advanced Pipeline Nodes</p>
+              </div>
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {[
+                  { label: "PII Middleware", enabled: advancedConfig.pii.enabled, on: "border-red-200 bg-red-50 text-red-800" },
+                  { label: "Prompt Node", enabled: advancedConfig.prompt.enabled, on: "border-violet-200 bg-violet-50 text-violet-800" },
+                  { label: "Output Formatter", enabled: advancedConfig.formatter.enabled, on: "border-emerald-200 bg-emerald-50 text-emerald-800" },
+                  { label: "Context Window", enabled: advancedConfig.context_window.enabled, on: "border-blue-200 bg-blue-50 text-blue-800" },
+                ].map(node => (
+                  <div
+                    key={node.label}
+                    className={cn(
+                      "rounded-lg border px-3 py-2 text-xs",
+                      node.enabled ? node.on : "border-slate-200 bg-slate-50 text-slate-400"
+                    )}
+                  >
+                    <span className="font-semibold">{node.label}</span>
+                    <br />
+                    {node.enabled ? "Enabled" : "Disabled"}
+                  </div>
+                ))}
+              </div>
+              {templateApplied && (
+                <p className="mt-2 text-[11px] text-slate-400">
+                  Based on template: <strong>{templateApplied}</strong>
+                </p>
+              )}
+            </div>
+
             {/* Apply result */}
             {applyResult && (
               <div className={cn(
@@ -1123,6 +1785,12 @@ export default function PipelineBuilderPage() {
                   ? <CheckCheck className="h-4 w-4 mt-0.5 flex-shrink-0" />
                   : <XCircle className="h-4 w-4 mt-0.5 flex-shrink-0" />}
                 {applyResult.msg}
+              </div>
+            )}
+            {advancedSaveResult && !advancedSaveResult.ok && (
+              <div className="mt-2 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                Advanced config save issue: {advancedSaveResult.msg}
               </div>
             )}
           </div>
@@ -1141,9 +1809,9 @@ export default function PipelineBuilderPage() {
 
         <span className="text-xs text-slate-400">{step} / {STEPS.length}</span>
 
-        {step < 5 ? (
+        {step < STEPS.length ? (
           <button
-            onClick={() => setStep(s => Math.min(5, s + 1))}
+            onClick={() => setStep(s => Math.min(STEPS.length, s + 1))}
             disabled={!canAdvance}
             className="flex items-center gap-1.5 rounded-lg bg-primary-600 px-5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-primary-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >

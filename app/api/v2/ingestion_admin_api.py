@@ -17,6 +17,7 @@ from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 # ✅ PERMANENT FIX: removed get_embedder, get_chroma_collection
 # Use _get_pipeline() directly — works with ANY backend (Chroma, Qdrant, Milvus...)
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2, _get_pipeline
+from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 from app.llm.llm_client import run_llm_normalization
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
@@ -141,7 +142,7 @@ async def retry_ingestion(
     user=Depends(require_role("admin")),
 ):
     """Re-runs full ingestion for the file. Role: admin only."""
-    await IngestionServiceV2.process_file(file_id)
+    await IngestionOrchestrator().ingest_file(file_id=file_id)
     return {"status": "retry_started", "file_id": file_id}
 
 # ===========================================================

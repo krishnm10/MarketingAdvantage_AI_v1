@@ -1,0 +1,30 @@
+{
+  "template_id": "advanced_rag_reranking",
+  "name": "Advanced RAG with Reranking",
+  "description": "RAG with hybrid search and cross-encoder reranking for higher precision.",
+  "tags": ["advanced", "rag", "reranking"],
+  "pii_enabled": false,
+  "recommended_default": false,
+  "version": "1.0",
+  "created_by": "system",
+  "config_patch": {
+    "retrieval": {
+      "search_mode": "hybrid",
+      "top_k_retrieval": 20,
+      "top_k_final": 5,
+      "hybrid_alpha": 0.7,
+      "enable_hyde": false,
+      "enable_multi_query": false,
+      "fusion_method": "rrf"
+    },
+    "reranker": {
+      "type": "crossencoder",
+      "model": "cross-encoder/ms-marco-MiniLM-L-12-v2",
+      "top_k": 5,
+      "device": "cpu"
+    },
+    "security": {
+      "pii_middleware": { "enabled": false }
+    }
+  }
+}

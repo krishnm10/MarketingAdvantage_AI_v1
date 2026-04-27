@@ -94,14 +94,14 @@ class InjectableIngestionService:
           1. Resolve pipeline once for this file (stable for full duration)
           2. Parse → chunk → PII-scan chunks → quality-filter → dedup → embed → store
         """
-        from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
+        from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 
         _ing_log.info("Injectable process_file starting", file_id=file_id, stage="start")
         async with timed_stage("full_pipeline", file_id=file_id):
-            await IngestionServiceV2.process_file(
+            await IngestionOrchestrator().ingest_file(
                 file_id=file_id,
+                client_id=business_id,
                 file_path=file_path,
-                business_id=business_id,
             )
         _ing_log.info("Injectable process_file complete", file_id=file_id, stage="complete")
 

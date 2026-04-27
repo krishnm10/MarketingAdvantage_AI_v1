@@ -102,6 +102,12 @@ class RAGResult:
     latency:           Dict[str, float]
     metadata:          Dict[str, Any]
 
+    # Phase 1 extensions — backward-compatible optional fields
+    pii_redacted:        bool = False
+    pii_entities_found:  List[str] = field(default_factory=list)
+    chunks_used:         int = 0
+    formatter_applied:   bool = False
+
     def __str__(self) -> str:
         return self.final_answer or "[No LLM configured — retrieval-only mode]"
 
@@ -112,11 +118,12 @@ class RAGResult:
             if self.trust_score is not None
             else "N/A"
         )
+        pii_str = " | pii=redacted" if self.pii_redacted else ""
         return (
             f"RAGResult | query={self.query[:60]!r} | "
             f"chunks={len(self.context_chunks)} | "
             f"reranked={self.reranked} | "
-            f"trust={trust_str} | "
+            f"trust={trust_str}{pii_str} | "
             f"total_ms={self.latency.get('total_ms', 0):.0f}"
         )
 
@@ -153,12 +160,14 @@ class RAGPipeline:
         llm:       Optional[Union[BaseLLM, LLMChain]] = None,
         reranker:  Optional[BaseReranker] = None,
         config:    ClientConfig,
+        nodes:     Optional[Any] = None,
     ):
         self.vectordb  = vectordb
         self.embedder  = embedder
         self.llm       = llm
         self.reranker  = reranker
         self.config    = config
+        self.nodes     = nodes
 
         # Determine component names for observability
         self._vectordb_kind  = vectordb.kind
@@ -183,12 +192,11 @@ class RAGPipeline:
             self._reranker_model,
         )
 
-        # Startup check: warn if trust scoring is enabled but calculator
-        # is missing — prevents silent fallback going unnoticed.
+        # Startup check: warn if trust scoring is enabled but the real
+        # calculator is missing — prevents silent fallback going unnoticed.
         if config.retrieval.enable_trust_scoring:
-            try:
-                from app.services.retrieval.trust_calculator import TrustCalculator  # noqa: F401
-            except ImportError:
+            from app.core.trust_adapter import _TRUST_CALCULATOR_AVAILABLE
+            if not _TRUST_CALCULATOR_AVAILABLE:
                 logger.warning(
                     "[RAGPipeline] client=%s: enable_trust_scoring=True but "
                     "trust_calculator module is not importable. Trust scores "
@@ -254,6 +262,41 @@ class RAGPipeline:
             self._reranker_model,
             self._llm_name,
         )
+
+        # ── SECURITY: Pre-embedding PII scan ────────────────────────
+        pii_redacted = False
+        pii_entities_found: List[str] = []
+        latency["pii_ms"] = 0.0
+
+        if self.nodes and getattr(self.nodes, 'pii_middleware', None):
+            pii_mw = self.nodes.pii_middleware
+            if "pre_embedding" in getattr(pii_mw, '_positions', []):
+                t0_pii = time.perf_counter()
+                try:
+                    scan_result = pii_mw.scan_text(user_query, position="pre_embedding")
+                    if getattr(scan_result, "blocked", False):
+                        latency["pii_ms"] = round((time.perf_counter() - t0_pii) * 1000, 2)
+                        latency["total_ms"] = latency["pii_ms"]
+                        return RAGResult(
+                            query=user_query,
+                            final_answer="[BLOCKED] Input blocked by security policy.",
+                            retrieved_chunks=[],
+                            reranked_chunks=None,
+                            context_chunks=[],
+                            reranked=False,
+                            trust_score=0.0,
+                            latency=latency,
+                            metadata={"client_id": self.config.client_id, "blocked_by": "pii_middleware"},
+                            pii_redacted=True,
+                            pii_entities_found=getattr(scan_result, "entities_found", []),
+                        )
+                    if getattr(scan_result, "entities_found", []):
+                        pii_redacted = True
+                        pii_entities_found.extend(scan_result.entities_found)
+                        user_query = getattr(scan_result, "redacted_text", user_query)
+                except Exception as e:
+                    logger.warning("[RAGPipeline] Pre-embedding PII scan failed: %s", e)
+                latency["pii_ms"] = round((time.perf_counter() - t0_pii) * 1000, 2)
 
         # ─────────────────────────────────────────────────────────────
         # STEP 1 — Embed the query (with optional HyDE expansion)
@@ -425,6 +468,43 @@ class RAGPipeline:
 
         context_str = self._build_context(context_chunks)
 
+        # ── SECURITY: Pre-LLM PII scan on context ──────────────────
+        if self.nodes and getattr(self.nodes, 'pii_middleware', None):
+            pii_mw = self.nodes.pii_middleware
+            if "pre_llm" in getattr(pii_mw, '_positions', []):
+                t0_pii = time.perf_counter()
+                try:
+                    ctx_scan = pii_mw.scan_text(context_str, position="pre_llm")
+                    if getattr(ctx_scan, "entities_found", []):
+                        pii_redacted = True
+                        pii_entities_found.extend(ctx_scan.entities_found)
+                        context_str = getattr(ctx_scan, "redacted_text", context_str)
+                except Exception as e:
+                    logger.warning("[RAGPipeline] Pre-LLM PII scan failed: %s", e)
+                latency["pii_ms"] = latency.get("pii_ms", 0.0) + round((time.perf_counter() - t0_pii) * 1000, 2)
+
+        # ── Prompt Node rendering ───────────────────────────────────
+        if self.nodes and getattr(self.nodes, 'prompt_node', None):
+            t0_prompt = time.perf_counter()
+            try:
+                prompt_result = self.nodes.prompt_node.render(
+                    query=user_query,
+                    context=context_str,
+                    system_prompt=(
+                        system_prompt or (
+                            self.config.llm.single.system_prompt
+                            if self.config.llm and self.config.llm.single
+                            else None
+                        )
+                    ),
+                )
+                if prompt_result.get("rendered_prompt"):
+                    context_str = prompt_result["rendered_prompt"]
+                    latency["prompt_ms"] = round((time.perf_counter() - t0_prompt) * 1000, 2)
+            except Exception as e:
+                logger.warning("[RAGPipeline] Prompt node failed, using default: %s", e)
+                latency["prompt_ms"] = round((time.perf_counter() - t0_prompt) * 1000, 2)
+
         # ─────────────────────────────────────────────────────────────
         # STEP 5 — LLM generation (optional)
         # Uses single LLM OR LLMChain — both work identically here
@@ -500,7 +580,7 @@ class RAGPipeline:
 
         if self.config.retrieval.enable_trust_scoring and context_chunks:
             t0 = time.perf_counter()
-            trust_score = self._calculate_trust(context_chunks)
+            trust_score = self._calculate_trust(context_chunks, pii_redacted=pii_redacted)
             latency["trust_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
         # ─────────────────────────────────────────────────────────────
@@ -533,6 +613,9 @@ class RAGPipeline:
                 "k_final":        k_final,
                 "filters_applied": effective_filters is not None,
             },
+            pii_redacted=pii_redacted,
+            pii_entities_found=list(set(pii_entities_found)),
+            chunks_used=len(context_chunks),
         )
 
         logger.info("[RAGPipeline] %s", result.summary())
@@ -629,30 +712,24 @@ class RAGPipeline:
         # Fall back to raw query if response is trivially short
         return text if len(text) > 20 else None
 
-    def _calculate_trust(self, chunks: List[Dict[str, Any]]) -> float:
+    def _calculate_trust(self, chunks: List[Dict[str, Any]], pii_redacted: bool = False) -> float:
         """
         Calculate trust/confidence score from context chunks.
 
-        Uses existing trust_calculator.py if available,
-        falls back to a simple average score calculation.
+        Delegates to TrustAdapter which bridges to the real
+        trust_calculator at app.retrieval.trust_calculator, falling
+        back to average-similarity scoring when unavailable.
         """
-        try:
-            from app.services.retrieval.trust_calculator import TrustCalculator
-            calculator = TrustCalculator()
-            return calculator.calculate(chunks)
-        except ImportError:
-            logger.warning(
-                "[RAGPipeline] trust_calculator not importable — using "
-                "fallback average-score trust. Install or fix the module "
-                "to get proper trust scoring."
-            )
-            return self._fallback_trust(chunks)
-        except Exception as e:
-            logger.warning(
-                "[RAGPipeline] TrustCalculator.calculate() raised %s — "
-                "using fallback average-score trust.", e,
-            )
-            return self._fallback_trust(chunks)
+        from app.core.trust_adapter import TrustAdapter
+        score = TrustAdapter().calculate(chunks)
+
+        if pii_redacted:
+            pii_penalty = 0.15
+            if self.nodes and getattr(self.nodes, 'pii_middleware', None):
+                pii_penalty = getattr(self.nodes.pii_middleware, '_trust_score_penalty', 0.15)
+            score = max(0.0, score - pii_penalty)
+
+        return score
 
     @staticmethod
     def _fallback_trust(chunks: List[Dict[str, Any]]) -> float:

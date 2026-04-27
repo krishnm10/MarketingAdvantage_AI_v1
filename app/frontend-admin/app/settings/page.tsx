@@ -42,6 +42,7 @@ import {
   ArrowRight,
   User,
   Sparkles,
+  Lock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
@@ -893,17 +894,20 @@ interface AlignmentData {
   overall_score: number | null;
   ingestion_ready: boolean | null;
   readiness_label: string | null;
+  // Phase 3 — PII middleware alignment
+  pii_middleware_status?: "aligned" | "partial" | "disabled" | "error" | null;
 }
 
 /* ── Icon mapping per component ── */
 const COMPONENT_ICON_MAP: Record<string, React.ElementType> = {
-  embedder:  Cpu,
-  tokenizer: Hash,
-  chunking:  Scissors,
-  vectordb:  Database,
-  reranker:  Filter,
-  llm:       Brain,
-  config:    Shield,
+  embedder:       Cpu,
+  tokenizer:      Hash,
+  chunking:       Scissors,
+  vectordb:       Database,
+  reranker:       Filter,
+  llm:            Brain,
+  config:         Shield,
+  pii_middleware:  Lock,
 };
 
 /* ── Readiness Arc Gauge (SVG, 270-degree sweep) ── */
@@ -1113,6 +1117,50 @@ function EmbeddingAlignmentCard({
                 ))}
               </div>
             </div>
+
+            {/* ── PII Middleware Status Banner ──────────────── */}
+            {data.pii_middleware_status && data.pii_middleware_status !== "disabled" && (
+              <div className={cn(
+                "rounded-lg border px-4 py-3 flex items-center gap-3",
+                data.pii_middleware_status === "aligned"
+                  ? "border-emerald-200 bg-emerald-50"
+                  : data.pii_middleware_status === "partial"
+                    ? "border-amber-200 bg-amber-50"
+                    : "border-red-200 bg-red-50"
+              )}>
+                <Lock className={cn(
+                  "h-4 w-4 flex-shrink-0",
+                  data.pii_middleware_status === "aligned" ? "text-emerald-600"
+                    : data.pii_middleware_status === "partial" ? "text-amber-500"
+                    : "text-red-500"
+                )} />
+                <div className="flex-1 min-w-0">
+                  <p className={cn(
+                    "text-xs font-semibold",
+                    data.pii_middleware_status === "aligned" ? "text-emerald-800"
+                      : data.pii_middleware_status === "partial" ? "text-amber-800"
+                      : "text-red-800"
+                  )}>
+                    PII Middleware:{" "}
+                    {data.pii_middleware_status === "aligned" ? "Active & Aligned"
+                      : data.pii_middleware_status === "partial" ? "Partially Configured"
+                      : "Error — Check Configuration"}
+                  </p>
+                  <p className={cn(
+                    "text-xs",
+                    data.pii_middleware_status === "aligned" ? "text-emerald-700"
+                      : data.pii_middleware_status === "partial" ? "text-amber-700"
+                      : "text-red-700"
+                  )}>
+                    {data.pii_middleware_status === "aligned"
+                      ? "PII detection and redaction is active at pre-embedding, pre-LLM, and post-LLM stages."
+                      : data.pii_middleware_status === "partial"
+                        ? "PII middleware is enabled but not configured for all pipeline positions."
+                        : "PII middleware encountered an error. Review your security configuration."}
+                  </p>
+                </div>
+              </div>
+            )}
 
             {/* ── Row 2: Safe chunk size recommendation ──────────────── */}
             {data.safe_chunk_size != null && (

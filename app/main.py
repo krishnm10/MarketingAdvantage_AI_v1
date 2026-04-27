@@ -667,6 +667,13 @@ app.include_router(
     tags=["RAG Evaluation"],
 )
 
+# ── Phase 3 — Pipeline Template Gallery ────────────────────────────────────
+try:
+    from app.api.v2.pipeline_template_api import router as pipeline_template_router
+    app.include_router(pipeline_template_router, tags=["Pipeline Templates"])
+except ImportError:
+    logger.warning("[Router] pipeline_template_api not available — skipping")
+
 
 # =============================================================================
 # ROOT ENDPOINT (preserved + enhanced)

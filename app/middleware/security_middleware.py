@@ -28,18 +28,77 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PII PATTERNS — India-first with international fallback
+#
+# Two tiers:
+#   _PII_PATTERNS        → regex-only, redact on match (low false-positive risk)
+#   _VALIDATED_PII       → regex candidates that MUST pass a validator before
+#                           redaction (credit_card → Luhn, iban → checksum)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _PII_PATTERNS: Dict[str, re.Pattern] = {
     # Indian identifiers
-    "aadhaar":     re.compile(r"\b\d{4}\s\d{4}\s\d{4}\b"),
+    "aadhaar":     re.compile(r"\b\d{4}[- ]?\d{4}[- ]?\d{4}\b"),
     "pan":         re.compile(r"\b[A-Z]{5}[0-9]{4}[A-Z]\b"),
-    "phone_in":    re.compile(r"\b[6-9]\d{9}\b"),
+    "phone_in":    re.compile(r"\b(?:\+91[- ]?|0)?[6-9]\d{9}\b"),
+    "ifsc":        re.compile(r"\b[A-Z]{4}0[A-Z0-9]{6}\b"),
+    "passport_in": re.compile(r"\b[A-Z][0-9]{7}\b"),
     # International
     "email":       re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b"),
     "ssn_us":      re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
-    "credit_card": re.compile(r"\b(?:\d[ -]?){13,19}\b"),
     "ipv4":        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+}
+
+# High-risk patterns: regex finds candidates, validator confirms before redaction.
+_VALIDATED_PII: Dict[str, re.Pattern] = {
+    "credit_card": re.compile(r"\b(?:\d[ -]?){13,19}\b"),
+    "iban":        re.compile(r"\b[A-Z]{2}\d{2}[ ]?[\dA-Z]{4}(?:[ ]?[\dA-Z]{4}){1,7}(?:[ ]?[\dA-Z]{1,4})?\b"),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Validators — only invoked on regex-matched candidates to cut false positives
+# ─────────────────────────────────────────────────────────────────────────────
+
+def is_valid_credit_card(number: str) -> bool:
+    """Validate a credit card candidate using the Luhn algorithm."""
+    digits = [int(d) for d in number if d.isdigit()]
+    if len(digits) < 13 or len(digits) > 19:
+        return False
+    checksum = 0
+    for i, d in enumerate(reversed(digits)):
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+    return checksum % 10 == 0
+
+
+def is_valid_iban(value: str) -> bool:
+    """Validate an IBAN candidate using the ISO 13616 mod-97 checksum."""
+    compact = value.replace(" ", "").replace("-", "").upper()
+    if len(compact) < 15 or len(compact) > 34:
+        return False
+    if not compact[:2].isalpha() or not compact[2:4].isdigit():
+        return False
+    rearranged = compact[4:] + compact[:4]
+    numeric = ""
+    for ch in rearranged:
+        if ch.isdigit():
+            numeric += ch
+        elif ch.isalpha():
+            numeric += str(ord(ch) - ord("A") + 10)
+        else:
+            return False
+    try:
+        return int(numeric) % 97 == 1
+    except (ValueError, OverflowError):
+        return False
+
+
+_PII_VALIDATORS: Dict[str, Any] = {
+    "credit_card": is_valid_credit_card,
+    "iban":        is_valid_iban,
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -89,16 +148,42 @@ def redact_pii(text: str) -> Tuple[str, List[str]]:
     """
     Scan and redact all known PII patterns.
 
+    Two-tier approach:
+      1. Simple patterns (_PII_PATTERNS) → redact every regex match.
+      2. Validated patterns (_VALIDATED_PII) → regex finds candidates,
+         validator confirms, only confirmed matches are redacted.
+         This eliminates false positives for high-ambiguity formats
+         like credit card numbers and IBANs.
+
     Returns:
         (redacted_text, list_of_pii_type_names_found)
-
-    Design: always returns the redacted text even on partial matches —
-    caller decides whether to reject or continue with redacted copy.
     """
     if not text or len(text) < _PII_MIN_LENGTH_TO_SCAN:
         return text, []
 
     found: List[str] = []
+
+    # Tier 1 (FIRST): validated patterns — must run before simple patterns
+    # so that e.g. a valid credit card is redacted before the Aadhaar regex
+    # can false-match on its 12-digit substring.
+    for pii_type, pattern in _VALIDATED_PII.items():
+        validator = _PII_VALIDATORS.get(pii_type)
+
+        def _make_replacer(
+            _pii_type: str, _validator: Any, _found: List[str],
+        ):
+            def _replacer(m: re.Match) -> str:
+                raw = m.group(0)
+                if _validator is None or _validator(raw):
+                    if _pii_type not in _found:
+                        _found.append(_pii_type)
+                    return f"[{_pii_type.upper()}_REDACTED]"
+                return raw
+            return _replacer
+
+        text = pattern.sub(_make_replacer(pii_type, validator, found), text)
+
+    # Tier 2: simple regex patterns (low false-positive risk)
     for pii_type, pattern in _PII_PATTERNS.items():
         if pattern.search(text):
             found.append(pii_type)

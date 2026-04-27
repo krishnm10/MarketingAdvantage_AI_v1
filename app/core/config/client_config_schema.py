@@ -67,6 +67,10 @@ class LLMType(str, Enum):
     GROQ      = "groq"
     ANTHROPIC = "anthropic"
     GEMINI    = "gemini"
+    MISTRAL   = "mistral"
+    AZURE_OPENAI = "azure_openai"
+    HUGGINGFACE = "huggingface"
+    CUSTOM    = "custom"
 
 
 class RerankerType(str, Enum):
@@ -489,6 +493,12 @@ class RetrievalConfig(BaseModel):
         ),
     )
 
+    # ── Fusion method for hybrid search ────────────────────────────────────────
+    fusion_method: str = Field(
+        "rrf",
+        description="Fusion method for hybrid search: rrf | weighted_sum",
+    )
+
     # ── Prompt template ───────────────────────────────────────────────────────
     prompt_template_id:   Optional[str]          = Field(
         None,
@@ -593,6 +603,89 @@ class FeatureFlags(BaseModel):
     max_concurrent_ingestions:  int  = Field(
         5, description="Max parallel ingestion tasks for this client."
     )
+    enable_bundle_validation:  bool = Field(False, description="Enforce Phase 1 embedder bundle validation.")
+    enable_pii_middleware:     bool = Field(False, description="Enable PII middleware pipeline integration.")
+    enable_advanced_nodes:     bool = Field(False, description="Enable advanced pipeline node configuration.")
+
+
+# ══════════════════════════════════════════════════════════════
+# SECTION 9 — ADVANCED PIPELINE NODE CONFIGS
+# ══════════════════════════════════════════════════════════════
+
+class PIIRegexPattern(BaseModel):
+    """Custom PII regex pattern definition."""
+    name: str = Field(..., description="Pattern identifier, e.g. 'employee_id'")
+    pattern: str = Field(..., description="Regex pattern string")
+    severity: str = Field("MEDIUM", description="LOW | MEDIUM | HIGH | CRITICAL")
+
+
+class PIIMiddlewareConfig(BaseModel):
+    """PII middleware node configuration."""
+    enabled: bool = Field(False, description="Enable PII middleware in the pipeline")
+    positions: List[str] = Field(
+        default_factory=lambda: ["pre_embedding", "pre_llm"],
+        description="Pipeline positions: pre_embedding, pre_llm, post_llm",
+    )
+    strategies: List[str] = Field(
+        default_factory=lambda: ["regex"],
+        description="Detection strategies: regex, presidio, spacy, huggingface",
+    )
+    action: str = Field("REDACT", description="REDACT | MASK | TOKENIZE | HASH | BLOCK")
+    block_on_severity: str = Field("CRITICAL", description="Block pipeline if severity >= this")
+    trust_score_penalty: float = Field(0.15, ge=0.0, le=1.0)
+    custom_patterns: List[PIIRegexPattern] = Field(default_factory=list)
+    audit_log_enabled: bool = True
+
+
+class SecurityConfig(BaseModel):
+    """Security configuration for the pipeline."""
+    pii_middleware: PIIMiddlewareConfig = Field(default_factory=PIIMiddlewareConfig)
+    data_sensitivity: str = Field(
+        "medium",
+        description=(
+            "Data sensitivity tier for this client. Controls embedding policy: "
+            "'high' = local embedders only (no data leaves service boundary), "
+            "'medium' = PII sanitized before cloud embedders (default), "
+            "'low' = no restrictions."
+        ),
+        pattern="^(high|medium|low)$",
+    )
+
+
+class PromptNodeConfig(BaseModel):
+    """Prompt selection node configuration."""
+    enabled: bool = Field(False, description="Enable custom prompt node")
+    prompt_type: str = Field(
+        "rag_context",
+        description="rag_context | system | few_shot | cot | instruction_tuned | custom",
+    )
+    template: Optional[str] = Field(None, description="Prompt template with {placeholders}")
+    template_id: Optional[str] = Field(None, description="Saved template ID from library")
+    variable_map: Dict[str, str] = Field(
+        default_factory=lambda: {"context": "retriever.output", "query": "user.input"},
+    )
+    max_tokens_warning: int = Field(3000, description="Warn when prompt exceeds this token count")
+
+
+class OutputFormatterConfig(BaseModel):
+    """Output formatter and security gate configuration."""
+    enabled: bool = Field(False, description="Enable output formatting node")
+    response_format: str = Field("plain_text", description="plain_text | markdown | json | structured_fields")
+    json_schema: Optional[Dict[str, Any]] = None
+    strip_boilerplate: bool = False
+    min_trust_score: float = Field(0.0, ge=0.0, le=1.0, description="Block output below this trust score")
+    block_on_low_trust: bool = False
+    toxicity_filter: str = Field("disabled", description="rule_based | detoxify | disabled")
+
+
+class ContextWindowConfig(BaseModel):
+    """Context window manager configuration."""
+    enabled: bool = Field(False, description="Enable context window management")
+    truncation_strategy: str = Field("oldest", description="oldest | least_relevant | summarize_history")
+    response_reserve_tokens: int = Field(1024, gt=0)
+    memory_mode: str = Field("none", description="none | buffer | summary | vector")
+    buffer_turns: int = Field(5, ge=1)
+    summary_max_tokens: int = Field(512, gt=0)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -633,6 +726,12 @@ class ClientConfig(BaseModel):
     ingestion:  IngestionConfig = Field(default_factory=IngestionConfig)
     parsers:    ParserConfig    = Field(default_factory=ParserConfig)
     features:   FeatureFlags    = Field(default_factory=FeatureFlags)
+
+    # ── Advanced pipeline nodes (OPTIONAL, Phase 1+) ────────────
+    security:    SecurityConfig       = Field(default_factory=SecurityConfig)
+    prompt:      PromptNodeConfig     = Field(default_factory=PromptNodeConfig)
+    formatter:   OutputFormatterConfig = Field(default_factory=OutputFormatterConfig)
+    context_window: ContextWindowConfig = Field(default_factory=ContextWindowConfig)
 
     # ── Loaders ─────────────────────────────────────────────
 

@@ -47,13 +47,18 @@ from app.services.ingestion.deduplication_engine_v2 import (
     register_unique_chunks_in_gci,   # ← NEW: post-dedup GCI commit
 )
 from app.utils.text_cleaner_v2 import clean_text
-from app.utils.logger import log_info, log_warning
+from app.utils.logger import log_info, log_warning, log_error
 from app.core.chunking_stratagies.text_preprocessor import preprocess_document_text
 from app.middleware.security_middleware import validate_business_id as _validate_business_id
 from app.utils.instrumentation import timed_stage, IngestionLogger
 from app.utils.cost_tracker import record_tokens
+from app.utils.pipeline_logger import PipelineLogger
 
 _ing_logger = IngestionLogger(__name__)
+
+STRICT_INGESTION_SECURITY: bool = os.getenv(
+    "STRICT_INGESTION_SECURITY", "false"
+).lower() in ("true", "1", "yes")
 
 # ── Pluggable pipeline factory ────────────────────────────────────────
 from app.core.pipeline_factory import pipeline_factory
@@ -1490,7 +1495,28 @@ class IngestionServiceV2:
         file_id: str,
         file_path: Optional[str] = None,
         business_id: Optional[str] = None,
+        *,
+        pre_embed_hook: Optional[Any] = None,
     ):
+        if pre_embed_hook is None:
+            log_error(
+                "[SECURITY][CRITICAL] pre_embed_hook missing in process_file — "
+                "unsafe ingestion path. PII may reach embedders unsanitized. "
+                "Use IngestionOrchestrator.",
+                file_id=file_id, stage="pre_embedding",
+            )
+            if STRICT_INGESTION_SECURITY:
+                raise RuntimeError(
+                    f"STRICT_INGESTION_SECURITY: pre_embed_hook is required for "
+                    f"process_file (file_id={file_id}). Route through IngestionOrchestrator."
+                )
+        _plog = PipelineLogger(
+            request_path="ingestion",
+            client_id=business_id,
+            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
+            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+        )
+        _plog.info("Starting file ingestion", file_id=file_id)
         async with async_session() as db:
             try:
                 log_info(f"[IngestionV2] Starting ingestion for {file_id}")
@@ -1571,10 +1597,19 @@ class IngestionServiceV2:
                     log_info(f"[IngestionV2] Parsing failed for {file_id}")
                     return
 
-                await IngestionServiceV2._run_pipeline(db, file_record, parsed)
+                await IngestionServiceV2._run_pipeline(
+                    db, file_record, parsed,
+                    pre_embed_hook=pre_embed_hook,
+                )
                 log_info(f"[IngestionV2] ✅ Completed ingestion for {file_id}")
+                _plog.info("File ingestion completed", file_id=file_id)
 
             except Exception as original_error:
+                _plog.error(
+                    "File ingestion failed",
+                    file_id=file_id,
+                    error=str(original_error)[:300],
+                )
                 _ing_logger.error(
                     "Ingestion failed",
                     file_id=str(file_id),
@@ -1597,8 +1632,29 @@ class IngestionServiceV2:
     # ----------------------------------------------------------
     @staticmethod
     async def ingest_parsed_output(
-        file_id: str, parsed_output: Dict[str, Any]
+        file_id: str,
+        parsed_output: Dict[str, Any],
+        *,
+        pre_embed_hook: Optional[Any] = None,
     ):
+        if pre_embed_hook is None:
+            log_error(
+                "[SECURITY][CRITICAL] pre_embed_hook missing in ingest_parsed_output — "
+                "unsafe ingestion path. PII may reach embedders unsanitized. "
+                "Use IngestionOrchestrator.",
+                file_id=file_id, stage="pre_embedding",
+            )
+            if STRICT_INGESTION_SECURITY:
+                raise RuntimeError(
+                    f"STRICT_INGESTION_SECURITY: pre_embed_hook is required for "
+                    f"ingest_parsed_output (file_id={file_id}). Route through IngestionOrchestrator."
+                )
+        _plog = PipelineLogger(
+            request_path="ingestion",
+            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
+            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+        )
+        _plog.info("Direct ingestion started", file_id=file_id)
         async with async_session() as db:
             try:
                 file_record = await IngestionServiceV2._get_file_record(db, file_id)
@@ -1608,11 +1664,17 @@ class IngestionServiceV2:
                     )
                     return
 
+                _plog = _plog.bind(client_id=file_record.business_id)
                 await IngestionServiceV2._ensure_file_entry(db, file_record)
-                await IngestionServiceV2._run_pipeline(db, file_record, parsed_output)
+                await IngestionServiceV2._run_pipeline(
+                    db, file_record, parsed_output,
+                    pre_embed_hook=pre_embed_hook,
+                )
                 log_info(f"[IngestionV2] ✅ Completed direct ingestion for {file_id}")
+                _plog.info("Direct ingestion completed", file_id=file_id)
 
             except Exception as e:
+                _plog.error("Direct ingestion failed", file_id=file_id, error=str(e)[:300])
                 log_info(f"[ERROR] Direct ingestion failed for {file_id}: {e}")
                 await IngestionServiceV2._set_file_error(db, file_id, str(e))
                 raise
@@ -1651,6 +1713,8 @@ class IngestionServiceV2:
         db: AsyncSession,
         file_record: IngestedFileV2,
         parsed_payload: Dict[str, Any],
+        *,
+        pre_embed_hook: Optional[Any] = None,
     ):
         await IngestionServiceV2._set_file_processing(db, file_record.id)
         file_id     = file_record.id
@@ -1669,6 +1733,14 @@ class IngestionServiceV2:
         # ──────────────────────────────────────────────────────────────────────
         pipeline        = _get_pipeline(business_id)
         embedding_model = pipeline.embedder.info.model
+        _plog = PipelineLogger(
+            request_path="ingestion",
+            client_id=str(business_id) if business_id else None,
+            pipeline_id=str(file_id),
+            embedder_model=embedding_model,
+            vectordb_backend=getattr(pipeline.vectordb, "kind", os.getenv("MAI_VECTORDB", "unknown")),
+        )
+        _plog.info("Pipeline resolved for ingestion", file_id=str(file_id))
         log_info(
             f"[IngestionV2] Active embedding model for {file_id}: {embedding_model}"
         )
@@ -1700,6 +1772,25 @@ class IngestionServiceV2:
         page_map = parsed_payload.get("page_map")
         if isinstance(page_map, list) and page_map:
             _assign_page_numbers_from_page_map(chunks, page_map)
+
+        # ── Security gate: PII sanitization before dedup/storage/embedding ──
+        # pre_embed_hook signature: (chunks: List[Dict]) -> List[Dict]
+        # Returns sanitized chunks with PII-redacted text; metadata preserved.
+        # semantic_hash was computed in _extract_chunks (segmenter) from
+        # original text BEFORE this point — dedup integrity is preserved.
+        if pre_embed_hook is not None and chunks:
+            chunks = pre_embed_hook(chunks)
+        elif chunks:
+            log_error(
+                "[SECURITY][CRITICAL] pre_embed_hook not provided in _run_pipeline — "
+                "unsafe ingestion path. Raw PII may reach embedders and vector stores.",
+                file_id=file_id, stage="pre_embedding",
+            )
+            if STRICT_INGESTION_SECURITY:
+                raise RuntimeError(
+                    f"STRICT_INGESTION_SECURITY: pre_embed_hook is required for "
+                    f"_run_pipeline (file_id={file_id}). Route through IngestionOrchestrator."
+                )
 
         if not chunks:
             log_info(f"[IngestionV2] No chunks to ingest for {file_id}")
@@ -2555,6 +2646,17 @@ class IngestionServiceV2:
           Any exception logs full detail, marks file FAILED in DB, re-raises.
           Never swallow exceptions — silent success = corrupt / missing data.
         """
+        _plog = PipelineLogger(
+            request_path="ingestion",
+            client_id=business_id,
+            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
+            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+        )
+        _plog.info(
+            "Embed and store started",
+            file_id=file_id,
+            chunk_count=len(chunks) if chunks else 0,
+        )
         try:
             loop = asyncio.get_running_loop()
     
