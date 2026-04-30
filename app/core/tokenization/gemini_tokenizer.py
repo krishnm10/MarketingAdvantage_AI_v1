@@ -1,7 +1,7 @@
 """
 ================================================================================
 Marketing Advantage AI — Gemini Tokenizer Contract
-File: app/ai/connectors/tokenizers/gemini_tokenizer.py
+File: app/core/tokenization/gemini_tokenizer.py
 
 Implements TokenizerContract using Gemini's countTokens API (via google-genai SDK).
 

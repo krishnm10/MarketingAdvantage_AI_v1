@@ -905,7 +905,7 @@ def _resolve_cloud_tokenizer(
         import os
         api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
         try:
-            from app.ai.connectors.tokenizers.gemini_tokenizer import GeminiTokenizerContract
+            from app.core.tokenization.gemini_tokenizer import GeminiTokenizerContract
             model_name = model_id.removeprefix("google/")
             gemini_tok = GeminiTokenizerContract(
                 model_id=model_name,
