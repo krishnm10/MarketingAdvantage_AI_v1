@@ -3,3 +3,6 @@ app/frontend-admin - Copy	duplicate_frontend	2026-04-30	git mv to _unwanted_quar
 .env	env_secrets	2026-04-30	Stop tracking via git rm --cached; kept on disk locally; never commit
  - Copy.env	env_secrets	2026-04-30	Bogus Windows duplicate-name file; git rm --cached + delete working copy (no archive)
 pluggable_db/*	pluggable_blob	2026-04-30	git rm --cached only; binaries remain on disk for CHROMA_PATH=./pluggable_db ; entire ./pluggable_db/ now in .gitignore (no tracked .gitkeep; avoids bogus rename heuristic)
+duplicate-and-backup-code/app/**/*.py	windows_duplicate_or_snapshot	2026-04-30	17 tracked files: Copy suffixes / dated ingestion forks; verified no app imports reference these paths
+.git/index .venv	stop_track_venv	2026-04-30	git rm -r --cached .venv (~25k paths); keeps local .venv/
+.git/index node_modules	stop_track_deps	2026-04-30	git rm -r --cached node_modules (~2945 paths); keeps local folder

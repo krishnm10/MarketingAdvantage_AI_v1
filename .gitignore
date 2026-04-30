@@ -29,7 +29,12 @@ venv/
 
 static/
 
+# Node dependency trees (never commit)
+/node_modules/
+
 # Next.js / Node (admin app)
 app/node_modules/
 app/frontend-admin/node_modules/
 app/frontend-admin/.next/
+node_modules
+node_modules
