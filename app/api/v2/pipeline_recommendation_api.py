@@ -27,8 +27,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
+
+from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -193,17 +195,26 @@ async def preview_recommendation(
     """
     from app.ai.recommendations.pipeline_recommender import generate_recommendation
 
+    try:
+        _tctx = validate_tenant_id(
+            body.client_id, source="body", endpoint="preview_recommendation",
+            allow_default=True,
+        )
+        _tenant = _tctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     logger.info(
         "[PipelineRecommendationAPI] preview model_id=%r client_id=%r prefer_onprem=%s",
         body.embedder_model_id,
-        body.client_id,
+        _tenant,
         body.prefer_onprem,
     )
 
     try:
         result = generate_recommendation(
             embedder_model_id=body.embedder_model_id,
-            client_id=body.client_id,
+            client_id=_tenant,
             prefer_onprem=body.prefer_onprem,
         )
 

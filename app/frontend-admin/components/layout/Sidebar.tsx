@@ -20,15 +20,17 @@ import {
   SlidersHorizontal,
   Sparkles,
   BarChart3,
+  Building2,
 } from "lucide-react";
 import { useState } from "react";
 import { cn } from "@/lib/utils";
 
 const NAV_SECTIONS = [
-  {
+    {
     label: "Main",
     items: [
       { href: "/dashboard", label: "Dashboard", icon: LayoutDashboard },
+      { href: "/dashboard/multi-customer-rag", label: "Customers & RAG", icon: Building2 },
       { href: "/dashboard/health", label: "System Health", icon: Activity },
     ],
   },

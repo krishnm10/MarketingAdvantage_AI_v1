@@ -8,6 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,9 @@ class PineconeVectorDB(BaseVectorDB):
             self._index = None
             logger.info("[PineconeVectorDB] Index '%s' deleted.", self._index_name)
         except Exception as exc:
-            logger.warning("[PineconeVectorDB] delete_collection failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="delete_collection", collection=collection,
+            ) from exc
 
     # ── Write ─────────────────────────────────────────────────────────
 
@@ -246,8 +249,9 @@ class PineconeVectorDB(BaseVectorDB):
             # Pinecone upsert is always "upsert" — can't distinguish insert vs update
             return BatchUpsertResult(inserted=total_upserted)
         except Exception as exc:
-            logger.error("[PineconeVectorDB] batch_upsert failed: %s", exc)
-            return BatchUpsertResult(failed=len(doc_ids))
+            raise self._wrap_error(
+                exc, operation="batch_upsert", collection=collection,
+            ) from exc
 
     # ── Read ──────────────────────────────────────────────────────────
 
@@ -257,20 +261,25 @@ class PineconeVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
         if self._local_vdb is not None:
             return self._local_vdb.search(
                 collection=collection,
                 query_embedding=query_embedding,
                 top_k=top_k,
-                filters=filters,
+                tenant_id=tenant_id,
+                filters=effective_filters,
             )
         pinecone_filter = None
-        if filters:
+        if effective_filters:
             pinecone_filter = {
                 k: (v if isinstance(v, dict) else {"$eq": v})
-                for k, v in filters.items()
+                for k, v in effective_filters.items()
             }
         res = self._get_index().query(
             vector=query_embedding,
@@ -289,6 +298,13 @@ class PineconeVectorDB(BaseVectorDB):
                 score=round(float(match.get("score", 0.0)), 6),
                 metadata=meta,
             ))
+        self._log_tenant_search(
+            tenant_id=tenant_id,
+            collection=collection,
+            filter_count=len(effective_filters),
+            search_mode="vector",
+            result_count=len(hits),
+        )
         return hits
 
     def exists(self, *, collection: str, ids: List[str]) -> List[str]:
@@ -313,14 +329,15 @@ class PineconeVectorDB(BaseVectorDB):
                 found.extend(res.get("vectors", {}).keys())
             return found
         except Exception as exc:
-            logger.warning("[PineconeVectorDB] exists() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="exists", collection=collection,
+            ) from exc
 
-    def get_by_ids(self, *, collection: str, ids: List[str]) -> List[VectorHit]:
+    def get_by_ids(self, *, collection: str, ids: List[str], tenant_id: Optional[str] = None) -> List[VectorHit]:
         if not ids:
             return []
         if self._local_vdb is not None:
-            return self._local_vdb.get_by_ids(collection=collection, ids=ids)
+            return self._local_vdb.get_by_ids(collection=collection, ids=ids, tenant_id=tenant_id)
         try:
             res = self._get_index().fetch(
                 ids=ids,
@@ -338,8 +355,9 @@ class PineconeVectorDB(BaseVectorDB):
                 ))
             return hits
         except Exception as exc:
-            logger.warning("[PineconeVectorDB] get_by_ids() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="get_by_ids", collection=collection,
+            ) from exc
 
     def count(self, collection: str) -> int:
         if self._local_vdb is not None:
@@ -349,8 +367,57 @@ class PineconeVectorDB(BaseVectorDB):
             ns_stats = stats.get("namespaces", {}).get(self._namespace, {})
             return int(ns_stats.get("vector_count", 0))
         except Exception as exc:
-            logger.warning("[PineconeVectorDB] count() failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="count", collection=collection,
+            ) from exc
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        if self._local_vdb is not None:
+            return self._local_vdb.stats(collection)
+        try:
+            raw = self._get_index().describe_index_stats()
+            ns_stats = raw.get("namespaces", {}).get(self._namespace, {})
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": int(ns_stats.get("vector_count", 0)),
+                "namespace": self._namespace,
+                "index_name": self._index_name,
+                "dimension": raw.get("dimension"),
+            }
+        except Exception:
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": -1,
+            }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        if not ids:
             return 0
+        if self._local_vdb is not None:
+            return self._local_vdb.update_metadata(
+                collection=collection, ids=ids, metadatas=metadatas,
+            )
+        try:
+            index = self._get_index()
+            for doc_id, meta in zip(ids, metadatas):
+                index.update(id=doc_id, set_metadata=meta, namespace=self._namespace)
+            logger.debug(
+                "[PineconeVectorDB] update_metadata '%s': %d doc(s)",
+                collection, len(ids),
+            )
+            return len(ids)
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     # ── Delete ────────────────────────────────────────────────────────
 
@@ -369,8 +436,9 @@ class PineconeVectorDB(BaseVectorDB):
             self._get_index().delete(ids=doc_ids, namespace=self._namespace)
             return len(doc_ids)
         except Exception as exc:
-            logger.warning("[PineconeVectorDB] delete_many failed: %s", exc)
-            return 0
+            raise self._wrap_error(
+                exc, operation="delete_many", collection=collection,
+            ) from exc
 
     # ── Internal helpers ──────────────────────────────────────────────
 

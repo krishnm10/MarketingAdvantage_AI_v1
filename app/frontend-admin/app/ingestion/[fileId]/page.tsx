@@ -1,10 +1,11 @@
 "use client";
 
 import { useEffect, useState, type ComponentType } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useSearchParams } from "next/navigation";
 import Button from "@/components/ui/Button";
 import Modal from "@/components/ui/Modal";
 import apiClient from "@/lib/apiClient";
+import { API } from "@/lib/apiRoutes";
 import { cn } from "@/lib/utils";
 import { useFormatDate } from "@/lib/useHydrated";
 import { useAuth } from "@/lib/useAuth";
@@ -98,6 +99,8 @@ function matchingSemanticsText(layer: DisplayRow["layer"], reference: string, du
 
 export default function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
+  const searchParams = useSearchParams();
+  const tenantScope = searchParams.get("tenant");
   const { role } = useAuth();
   const canEditChunks = role === "admin" || role === "editor";
   const [file, setFile] = useState<FileDetails | null>(null);
@@ -115,8 +118,8 @@ export default function FileDetailPage() {
     (async () => {
       try {
         const [fRes, cRes] = await Promise.all([
-          apiClient.get(`/api/v2/ingestion-admin/files/${fileId}`),
-          apiClient.get(`/api/v2/ingestion-admin/files/${fileId}/chunks`),
+          apiClient.get(API.INGESTION_ADMIN.FILE_DETAIL(String(fileId), tenantScope || undefined)),
+          apiClient.get(API.INGESTION_ADMIN.FILE_CHUNKS(String(fileId), tenantScope || undefined)),
         ]);
         setFile(fRes.data);
         setChunks(cRes.data ?? []);
@@ -126,7 +129,7 @@ export default function FileDetailPage() {
         setLoading(false);
       }
     })();
-  }, [fileId]);
+  }, [fileId, tenantScope]);
 
   function openEditor(chunk: Chunk) {
     setEditingChunk(chunk);
@@ -154,7 +157,7 @@ export default function FileDetailPage() {
     setSavingChunk(true);
     setSaveMessage(null);
     try {
-      await apiClient.put(`/api/v2/ingestion-admin/chunks/${editingChunk.id}`, {
+      await apiClient.put(API.INGESTION_ADMIN.CHUNK_UPDATE(editingChunk.id), {
         cleaned_text: nextText,
         llm_mode: llmMode || null,
       });

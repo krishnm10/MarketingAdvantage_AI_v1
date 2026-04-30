@@ -37,8 +37,21 @@ from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.utils.path_sanitizer import sanitize_client_id
+from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
 
 logger = logging.getLogger(__name__)
+
+
+def _validated_tenant_path(client_id: str, endpoint: str) -> str:
+    """Validate a path-param tenant ID or raise HTTP 422."""
+    try:
+        ctx = validate_tenant_id(
+            client_id, source="path", endpoint=endpoint,
+            allow_default=False,
+        )
+        return ctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
 router = APIRouter(
     prefix="/api/v2/rag-config",
@@ -485,6 +498,7 @@ async def update_pipeline_config(
     If no config file exists, a new one is created from environment defaults
     and the requested updates are applied to it.
     """
+    client_id = _validated_tenant_path(client_id, "update_pipeline_config")
     import json as _json
 
     config_path = _get_client_config_path(client_id)
@@ -604,6 +618,7 @@ async def get_pipeline_config(client_id: str):
     Returns a synthetic default (is_default=True) when no config file exists
     so the UI can display editable defaults rather than receiving a 404.
     """
+    client_id = _validated_tenant_path(client_id, "get_pipeline_config")
     import json as _json
 
     config_path = _get_client_config_path(client_id)
@@ -654,6 +669,7 @@ async def validate_pipeline_config(client_id: str):
     Does not persist any changes or run actual queries.
     If no config file exists, returns a warning (not an error) to the UI.
     """
+    client_id = _validated_tenant_path(client_id, "validate_pipeline_config")
     import json as _json
 
     config_path = _get_client_config_path(client_id)

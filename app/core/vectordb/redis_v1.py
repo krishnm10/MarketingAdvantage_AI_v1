@@ -27,6 +27,7 @@ import struct
 from typing import Any, Dict, List, Optional
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -307,9 +308,9 @@ class RedisVectorDB(BaseVectorDB):
         try:
             pipe.execute()
         except Exception as exc:
-            logger.warning("[RedisVectorDB] batch_upsert pipeline flush: %s", exc)
-            failed += inserted
-            inserted = 0
+            raise self._wrap_error(
+                exc, operation="batch_upsert", collection=collection,
+            ) from exc
 
         return BatchUpsertResult(inserted=inserted, updated=updated, failed=failed)
 
@@ -319,14 +320,18 @@ class RedisVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
         self._assert_vector_backend_ready()
         idx = self._index_name(collection)
         blob = _float_list_to_bytes(query_embedding)
 
-        server_filter_expr = _build_redis_server_filter(filters)
-        fetch_k = _redis_fetch_limit(top_k, filters)
+        server_filter_expr = _build_redis_server_filter(effective_filters)
+        fetch_k = _redis_fetch_limit(top_k, effective_filters)
         query_str = f"({server_filter_expr})=>[KNN {fetch_k} @embedding $BLOB AS _score]"
 
         try:
@@ -340,12 +345,20 @@ class RedisVectorDB(BaseVectorDB):
             )
         except Exception as exc:
             self._raise_if_redisearch_missing(exc)
-            logger.warning("[RedisVectorDB] search failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="search", collection=collection, tenant_id=tenant_id,
+            ) from exc
 
         hits = self._parse_search_results(raw, collection)
-        if filters:
-            hits = [hit for hit in hits if _matches_redis_filters(hit, filters)]
+        if effective_filters:
+            hits = [hit for hit in hits if _matches_redis_filters(hit, effective_filters)]
+        self._log_tenant_search(
+            tenant_id=tenant_id,
+            collection=collection,
+            filter_count=len(effective_filters),
+            search_mode="vector",
+            result_count=min(len(hits), top_k),
+        )
         return hits[:top_k]
 
     def _parse_search_results(self, raw: Any, collection: str) -> List[VectorHit]:
@@ -440,6 +453,7 @@ class RedisVectorDB(BaseVectorDB):
         *,
         collection: str,
         ids: List[str],
+        tenant_id: Optional[str] = None,
     ) -> List[VectorHit]:
         if not ids:
             return []
@@ -494,8 +508,54 @@ class RedisVectorDB(BaseVectorDB):
             return 0
         except Exception as exc:
             self._raise_if_redisearch_missing(exc)
-            logger.warning("[RedisVectorDB] count failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="count", collection=collection,
+            ) from exc
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        try:
+            doc_count = self.count(collection)
+        except Exception:
+            doc_count = -1
+        return {
+            "backend": self.kind,
+            "collection": collection,
+            "document_count": doc_count,
+            "prefix": self._prefix,
+        }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        if not ids:
             return 0
+        updated = 0
+        try:
+            for doc_id, new_meta in zip(ids, metadatas):
+                key = self._key(collection, doc_id)
+                raw = self._client.hget(key, "_metadata")
+                if raw is None:
+                    continue
+                existing = json.loads(raw)
+                existing.update(new_meta)
+                self._client.hset(
+                    key, "_metadata",
+                    json.dumps(existing, default=str).encode("utf-8"),
+                )
+                updated += 1
+            logger.debug(
+                "[RedisVectorDB] update_metadata '%s': %d doc(s)",
+                collection, updated,
+            )
+            return updated
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     def delete(self, *, collection: str, doc_id: str) -> None:
         key = self._key(collection, doc_id)

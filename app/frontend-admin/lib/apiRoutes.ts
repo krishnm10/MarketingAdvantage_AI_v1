@@ -10,11 +10,20 @@ export const API = {
     UPLOAD: "/ingestion/upload",
   },
   INGESTION_ADMIN: {
-    FILES: "/ingestion-admin/files",
-    FILE_DETAIL: (id: string) => `/ingestion-admin/files/${id}`,
-    FILE_CHUNKS: (id: string) => `/ingestion-admin/files/${id}/chunks`,
-    RETRY: (id: string) => `/ingestion-admin/files/${id}/retry`,
-    CHUNK_UPDATE: (id: string) => `/ingestion-admin/chunks/${id}`,
+    FILES: (tenantId?: string) =>
+      tenantId
+        ? `/api/v2/ingestion-admin/files?tenant_id=${encodeURIComponent(tenantId)}`
+        : "/api/v2/ingestion-admin/files",
+    FILE_DETAIL: (id: string, tenantId?: string) =>
+      tenantId
+        ? `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}?tenant_id=${encodeURIComponent(tenantId)}`
+        : `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}`,
+    FILE_CHUNKS: (id: string, tenantId?: string) =>
+      tenantId
+        ? `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/chunks?tenant_id=${encodeURIComponent(tenantId)}`
+        : `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/chunks`,
+    RETRY: (id: string) => `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/retry`,
+    CHUNK_UPDATE: (id: string) => `/api/v2/ingestion-admin/chunks/${encodeURIComponent(id)}`,
   },
   SYNC: {
     ORPHANS: "/sync/orphans",
@@ -26,6 +35,13 @@ export const API = {
     FIX_DB_TO_CHROMA: "/integrity/fix/db-to-chroma",
     FIX_CHROMA_TO_DB: "/integrity/fix/chroma-to-db",
   },
+  // Admin — multi-customer pipeline + alignment (config-file tenant list)
+  ADMIN: {
+    CUSTOMERS_RAG_DASHBOARD: () => "/api/v2/admin/customers-rag-dashboard",
+    TENANT_OVERVIEW: (clientId: string) =>
+      `/api/v2/admin/tenants/${encodeURIComponent(clientId)}/overview`,
+  },
+
   // Phase 1 — Embedding & Tokenization Alignment
   EMBEDDING_ALIGNMENT: (clientId?: string) =>
     clientId

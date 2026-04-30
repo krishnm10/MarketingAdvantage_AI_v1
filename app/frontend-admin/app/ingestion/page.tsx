@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useFormatDate } from "@/lib/useHydrated";
 import apiClient from "@/lib/apiClient";
+import { API } from "@/lib/apiRoutes";
 import Table from "@/components/ui/Table";
 import Button from "@/components/ui/Button";
 import { FileText, Upload, Loader2, FolderOpen } from "lucide-react";
@@ -28,7 +29,7 @@ export default function IngestionListPage() {
   useEffect(() => {
     const loadFiles = async () => {
       try {
-        const res = await apiClient.get("/api/v2/ingestion-admin/files");
+        const res = await apiClient.get(API.INGESTION_ADMIN.FILES());
         setFiles(res.data ?? []);
       } catch (err) {
         console.error("Failed to fetch ingested files:", err);

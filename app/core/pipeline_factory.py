@@ -69,6 +69,7 @@ from app.core.embedders.prompting import PromptedEmbedder, EmbeddingPrompts
 from app.core.rerankers.base  import BaseReranker
 from app.core.llms.base       import BaseLLM
 from app.core.llms.chain      import LLMChain, ChainStep  # ← NEW
+from app.core.runtime.errors  import ConfigResolutionError
 
 # ── RAG pipeline (the orchestrator we just built) ───────────────────────────
 from app.core.rag_pipeline import RAGPipeline, RAGResult  # ← NEW
@@ -256,8 +257,45 @@ class PipelineFactory:
             EnvironmentError:     Required env var not set.
             ValueError:           Invalid config combination.
         """
+        from app.core.config.client_config_resolver import (
+            get_config_fingerprint,
+            validate_config_compatibility,
+            ConfigValidationError,
+            IssueSeverity,
+        )
+
         client_id = config.client_id
-        config_fingerprint = config.model_dump_json()
+        config_fingerprint = get_config_fingerprint(config)
+
+        # ── Pre-build validation gate (fail-fast) ────────────────────
+        issues = validate_config_compatibility(config)
+        errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+        warnings = [i for i in issues if i.severity == IssueSeverity.WARNING]
+
+        for w in warnings:
+            logger.warning(
+                "[PipelineFactory] Validation warning | client=%s | "
+                "component=%s | %s",
+                client_id, w.component, w.message,
+            )
+
+        if errors:
+            _error_details = "; ".join(
+                f"[{e.component}] {e.message}" for e in errors
+            )
+            logger.error(
+                '{"event":"PIPELINE_BUILD_REJECTED",'
+                '"client_id":"%s",'
+                '"config_fingerprint":"%s",'
+                '"error_count":%d,'
+                '"errors":"%s"}',
+                client_id, config_fingerprint, len(errors),
+                _error_details.replace('"', "'"),
+            )
+            raise ConfigValidationError(
+                client_id=client_id,
+                issues=errors,
+            )
 
         # ── Return cached pipeline if available ──────────────────────
         if self._cache_enabled:
@@ -279,9 +317,10 @@ class PipelineFactory:
                     stale_pipeline.close()
 
         logger.info(
-            "[PipelineFactory] Building pipeline | client=%s | "
+            "[PipelineFactory] Building pipeline | client=%s | fingerprint=%s | "
             "vectordb=%s | embedder=%s | llm=%s | reranker=%s",
             client_id,
+            config_fingerprint,
             config.vectordb.type.value,
             config.embedder.type.value,
             (
@@ -296,6 +335,10 @@ class PipelineFactory:
 
         # ── Build each component ──────────────────────────────────────
         vectordb = self._build_vectordb(config.vectordb)
+        # Wire tenant isolation setting from config into the adapter
+        vectordb._tenant_isolation_enabled = (
+            config.features.enable_multi_tenant_isolation
+        )
         embedder = self._build_embedder(config.embedder)
         llm      = self._build_llm(config.llm)
         reranker = self._build_reranker(config.reranker)
@@ -329,9 +372,9 @@ class PipelineFactory:
         )
 
         # ── Phase 1: Resolve EmbedderBundle and validate alignment ──────
-        # Non-blocking: if the model is not in embedder_catalog.yaml, or Phase 1
-        # dependencies are unavailable, we log a warning and continue with
-        # legacy BaseEmbedder behavior.  No existing pipeline is disrupted.
+        # When features.enable_bundle_validation is True, alignment failures
+        # are hard errors.  Otherwise, log and continue (legacy behavior).
+        _strict_bundle = config.features.enable_bundle_validation
         embedder_bundle = None
         try:
             from app.ai.pipeline.embedder_bundle_resolver import try_resolve_embedder_bundle
@@ -341,17 +384,22 @@ class PipelineFactory:
             if embedder_bundle is not None:
                 report = _tv.validate_pipeline_alignment(
                     embedder_bundle=embedder_bundle,
-                    reranker_bundle=None,    # reranker RerankerView integration is Phase 2
+                    reranker_bundle=None,
                     vector_db_config=config.vectordb,
                 )
                 if not report.ok:
-                    logger.warning(
-                        "[PipelineFactory] Phase 1 alignment issues for client '%s' "
-                        "[model=%s]: %s",
-                        client_id,
-                        embedder_bundle.model_id,
-                        "; ".join(report.errors),
+                    _align_msg = (
+                        f"Phase 1 alignment failed for client '{client_id}' "
+                        f"[model={embedder_bundle.model_id}]: "
+                        + "; ".join(report.errors)
                     )
+                    if _strict_bundle:
+                        raise ValueError(
+                            f"[PipelineFactory] {_align_msg}. "
+                            f"Set features.enable_bundle_validation=false to "
+                            f"bypass (not recommended)."
+                        )
+                    logger.warning("[PipelineFactory] %s", _align_msg)
                 else:
                     logger.info(
                         "[PipelineFactory] Phase 1 alignment OK | client=%s | "
@@ -362,7 +410,16 @@ class PipelineFactory:
                         embedder_bundle.embed_max_tokens,
                         embedder_bundle.embedding_fingerprint_short(),
                     )
+        except (ValueError, ConfigResolutionError):
+            raise
         except Exception as _bundle_exc:
+            if _strict_bundle:
+                raise ConfigResolutionError(
+                    f"[PipelineFactory] Bundle validation required but failed "
+                    f"for client '{client_id}': {_bundle_exc}",
+                    tenant_id=client_id,
+                    details={"operation": "bundle_validation"},
+                ) from _bundle_exc
             logger.warning(
                 "[PipelineFactory] Phase 1 bundle resolution skipped for client '%s': %s",
                 client_id,
@@ -822,11 +879,12 @@ class PipelineFactory:
                     api_key=api_key or "",
                 )
             except Exception as e:
-                logger.warning(
-                    "[PipelineFactory] LLM-Judge reranker init failed (%s); "
-                    "falling back to no reranker.", e,
-                )
-                return None
+                raise ConfigResolutionError(
+                    f"[PipelineFactory] LLM-Judge reranker initialization failed: {e}. "
+                    f"Verify provider='{judge_provider}', model='{model or 'default'}', "
+                    f"and that the required API key is set.",
+                    details={"operation": "reranker_init", "provider": judge_provider},
+                ) from e
 
         raise ValueError(
             f"[PipelineFactory] Unknown reranker type '{t}'. "
@@ -835,52 +893,159 @@ class PipelineFactory:
 
     # ── Pipeline Nodes (PII middleware, Prompt node, etc.) ────────────────
 
-    def _build_pipeline_nodes(self, config):
-        """Build optional pipeline nodes from config."""
-        try:
-            from app.core.pipeline_nodes.node_set import PipelineNodeSet
-        except ImportError:
-            return None
+    def _build_pipeline_nodes(self, config: ClientConfig) -> "PipelineNodeSet":
+        """
+        Build all optional pipeline nodes declared in config.
 
+        Construction order matches future execution order:
+          1. PII Middleware      (pre-LLM input sanitization)
+          2. Prompt Node         (prompt template resolution)
+          3. Context Window Mgr  (token budget enforcement)
+          4. Output Formatter    (response formatting + trust gate)
+
+        Nodes are attached to PipelineNodeSet but NOT wired into
+        RAGPipeline execution — construction-only for now.
+        """
+        from app.core.pipeline_nodes.node_set import PipelineNodeSet
+
+        client_id = config.client_id
         nodes = PipelineNodeSet()
 
-        # PII Middleware
-        try:
-            security_cfg = getattr(config, 'security', None)
-            if security_cfg and getattr(security_cfg, 'pii_middleware', None):
-                pii_cfg = security_cfg.pii_middleware
-                if pii_cfg.enabled:
-                    from app.core.pipeline_nodes.pii_middleware import RegexPIIMiddleware
-                    nodes.pii_middleware = RegexPIIMiddleware(config={
-                        "position": pii_cfg.positions,
-                        "action": pii_cfg.action,
-                        "block_on_severity": pii_cfg.block_on_severity,
-                        "trust_score_penalty": pii_cfg.trust_score_penalty,
-                        "custom_patterns": [
-                            {"name": p.name, "pattern": p.pattern, "severity": p.severity}
-                            for p in pii_cfg.custom_patterns
-                        ],
-                        "audit_log_enabled": pii_cfg.audit_log_enabled,
-                    })
-                    logger.info("[PipelineFactory] PII middleware enabled | positions=%s", pii_cfg.positions)
-        except Exception as e:
-            logger.warning("[PipelineFactory] Failed to build PII middleware: %s", e)
+        # ── 1. PII Middleware ────────────────────────────────────────
+        pii_cfg = config.security.pii_middleware
+        if pii_cfg.enabled:
+            from app.core.pipeline_nodes.pii_middleware import RegexPIIMiddleware
+            nodes.pii_middleware = RegexPIIMiddleware(config={
+                "position": pii_cfg.positions,
+                "action": pii_cfg.action,
+                "block_on_severity": pii_cfg.block_on_severity,
+                "trust_score_penalty": pii_cfg.trust_score_penalty,
+                "custom_patterns": [
+                    {"name": p.name, "pattern": p.pattern, "severity": p.severity}
+                    for p in pii_cfg.custom_patterns
+                ],
+                "audit_log_enabled": pii_cfg.audit_log_enabled,
+            })
+            logger.info(
+                '{"event":"PIPELINE_NODE_BUILT","client_id":"%s",'
+                '"node":"pii_middleware","enabled":true,'
+                '"positions":"%s","action":"%s"}',
+                client_id, pii_cfg.positions, pii_cfg.action,
+            )
+        else:
+            logger.info(
+                '{"event":"PIPELINE_NODE_SKIPPED","client_id":"%s",'
+                '"node":"pii_middleware","enabled":false}',
+                client_id,
+            )
 
-        # Prompt Node
-        try:
-            prompt_cfg = getattr(config, 'prompt', None)
-            if prompt_cfg and getattr(prompt_cfg, 'enabled', False):
-                from app.core.pipeline_nodes.prompt_node import PromptNode
-                nodes.prompt_node = PromptNode(
-                    prompt_type=prompt_cfg.prompt_type,
-                    template=prompt_cfg.template,
-                    template_id=prompt_cfg.template_id,
-                    variable_map=dict(prompt_cfg.variable_map),
-                    max_tokens_warning=prompt_cfg.max_tokens_warning,
+        # ── 2. Prompt Node ───────────────────────────────────────────
+        prompt_cfg = getattr(config, "prompt", None)
+        if prompt_cfg and getattr(prompt_cfg, "enabled", False):
+            from app.core.pipeline_nodes.prompt_node import PromptNode
+            nodes.prompt_node = PromptNode(
+                prompt_type=prompt_cfg.prompt_type,
+                template=prompt_cfg.template,
+                template_id=prompt_cfg.template_id,
+                variable_map=dict(prompt_cfg.variable_map),
+                max_tokens_warning=prompt_cfg.max_tokens_warning,
+            )
+            logger.info(
+                '{"event":"PIPELINE_NODE_BUILT","client_id":"%s",'
+                '"node":"prompt_node","enabled":true,'
+                '"prompt_type":"%s"}',
+                client_id, prompt_cfg.prompt_type,
+            )
+        else:
+            logger.info(
+                '{"event":"PIPELINE_NODE_SKIPPED","client_id":"%s",'
+                '"node":"prompt_node","enabled":false}',
+                client_id,
+            )
+
+        # ── 3. Context Window Manager ────────────────────────────────
+        cw_cfg = config.context_window
+        if cw_cfg.enabled:
+            from app.core.pipeline_nodes.context_window_manager import ContextWindowManager
+
+            cwm = ContextWindowManager(
+                truncation_strategy=cw_cfg.truncation_strategy,
+                response_reserve_tokens=cw_cfg.response_reserve_tokens,
+                memory_mode=cw_cfg.memory_mode,
+                buffer_turns=cw_cfg.buffer_turns,
+                summary_max_tokens=cw_cfg.summary_max_tokens,
+                token_budget_context_fraction=config.retrieval.token_budget_context_fraction,
+            )
+            cfg_errors = cwm.validate_config()
+            if cfg_errors:
+                raise ValueError(
+                    f"[PipelineFactory] ContextWindowManager config invalid for "
+                    f"client '{client_id}': {'; '.join(cfg_errors)}"
                 )
-                logger.info("[PipelineFactory] Prompt node enabled | type=%s", prompt_cfg.prompt_type)
-        except Exception as e:
-            logger.warning("[PipelineFactory] Failed to build prompt node: %s", e)
+            nodes.context_window = cwm
+            logger.info(
+                '{"event":"PIPELINE_NODE_BUILT","client_id":"%s",'
+                '"node":"context_window_manager","enabled":true,'
+                '"strategy":"%s","reserve_tokens":%d,'
+                '"context_fraction":%.2f}',
+                client_id,
+                cw_cfg.truncation_strategy,
+                cw_cfg.response_reserve_tokens,
+                config.retrieval.token_budget_context_fraction,
+            )
+        else:
+            logger.info(
+                '{"event":"PIPELINE_NODE_SKIPPED","client_id":"%s",'
+                '"node":"context_window_manager","enabled":false}',
+                client_id,
+            )
+
+        # ── 4. Output Formatter ──────────────────────────────────────
+        fmt_cfg = config.formatter
+        if fmt_cfg.enabled:
+            from app.core.pipeline_nodes.output_formatter import OutputFormatter
+
+            ofmt = OutputFormatter(
+                response_format=fmt_cfg.response_format,
+                json_schema=fmt_cfg.json_schema,
+                strip_boilerplate=fmt_cfg.strip_boilerplate,
+                min_trust_score=fmt_cfg.min_trust_score,
+                block_on_low_trust=fmt_cfg.block_on_low_trust,
+                toxicity_filter=fmt_cfg.toxicity_filter,
+            )
+            cfg_errors = ofmt.validate_config()
+            if cfg_errors:
+                raise ValueError(
+                    f"[PipelineFactory] OutputFormatter config invalid for "
+                    f"client '{client_id}': {'; '.join(cfg_errors)}"
+                )
+            nodes.output_formatter = ofmt
+            logger.info(
+                '{"event":"PIPELINE_NODE_BUILT","client_id":"%s",'
+                '"node":"output_formatter","enabled":true,'
+                '"format":"%s","trust_gate":%s,'
+                '"toxicity_filter":"%s"}',
+                client_id,
+                fmt_cfg.response_format,
+                str(fmt_cfg.block_on_low_trust).lower(),
+                fmt_cfg.toxicity_filter,
+            )
+        else:
+            logger.info(
+                '{"event":"PIPELINE_NODE_SKIPPED","client_id":"%s",'
+                '"node":"output_formatter","enabled":false}',
+                client_id,
+            )
+
+        # ── Summary log ──────────────────────────────────────────────
+        active = [n for n in ("pii_middleware", "prompt_node",
+                              "context_window", "output_formatter")
+                  if getattr(nodes, n) is not None]
+        logger.info(
+            '{"event":"PIPELINE_NODES_SUMMARY","client_id":"%s",'
+            '"active_count":%d,"active_nodes":"%s"}',
+            client_id, len(active), ",".join(active) or "none",
+        )
 
         return nodes
 

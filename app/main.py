@@ -153,6 +153,7 @@ from app.api.v2.rag_api import router as rag_router
 # Phase 1 — Embedding Alignment Router (NEW — additive only)
 # ─────────────────────────────────────────────────────────────────────────────
 from app.api.v2.embedding_alignment_api import router as embedding_alignment_router
+from app.api.v2.admin_customers_rag_dashboard_api import router as admin_customers_rag_dashboard_router
 from app.api.v2.pipeline_recommendation_api import router as pipeline_recommendation_router
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -642,6 +643,10 @@ app.include_router(
 app.include_router(
     embedding_alignment_router,
     tags=["Embedding Alignment"],
+)
+
+app.include_router(
+    admin_customers_rag_dashboard_router,
 )
 
 # ── Pipeline Recommendations Router (catalog-driven, read-only) ───────────────
@@ -1149,7 +1154,18 @@ async def token_usage_stats(tenant_id: str = "", month: str = ""):
         month:     "YYYY-MM" format (empty = current month)
     """
     from app.utils.cost_tracker import get_usage, get_all_usage
+    from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
+    from fastapi import HTTPException as _HTTPException
+
     if tenant_id:
+        try:
+            _tctx = validate_tenant_id(
+                tenant_id, source="query", endpoint="token_usage_stats",
+                allow_default=False,
+            )
+            tenant_id = _tctx.tenant_id
+        except TenantValidationError as e:
+            raise _HTTPException(status_code=422, detail=str(e))
         usage = get_usage(tenant_id, month=month or None)
         return {
             "tenant_id": tenant_id,

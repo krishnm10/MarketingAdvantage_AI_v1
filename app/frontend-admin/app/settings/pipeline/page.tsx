@@ -537,6 +537,18 @@ export default function PipelineBuilderPage() {
   const [templateApplied, setTemplateApplied] = useState<string | null>(null);
   const [advancedSaveResult, setAdvancedSaveResult] = useState<{ ok: boolean; msg: string } | null>(null);
 
+  /* Deep link: ?client=<tenant> from Customers & RAG dashboard */
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const raw = new URLSearchParams(window.location.search).get("client");
+      if (!raw?.trim()) return;
+      setClientId(decodeURIComponent(raw.trim()));
+    } catch {
+      /* ignore malformed */
+    }
+  }, []);
+
   /* ── Fetch models ── */
   const fetchModels = useCallback(async () => {
     setModelsLoading(true);

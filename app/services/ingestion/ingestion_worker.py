@@ -222,9 +222,19 @@ class IngestionWorker:
 
     async def _process_command(self, command: IngestionCommand, worker_id: int) -> None:
         t0 = time.monotonic()
+
+        # ── Tenant enforcement: validate before processing ────────────
+        from app.services.ingestion.tenant_guard import resolve_ingestion_tenant
+        tenant_ctx = resolve_ingestion_tenant(
+            business_id=command.business_id,
+            file_id=command.file_id,
+            source="worker",
+            allow_default=True,
+        )
+
         plog = PipelineLogger(
             request_path="ingestion",
-            client_id=command.business_id,
+            client_id=tenant_ctx.tenant_id,
             pipeline_id=command.command_id,
             embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
             vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
@@ -237,10 +247,11 @@ class IngestionWorker:
                 worker_id=worker_id,
                 attempt=command.attempt,
                 source_type=command.source_type,
+                tenant_id=tenant_ctx.tenant_id,
             )
             await IngestionOrchestrator().ingest_file(
                 file_id=command.file_id,
-                client_id=command.business_id,
+                client_id=tenant_ctx.tenant_id,
                 file_path=command.file_path,
             )
             elapsed_ms = (time.monotonic() - t0) * 1000

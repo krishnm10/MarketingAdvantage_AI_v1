@@ -147,21 +147,20 @@ async def _check_chroma() -> dict:
         # heartbeat OK but collections endpoint failed — still online
         return _ok(f"Connected | {chroma_host}:{port}")
 
-    # ── Local mode — PersistentClient singleton ───────────────────
-    # MUST use identical Settings as chroma_v1.py (anonymized_telemetry=False)
-    # so that chromadb returns the existing singleton instead of raising
-    # 'instance already exists with different settings'.
+    # ── Local mode — use BaseVectorDB abstraction ──────────────────
     try:
-        import chromadb
-        from chromadb.config import Settings
+        from app.core.vectordb.chroma_v1 import ChromaVectorDB
         chroma_path = os.getenv("CHROMA_PATH") or "./pluggable_db"
-        client = chromadb.PersistentClient(
-            path=chroma_path,
-            settings=Settings(anonymized_telemetry=False),
+        vdb = ChromaVectorDB(
+            persist_directory=chroma_path,
+            anonymized_telemetry=False,
         )
-        colls = client.list_collections()
-        n = len(colls) if isinstance(colls, (list, tuple)) else 0
-        return _ok(f"{n} collection(s) | {chroma_path}")
+        if not vdb.health_check():
+            return _fail("ChromaDB local health_check returned False")
+        collection_name = os.getenv("MAI_COLLECTION", "ingested_content")
+        stats = vdb.stats(collection_name)
+        doc_count = stats.get("document_count", 0)
+        return _ok(f"{doc_count} doc(s) | {chroma_path}")
     except Exception as e:
         return _fail(str(e))
 

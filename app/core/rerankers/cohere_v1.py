@@ -31,6 +31,7 @@ import logging
 from typing import List, Optional
 
 from app.core.rerankers.base import BaseReranker, RerankerInfo, RerankCandidate
+from app.core.runtime.runtime_telemetry import emit_runtime_event
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +127,11 @@ class CohereReranker(BaseReranker):
             reverse=True,
         )
 
-        logger.info(
-            "[CohereReranker] Reranked %d → top %d | "
-            "top_score=%.4f | bottom_score=%.4f",
-            len(candidates), top_k,
-            reranked[0].rerank_score or 0.0,
-            reranked[top_k - 1].rerank_score or 0.0,
+        emit_runtime_event(
+            "RERANK_EXECUTION",
+            reranker_provider="cohere",
+            reranker_model=self._model,
+            reranked_count=len(reranked[:top_k]),
         )
 
         return reranked[:top_k]

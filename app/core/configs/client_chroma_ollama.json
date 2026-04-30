@@ -18,14 +18,18 @@
   "llm": {
     "chain": [
       {
+        "step_name": "extract",
         "type": "ollama",
         "model": "llama3.2",
+        "base_url": "http://localhost:11434",
         "system_prompt": "Extract the key marketing intent from this query.",
         "max_tokens": 256
       },
       {
+        "step_name": "answer",
         "type": "ollama",
         "model": "mistral",
+        "base_url": "http://localhost:11434",
         "system_prompt": "Using the extracted intent, generate a detailed marketing answer.",
         "max_tokens": 1024
       }

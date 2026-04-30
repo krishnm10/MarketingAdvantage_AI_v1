@@ -8,6 +8,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,9 @@ class MilvusVectorDB(BaseVectorDB):
             utility.drop_collection(collection, using=self._alias)
             logger.info("[MilvusVectorDB] Collection '%s' deleted.", collection)
         except Exception as exc:
-            logger.warning("[MilvusVectorDB] delete_collection failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="delete_collection", collection=collection,
+            ) from exc
 
     # ── Write ─────────────────────────────────────────────────────────
 
@@ -191,8 +194,9 @@ class MilvusVectorDB(BaseVectorDB):
             )
             return BatchUpsertResult(inserted=inserted, updated=updated)
         except Exception as exc:
-            logger.error("[MilvusVectorDB] batch_upsert failed: %s", exc)
-            return BatchUpsertResult(failed=len(doc_ids))
+            raise self._wrap_error(
+                exc, operation="batch_upsert", collection=collection,
+            ) from exc
 
     # ── Read ──────────────────────────────────────────────────────────
 
@@ -202,11 +206,15 @@ class MilvusVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
         col = self._get_collection(collection)
 
-        expr = _build_milvus_filter_expr(filters)
+        expr = _build_milvus_filter_expr(effective_filters)
 
         search_params = {
             "metric_type": _METRIC_TYPE,
@@ -230,6 +238,13 @@ class MilvusVectorDB(BaseVectorDB):
                 score=float(result.score),
                 metadata=meta,
             ))
+        self._log_tenant_search(
+            tenant_id=tenant_id,
+            collection=collection,
+            filter_count=len(effective_filters),
+            search_mode="vector",
+            result_count=len(hits),
+        )
         return hits
 
     def exists(self, *, collection: str, ids: List[str]) -> List[str]:
@@ -248,10 +263,11 @@ class MilvusVectorDB(BaseVectorDB):
             )
             return [r[_FIELD_ID] for r in results]
         except Exception as exc:
-            logger.warning("[MilvusVectorDB] exists() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="exists", collection=collection,
+            ) from exc
 
-    def get_by_ids(self, *, collection: str, ids: List[str]) -> List[VectorHit]:
+    def get_by_ids(self, *, collection: str, ids: List[str], tenant_id: Optional[str] = None) -> List[VectorHit]:
         if not ids:
             return []
         col = self._get_collection(collection)
@@ -272,16 +288,87 @@ class MilvusVectorDB(BaseVectorDB):
                 ))
             return hits
         except Exception as exc:
-            logger.warning("[MilvusVectorDB] get_by_ids() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="get_by_ids", collection=collection,
+            ) from exc
 
     def count(self, collection: str) -> int:
         try:
             col = self._get_collection(collection)
             return col.num_entities
         except Exception as exc:
-            logger.warning("[MilvusVectorDB] count() failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="count", collection=collection,
+            ) from exc
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        try:
+            col = self._get_collection(collection)
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": col.num_entities,
+                "alias": self._alias,
+            }
+        except Exception:
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": -1,
+            }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        """
+        Milvus has no native partial-metadata update. Strategy:
+        query existing rows → merge metadata → delete → re-insert.
+        """
+        if not ids:
             return 0
+        col = self._get_collection(collection)
+        try:
+            ids_expr = ", ".join(f'"{i}"' for i in ids)
+            existing_rows = col.query(
+                expr=f'{_FIELD_ID} in [{ids_expr}]',
+                output_fields=[_FIELD_ID, _FIELD_VECTOR, _FIELD_TEXT, _FIELD_METADATA],
+            )
+            row_map = {r[_FIELD_ID]: r for r in existing_rows}
+
+            updated = 0
+            reinsert_rows = []
+            for doc_id, new_meta in zip(ids, metadatas):
+                row = row_map.get(doc_id)
+                if row is None:
+                    continue
+                old_meta = json.loads(row[_FIELD_METADATA]) if row[_FIELD_METADATA] else {}
+                old_meta.update(new_meta)
+                reinsert_rows.append({
+                    _FIELD_ID:       doc_id,
+                    _FIELD_VECTOR:   row[_FIELD_VECTOR],
+                    _FIELD_TEXT:     row[_FIELD_TEXT],
+                    _FIELD_METADATA: json.dumps(old_meta),
+                })
+                updated += 1
+
+            if reinsert_rows:
+                col.delete(expr=f'{_FIELD_ID} in [{ids_expr}]')
+                col.insert(reinsert_rows)
+                col.flush()
+
+            logger.debug(
+                "[MilvusVectorDB] update_metadata '%s': %d doc(s)",
+                collection, updated,
+            )
+            return updated
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     # ── Delete ────────────────────────────────────────────────────────
 
@@ -303,8 +390,9 @@ class MilvusVectorDB(BaseVectorDB):
             col.flush()
             return len(existing)
         except Exception as exc:
-            logger.warning("[MilvusVectorDB] delete_many failed: %s", exc)
-            return 0
+            raise self._wrap_error(
+                exc, operation="delete_many", collection=collection,
+            ) from exc
 
     # ── Internal helpers ──────────────────────────────────────────────
 

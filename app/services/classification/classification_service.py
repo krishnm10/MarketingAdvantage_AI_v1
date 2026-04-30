@@ -1,7 +1,8 @@
 # services/classification/classification_service.py
 
+import os
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,34 +16,36 @@ from app.services.classification.taxonomy_loader import load_taxonomy
 from app.db.models.business_classification import BusinessClassification
 from app.db.models.classification_logs import ClassificationLogs
 
+from app.core.vectordb.base import BaseVectorDB
 from app.utils.logger import log_info, log_warning
-import os
-import chromadb
-from chromadb.config import Settings
 
 
-# Chroma client (update metadata for chunks) — remote or local
-def _make_chroma_client():
+_COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
+
+# Lazy singleton for backward-compatible fallback when no VectorDB is injected.
+_fallback_vectordb: Optional[BaseVectorDB] = None
+
+
+def _get_fallback_vectordb() -> BaseVectorDB:
+    """
+    Create a BaseVectorDB instance from environment config.
+    Used only when callers don't inject a VectorDB instance.
+    """
+    global _fallback_vectordb
+    if _fallback_vectordb is not None:
+        return _fallback_vectordb
+
+    from app.core.vectordb.chroma_v1 import ChromaVectorDB
     host = os.getenv("CHROMA_HOST") or None
-    if host:
-        port = int(os.getenv("CHROMA_PORT") or "8000")
-        ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
-        api_key = os.getenv("CHROMA_API_KEY") or None
-        return chromadb.HttpClient(
-            host=host, port=port, ssl=ssl,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
-            settings=Settings(anonymized_telemetry=False),
-        )
-    return chromadb.PersistentClient(
-        path=os.getenv("CHROMA_PATH", "./pluggable_db"),
-        settings=Settings(anonymized_telemetry=False),
+    _fallback_vectordb = ChromaVectorDB(
+        persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db"),
+        anonymized_telemetry=False,
+        host=host,
+        port=int(os.getenv("CHROMA_PORT") or "8000"),
+        ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
+        api_key=os.getenv("CHROMA_API_KEY") or None,
     )
-
-CHROMA = _make_chroma_client()
-CONTENT_COLLECTION = CHROMA.get_or_create_collection(
-    name=os.getenv("MAI_COLLECTION", "ingested_content"),
-    metadata={"hnsw:space": "cosine"}
-)
+    return _fallback_vectordb
 
 
 class ClassificationService:
@@ -50,7 +53,8 @@ class ClassificationService:
     @staticmethod
     async def classify_chunk(
         db: AsyncSession,
-        chunk: Dict[str, Any]
+        chunk: Dict[str, Any],
+        vectordb: Optional[BaseVectorDB] = None,
     ) -> Dict[str, Any]:
         """
         Full classification pipeline for a single chunk.
@@ -143,10 +147,12 @@ class ClassificationService:
         await db.commit()
 
         # -----------------------------------------------------
-        # 7. Update Chroma metadata
+        # 7. Update VectorDB metadata via BaseVectorDB abstraction
         # -----------------------------------------------------
         try:
-            CONTENT_COLLECTION.update(
+            vdb = vectordb or _get_fallback_vectordb()
+            vdb.update_metadata(
+                collection=_COLLECTION_NAME,
                 ids=[chunk_id],
                 metadatas=[
                     {
@@ -156,10 +162,10 @@ class ClassificationService:
                         "pending_taxonomy_id": canonical["pending_taxonomy_id"],
                         "confidence": llm_output.get("confidence"),
                     }
-                ]
+                ],
             )
         except Exception as e:
-            log_warning(f"[classification_service] Chroma update failed: {e}")
+            log_warning(f"[classification_service] VectorDB metadata update failed: {e}")
 
         # -----------------------------------------------------
         # 8. Return result

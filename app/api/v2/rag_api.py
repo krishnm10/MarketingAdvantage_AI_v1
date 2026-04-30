@@ -9,11 +9,18 @@ Endpoints:
   DELETE /api/v2/rag/pipeline/cache   → Invalidate cached pipeline
   GET  /api/v2/rag/pipeline/health    → Per-client pipeline health
   GET  /api/v2/rag/pipeline/list      → List cached pipelines
+
+CONFIG RESOLUTION:
+  All runtime config loading goes through get_client_config() — the
+  authoritative resolver. No direct filesystem config parsing in any
+  request handler. The build endpoint accepts explicit admin overrides
+  but routes them through validation.
 ================================================================================
 """
 
 from __future__ import annotations
 
+import json as _json_module
 import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -23,35 +30,45 @@ from pydantic import BaseModel, Field
 
 from app.core.pipeline_factory import pipeline_factory
 from app.core.config.client_config_schema import ClientConfig
-from app.utils.path_sanitizer import sanitize_client_id
+from app.core.config.client_config_resolver import (
+    get_client_config,
+    get_config_fingerprint,
+    validate_config_compatibility,
+    ConfigValidationError,
+    IssueSeverity,
+)
 from app.utils.pipeline_logger import PipelineLogger
+from app.utils.tenant_validator import (
+    validate_tenant_id,
+    TenantValidationError,
+)
+from app.core.runtime.runtime_constants import AUTHORITATIVE_RUNTIME
+from app.core.runtime.runtime_context import RAGRuntimeContext
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+def _validated_tenant(
+    raw_id: Optional[str],
+    *,
+    source: str = "body",
+    endpoint: str = "rag_api",
+    allow_default: bool = False,
+) -> str:
+    """Validate tenant ID or raise HTTPException(422)."""
+    try:
+        ctx = validate_tenant_id(
+            raw_id, source=source, endpoint=endpoint,
+            allow_default=allow_default,
+        )
+        return ctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-_CONFIG_DIRS = [
-    _REPO_ROOT / "app" / "core" / "configs",
-    _REPO_ROOT / "configs",  # backward-compatible fallback
-]
 _PROMPTS_DIR = _REPO_ROOT / "app" / "core" / "configs" / "prompts"
-
-
-def _find_client_config(client_id: str) -> Optional[Path]:
-    safe_id = sanitize_client_id(client_id)
-    for base in _CONFIG_DIRS:
-        for ext in ("json", "yaml"):
-            candidate = (base / f"{safe_id}.{ext}").resolve()
-            if not str(candidate).startswith(str(base.resolve())):
-                logger.warning(
-                    "[rag_api] Path containment violation for client_id=%.20s",
-                    client_id[:20],
-                )
-                continue
-            if candidate.exists():
-                return candidate
-    return None
 
 
 def _resolve_prompt_template(template_id: str) -> Optional[str]:
@@ -60,8 +77,6 @@ def _resolve_prompt_template(template_id: str) -> Optional[str]:
     the system_instructions string for use as the LLM system prompt.
     Returns None if the template is not found or cannot be loaded.
     """
-    import json as _json
-
     template_path = _PROMPTS_DIR / f"{template_id}.json"
     if not template_path.exists():
         logger.warning(
@@ -71,13 +86,15 @@ def _resolve_prompt_template(template_id: str) -> Optional[str]:
         return None
     try:
         with template_path.open() as f:
-            data = _json.load(f)
+            data = _json_module.load(f)
         return data.get("system_instructions") or data.get("content") or None
     except Exception as e:
         logger.warning(
             "[rag_api] Failed to load prompt template '%s': %s", template_id, e
         )
         return None
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,15 +116,18 @@ class RAGQueryRequest(BaseModel):
 class BuildPipelineRequest(BaseModel):
     """
     Request body for POST /api/v2/rag/pipeline/build.
-    Accepts either inline config dict OR a path to a config JSON/YAML file.
+
+    Resolution order:
+        1. client_id → get_client_config() authoritative resolution (preferred).
+        2. config_dict → inline override (admin use only, validated).
     """
+    client_id: Optional[str] = Field(
+        None,
+        description="Client ID — resolved via authoritative config resolver.",
+    )
     config_dict: Optional[Dict[str, Any]] = Field(
         None,
-        description="Inline ClientConfig as JSON object."
-    )
-    config_file: Optional[str] = Field(
-        None,
-        description="Path to a ClientConfig JSON or YAML file (server-side path)."
+        description="Inline ClientConfig as JSON object (admin override).",
     )
 
 
@@ -132,14 +152,33 @@ async def rag_query(req: RAGQueryRequest):
     """
     Run a full RAG query using a pre-built client pipeline.
 
-    The pipeline must be built first via POST /api/v2/rag/pipeline/build
-    OR it will be built on-the-fly if a config file exists at
-    app/core/configs/{client_id}.json.
-
-    The pipeline is cached after first build — subsequent queries are fast.
+    If no cached pipeline exists, one is built on-the-fly from the
+    authoritative config resolver (get_client_config).
     """
-    plog = PipelineLogger(request_path="rag_api", client_id=req.client_id)
-    plog.info("RAG query received", query_length=len(req.query))
+    import uuid as _uuid
+
+    tenant = _validated_tenant(req.client_id, endpoint="rag_query")
+    _request_id = str(_uuid.uuid4())
+    _trace_id = str(_uuid.uuid4())
+
+    _rtx = RAGRuntimeContext(
+        request_id=_request_id,
+        trace_id=_trace_id,
+        tenant_id=tenant,
+        client_id=tenant,
+        pipeline_id=tenant,
+        user_query=req.query,
+        stack_used="rag_pipeline",
+        runtime_authority=AUTHORITATIVE_RUNTIME,
+    )
+
+    plog = PipelineLogger(request_path="rag_api", client_id=tenant)
+    plog.info(
+        "RAG query received",
+        query_length=len(req.query),
+        stack_used="rag_pipeline",
+        runtime_authority=AUTHORITATIVE_RUNTIME,
+    )
 
     # ── Security gate: PII redaction + prompt injection detection ─────────
     from app.middleware.security_middleware import scan_text as _security_scan_text
@@ -157,49 +196,51 @@ async def rag_query(req: RAGQueryRequest):
         pii_detected=_scan_result.has_pii,
     )
 
-    pipeline = pipeline_factory.get_cached(req.client_id)
+    # ── Pipeline resolution: cache hit or authoritative build ─────────────
+    pipeline = pipeline_factory.get_cached(tenant)
     if pipeline is None:
-        config_path = _find_client_config(req.client_id)
-        if config_path is None:
-            searched_dirs = ", ".join(str(p) for p in _CONFIG_DIRS)
+        try:
+            config = get_client_config(tenant)
+            fingerprint = get_config_fingerprint(config)
+            plog.info(
+                "Auto-building pipeline from authoritative config",
+                authoritative_config_used=True,
+                config_fingerprint=fingerprint,
+            )
+            pipeline_factory.build(config)
+            pipeline = pipeline_factory.get_cached(tenant)
+        except ConfigValidationError as e:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Config validation failed for '{tenant}': {e}",
+            )
+        except FileNotFoundError:
             raise HTTPException(
                 status_code=404,
                 detail=(
-                    f"No pipeline found for client_id='{req.client_id}' "
-                    f"and no config file in: {searched_dirs}. "
+                    f"No config found for client_id='{tenant}'. "
                     f"Use POST /api/v2/rag/pipeline/build first."
                 ),
             )
-        try:
-            if str(config_path).endswith(".yaml"):
-                config = ClientConfig.from_yaml_file(config_path)
-            else:
-                config = ClientConfig.from_json_file(config_path)
-            pipeline_factory.build(config)
         except Exception as e:
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to auto-build pipeline from config: {e}",
+                detail=f"Failed to auto-build pipeline: {e}",
             )
-        pipeline = pipeline_factory.get_cached(req.client_id)
 
     try:
         if not pipeline:
             raise HTTPException(
                 status_code=500,
-                detail=f"Pipeline for '{req.client_id}' not in cache after build.",
+                detail=f"Pipeline for '{tenant}' not in cache after build.",
             )
 
         plog = plog.bind(
-            pipeline_id=req.client_id,
+            pipeline_id=tenant,
             embedder_model=getattr(getattr(pipeline, "embedder", None), "info", None) and pipeline.embedder.info.model,
             vectordb_backend=getattr(pipeline.vectordb, "kind", None),
         )
 
-        # Resolve effective system prompt:
-        # 1. Per-request override takes precedence.
-        # 2. If not overridden, look up the prompt_template_id from the
-        #    pipeline's retrieval config (saved in the client's config file).
         effective_system_prompt = req.system_prompt
         if not effective_system_prompt:
             retrieval_cfg = getattr(
@@ -211,7 +252,7 @@ async def rag_query(req: RAGQueryRequest):
                 if effective_system_prompt:
                     logger.info(
                         "[rag_api] Using prompt template '%s' for client '%s'.",
-                        template_id, req.client_id,
+                        template_id, tenant,
                     )
 
         result = pipeline.query(
@@ -222,6 +263,7 @@ async def rag_query(req: RAGQueryRequest):
             system_prompt=effective_system_prompt,
             temperature=req.temperature,
             max_tokens=req.max_tokens,
+            runtime_context=_rtx,
         )
 
         plog.query_complete(
@@ -232,9 +274,8 @@ async def rag_query(req: RAGQueryRequest):
             token_usage=result.metadata.get("token_usage"),
         )
 
-        # ── Shadow dual execution (observability only) ─────────────────────
         _shadow_dual_execute(
-            client_id=req.client_id,
+            client_id=tenant,
             sanitized_query=sanitized_query,
             old_result=result,
             query_kwargs=dict(
@@ -257,7 +298,7 @@ async def rag_query(req: RAGQueryRequest):
         }
 
         return RAGQueryResponse(
-            client_id=req.client_id,
+            client_id=tenant,
             query=req.query,
             final_answer=result.final_answer,
             reranked=result.reranked,
@@ -277,35 +318,46 @@ async def rag_query(req: RAGQueryRequest):
 @router.post("/pipeline/build")
 async def build_pipeline(req: BuildPipelineRequest):
     """
-    Build (or rebuild) a client pipeline from config.
-    Accepts inline config dict OR server-side config file path.
+    Build (or rebuild) a client pipeline.
+
+    Resolution order:
+        1. client_id → authoritative get_client_config() (preferred).
+        2. config_dict → inline admin override (validated before build).
+
+    At least one of client_id or config_dict must be provided.
     """
     plog = PipelineLogger(request_path="rag_api")
     try:
-        if req.config_dict:
+        if req.client_id and not req.config_dict:
+            tenant = _validated_tenant(
+                req.client_id, endpoint="build_pipeline",
+            )
+            config = get_client_config(tenant)
+            plog.info(
+                "Pipeline build from authoritative config",
+                authoritative_config_used=True,
+                config_fingerprint=get_config_fingerprint(config),
+            )
+        elif req.config_dict:
             config = ClientConfig.from_dict(req.config_dict)
-        elif req.config_file:
-            p = Path(req.config_file)
-            if not p.exists():
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Config file not found: {req.config_file}",
-                )
-            config = (
-                ClientConfig.from_yaml_file(p)
-                if str(p).endswith(".yaml")
-                else ClientConfig.from_json_file(p)
+            issues = validate_config_compatibility(config)
+            errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+            if errors:
+                raise ConfigValidationError(client_id=config.client_id, issues=errors)
+            plog.info(
+                "Pipeline build from inline admin override",
+                authoritative_config_used=False,
+                config_fingerprint=get_config_fingerprint(config),
             )
         else:
             raise HTTPException(
                 status_code=400,
-                detail="Provide either 'config_dict' or 'config_file'.",
+                detail="Provide either 'client_id' or 'config_dict'.",
             )
 
         plog = plog.bind(client_id=config.client_id)
         plog.info("Pipeline build requested")
 
-        # Invalidate existing cache first (force rebuild)
         pipeline_factory.invalidate(config.client_id)
         pipeline = pipeline_factory.build(config)
 
@@ -326,6 +378,8 @@ async def build_pipeline(req: BuildPipelineRequest):
             "cached":     True,
         }
 
+    except ConfigValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except HTTPException:
         raise
     except Exception as e:
@@ -341,8 +395,11 @@ async def invalidate_pipeline(
     Invalidate a cached pipeline.
     Next query for this client will trigger a fresh pipeline build.
     """
-    pipeline_factory.invalidate(client_id)
-    return {"status": "invalidated", "client_id": client_id}
+    tenant = _validated_tenant(
+        client_id, source="query", endpoint="invalidate_pipeline",
+    )
+    pipeline_factory.invalidate(tenant)
+    return {"status": "invalidated", "client_id": tenant}
 
 
 @router.get("/pipeline/health")
@@ -350,11 +407,14 @@ async def pipeline_health(
     client_id: str = Query(..., description="Client ID to check"),
 ):
     """Per-client pipeline health check (VectorDB reachability, etc.)"""
-    pipeline = pipeline_factory.get_cached(client_id)
+    tenant = _validated_tenant(
+        client_id, source="query", endpoint="pipeline_health",
+    )
+    pipeline = pipeline_factory.get_cached(tenant)
     if pipeline is None:
         raise HTTPException(
             status_code=404,
-            detail=f"No cached pipeline for client_id='{client_id}'.",
+            detail=f"No cached pipeline for client_id='{tenant}'.",
         )
     return pipeline.health_check()
 
@@ -388,7 +448,6 @@ def _shadow_dual_execute(
     The old_result is NEVER replaced. This function has no return value.
     """
     import asyncio
-    import json as _json
     import time
 
     try:
@@ -397,16 +456,10 @@ def _shadow_dual_execute(
         if not migration_controller.should_run_shadow_dual_execution(client_id):
             return
 
-        from app.core.config.client_config_resolver import (
-            _find_config_path,
-            _load_config_from_path,
-        )
-
-        config_path = _find_config_path(client_id)
-        if config_path is None:
+        try:
+            new_config = get_client_config(client_id)
+        except Exception:
             return
-
-        new_config = _load_config_from_path(client_id, config_path)
         new_pipeline = pipeline_factory.build(new_config)
 
         plog.info("Shadow dual execution: running new pipeline", client_id=client_id)
@@ -420,7 +473,7 @@ def _shadow_dual_execute(
         try:
             logger.info(
                 "%s",
-                _json.dumps({
+                _json_module.dumps({
                     "event": "SHADOW_DUAL_EXECUTION",
                     "client_id": client_id,
                     **metrics,

@@ -1,20 +1,29 @@
 """
 ================================================================================
-Config Diff Logger — Structured comparison of ClientConfig snapshots.
+Config Diff Logger — Structured comparison + logging for ClientConfig drift.
 
 STATUS: SHADOW-ONLY. Safe to import without runtime side effects.
 
-PURPOSE:
-    Detects configuration drift between two ClientConfig instances (e.g.
-    before/after a hot-reload, migration, or env-var override). Produces a
-    machine-readable diff with per-field severity for alerting and audit.
+COMPONENTS:
+    compare_configs()         — PURE function. Returns structured diff only.
+                                No logging, no scoring, no side effects.
+    log_config_drift_event()  — Fire-and-forget JSON log emitter.
+                                No computation, no decision-making.
 
 USAGE:
-    from app.core.config.config_diff_logger import compare_configs
+    from app.core.config.config_diff_logger import compare_configs, log_config_drift_event
+    from app.core.config.config_drift_scorer import compute_drift_score
 
     diff = compare_configs(old_config, new_config, client_id="acme_corp")
-    for d in diff["differences"]:
-        print(f"[{d['severity']}] {d['field']}: {d['old']} → {d['new']}")
+    drift_score = compute_drift_score(diff)
+
+    log_config_drift_event(
+        client_id="acme_corp",
+        event="CONFIG_DIFF_DETECTED",
+        diff=diff,
+        drift_score=drift_score,
+        mode="SHADOW",
+    )
 ================================================================================
 """
 
@@ -201,52 +210,34 @@ def compare_configs(
     client_id: str,
 ) -> Dict[str, Any]:
     """
-    Compute a structured diff between two ClientConfig instances.
+    PURE function — compute a structured diff between two ClientConfig instances.
+
+    No logging, no scoring, no side effects. Callers are responsible for
+    scoring (config_drift_scorer) and logging (log_config_drift_event).
 
     Args:
         old_config: Previous ClientConfig (or None for first-time load).
         new_config: Current ClientConfig.
-        client_id:  Client identifier for the diff record.
+        client_id:  Client identifier (passthrough for correlation).
 
     Returns:
         {
-            "client_id": "...",
-            "total_changes": int,
-            "has_critical": bool,
-            "differences": [
+            "client_id":      str,
+            "critical_count": int,
+            "warning_count":  int,
+            "info_count":     int,
+            "has_critical":   bool,
+            "differences":    [
                 {
-                    "field": "embedder.model",
-                    "old": "BAAI/bge-large-en-v1.5",
-                    "new": "text-embedding-3-small",
+                    "field":    "embedder.model",
+                    "old":      "BAAI/bge-large-en-v1.5",
+                    "new":      "text-embedding-3-small",
                     "severity": "CRITICAL"
                 },
                 ...
             ]
         }
-
-    Never raises exceptions — returns an empty diff on any internal error.
     """
-    try:
-        return _compare(old_config, new_config, client_id)
-    except Exception as exc:
-        logger.warning(
-            "[ConfigDiff] Comparison failed for client_id='%s': %s",
-            client_id, exc,
-        )
-        return {
-            "client_id": client_id,
-            "total_changes": 0,
-            "has_critical": False,
-            "differences": [],
-            "error": str(exc)[:200],
-        }
-
-
-def _compare(
-    old_config: Any,
-    new_config: Any,
-    client_id: str,
-) -> Dict[str, Any]:
     differences: List[Dict[str, Any]] = []
 
     for spec in _FIELD_SPECS:
@@ -265,40 +256,57 @@ def _compare(
                 "severity": severity,
             })
 
-    has_critical = any(d["severity"] == "CRITICAL" for d in differences)
-
     critical_count = sum(1 for d in differences if d["severity"] == "CRITICAL")
     warning_count = sum(1 for d in differences if d["severity"] == "WARNING")
     info_count = sum(1 for d in differences if d["severity"] == "INFO")
 
-    # Drift score: CRITICAL=10, WARNING=3, INFO=1
-    drift_score = critical_count * 10 + warning_count * 3 + info_count
-
-    if differences:
-        try:
-            logger.info(
-                "%s",
-                _json_module.dumps({
-                    "event": "CONFIG_DIFF_DETECTED",
-                    "client_id": client_id,
-                    "diff_count": len(differences),
-                    "critical_count": critical_count,
-                    "warning_count": warning_count,
-                    "info_count": info_count,
-                    "drift_score": drift_score,
-                    "summary": differences,
-                }, default=str),
-            )
-        except Exception:
-            pass
-
     return {
         "client_id": client_id,
-        "total_changes": len(differences),
-        "has_critical": has_critical,
-        "drift_score": drift_score,
+        "critical_count": critical_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "has_critical": critical_count > 0,
         "differences": differences,
     }
+
+
+def log_config_drift_event(
+    client_id: str,
+    event: str,
+    diff: Dict[str, Any],
+    drift_score: int,
+    mode: str,
+) -> None:
+    """
+    Emit a single structured JSON log entry for a config drift event.
+
+    This function performs NO computation and NO decision-making.
+    It is a fire-and-forget log emitter wrapped in try/except so that
+    logging failures never propagate to callers.
+
+    Args:
+        client_id:    Tenant/client identifier.
+        event:        Event label (e.g. SHADOW_MODE_ACTIVE, MIGRATION_BLOCKED).
+        diff:         The diff payload (output of compare_configs or config_diff_engine).
+        drift_score:  Pre-computed drift score (from config_drift_scorer).
+        mode:         Execution mode (e.g. SHADOW, CANARY, FULL_MIGRATION).
+    """
+    try:
+        logger.info(
+            "%s",
+            _json_module.dumps(
+                {
+                    "event": event,
+                    "client_id": client_id,
+                    "mode": mode,
+                    "drift_score": drift_score,
+                    "diff": diff,
+                },
+                default=str,
+            ),
+        )
+    except Exception:
+        pass
 
 
 def _normalize(value: Any) -> Any:

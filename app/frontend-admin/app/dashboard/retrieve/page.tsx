@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState, useRef, useEffect } from "react";
 import apiClient from "@/lib/apiClient";
 import {
@@ -30,6 +31,8 @@ import {
   Server,
   XCircle,
   Settings,
+  Building2,
+  ChevronRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import InfoTooltip from "@/components/ui/InfoTooltip";
@@ -492,6 +495,14 @@ export default function RetrievePage() {
         <p className="text-slate-500 text-sm mt-1">
           Semantic search with governance scoring — mirrors the Retrieve CLI
         </p>
+        <Link
+          href="/dashboard/multi-customer-rag"
+          className="inline-flex items-center gap-1.5 mt-3 text-xs font-medium text-primary-600 hover:text-primary-800"
+        >
+          <Building2 className="w-3.5 h-3.5" />
+          Customers & RAG dashboard
+          <ChevronRight className="w-3.5 h-3.5 opacity-70" />
+        </Link>
       </div>
 
       {/* Query input card */}

@@ -4,43 +4,38 @@ Ingestion Orchestrator — Single entry point for all ingestion operations.
 
 ARCHITECTURE:
     External callers (API, worker, connectors) → IngestionOrchestrator
+        → get_client_config       (authoritative config resolution)
         → _enforce_embedding_policy  (sensitivity gate — fail fast)
         → sanitize_ingestion_chunks  (PII gate)
         → IngestionServiceV2         (chunking, dedup, storage, embedding)
 
-PURPOSE:
-    1. Enforces the non-negotiable EMBEDDING POLICY: clients with
-       data_sensitivity="high" are restricted to local-only embedders
-       (huggingface, ollama). The check runs BEFORE any data is parsed,
-       chunked, or processed — fail fast, fail loud.
-
-    2. Enforces the non-negotiable SECURITY GATE: ALL data entering the
-       ingestion pipeline passes through PII sanitization before it
-       reaches embedders, vector stores, or any external API.
-
-    The PII hook is defined ONCE here and injected into every
-    IngestionServiceV2 call via the pre_embed_hook parameter. The service
-    itself is agnostic to what the hook does — clean separation of concerns.
+NON-NEGOTIABLES:
+    1. ClientConfig is resolved via get_client_config() at the START of
+       every entry point. No env-driven fallback. No optional configs.
+    2. Embedding policy is enforced from the resolved config ONLY.
+    3. PII sanitization runs on EVERY ingestion path.
 
 USAGE:
-    orchestrator = IngestionOrchestrator(client_config=cfg)
-    await orchestrator.ingest_file(file_id="...", client_id="...")
-    await orchestrator.ingest_parsed_output(file_id="...", parsed={...}, client_id="...")
+    orchestrator = IngestionOrchestrator()
+    await orchestrator.ingest_file(file_id="...", client_id="acme")
+    await orchestrator.ingest_parsed_output(file_id="...", parsed={...}, client_id="acme")
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
+import json as _json_module
 import logging
 from typing import Any, Dict, FrozenSet, List, Optional
 
+from app.core.config.client_config_schema import ClientConfig
+from app.core.config.client_config_resolver import get_config_fingerprint
 from app.utils.pipeline_logger import PipelineLogger
 from app.services.security.ingestion_security import sanitize_ingestion_chunks
 
 logger = logging.getLogger(__name__)
 
-# Providers that run entirely on local hardware — no data crosses the network.
 _LOCAL_EMBEDDER_PROVIDERS: FrozenSet[str] = frozenset({
     "huggingface",
     "ollama",
@@ -49,7 +44,7 @@ _LOCAL_EMBEDDER_PROVIDERS: FrozenSet[str] = frozenset({
 
 def _fire_pii_audit(
     *,
-    client_id: Optional[str],
+    client_id: str,
     file_id: str,
     pii_meta: Dict[str, Any],
 ) -> None:
@@ -62,7 +57,7 @@ def _fire_pii_audit(
 
         svc = SecurityAuditService()
         coro = svc.log_pii_event(
-            business_id=client_id or "unknown",
+            business_id=client_id,
             pipeline_id=file_id,
             node_id="ingestion_orchestrator",
             position="pre_embedding",
@@ -89,58 +84,102 @@ def _fire_pii_audit(
         )
 
 
+def _resolve_config(client_id: str) -> ClientConfig:
+    """
+    Authoritative config resolution. Every ingestion path starts here.
+
+    Raises ConfigValidationError or FileNotFoundError on bad config.
+    """
+    from app.core.config.client_config_resolver import get_client_config
+    return get_client_config(client_id)
+
+
+def _log_resolved_config(
+    config: ClientConfig,
+    *,
+    plog: PipelineLogger,
+) -> None:
+    """Emit a structured JSON log confirming config resolution for ingestion."""
+    embedder_model = None
+    sub = getattr(config.embedder, config.embedder.type.value, None)
+    if sub is not None:
+        embedder_model = getattr(sub, "model", None)
+
+    llm_model = None
+    if config.llm and config.llm.single:
+        llm_model = config.llm.single.model
+
+    fingerprint = get_config_fingerprint(config)
+
+    try:
+        logger.info(
+            "%s",
+            _json_module.dumps({
+                "event": "INGESTION_CONFIG_RESOLVED",
+                "client_id": config.client_id,
+                "config_fingerprint": fingerprint,
+                "embedder_type": config.embedder.type.value,
+                "embedder_model": embedder_model,
+                "vectordb_backend": config.vectordb.type.value,
+                "vectordb_collection": config.vectordb.collection,
+                "llm_model": llm_model,
+                "reranker": config.reranker.type.value if config.reranker else "none",
+                "data_sensitivity": config.security.data_sensitivity,
+                "pii_enabled": config.security.pii_middleware.enabled,
+            }, default=str),
+        )
+    except Exception:
+        pass
+
+    plog.info(
+        "Resolved authoritative ClientConfig",
+        client_id=config.client_id,
+        config_fingerprint=fingerprint,
+        embedder=config.embedder.type.value,
+        vectordb=config.vectordb.type.value,
+    )
+
+
 class IngestionOrchestrator:
     """
     Orchestrates ingestion with mandatory security sanitization.
 
     Every ingestion path — file upload, pre-parsed RSS/API, connector
-    output — MUST go through this class to guarantee PII redaction
-    before data leaves the service boundary.
+    output — MUST go through this class to guarantee:
+        1. Authoritative ClientConfig resolution via get_client_config().
+        2. Embedding policy enforcement from the resolved config.
+        3. PII redaction before data leaves the service boundary.
     """
-
-    def __init__(self, *, client_config: Optional[Any] = None) -> None:
-        """
-        Args:
-            client_config: Optional ClientConfig instance. When provided,
-                           PII middleware settings (custom patterns, severity
-                           blocking, audit logging) are read from
-                           config.security.pii_middleware.
-                           Embedding policy is read from
-                           config.security.data_sensitivity.
-        """
-        self._client_config = client_config
 
     # ------------------------------------------------------------------
     # Embedding policy — fail fast before any data is processed
     # ------------------------------------------------------------------
 
-    def _enforce_embedding_policy(self, *, plog: PipelineLogger) -> None:
+    @staticmethod
+    def _enforce_embedding_policy(
+        config: ClientConfig,
+        *,
+        plog: PipelineLogger,
+    ) -> None:
         """
         Validate that the configured embedder is compatible with the
         client's data sensitivity tier.
 
+        All decisions are driven by the resolved ClientConfig — no env
+        fallback. The embedder type is read directly from config.embedder.type.
+
         Policy:
-            high   → local embedders only (huggingface, ollama). Remote
-                     providers are rejected because raw text (even after PII
-                     redaction) must never leave the service boundary.
-            medium → cloud embedders are permitted; PII is sanitized by the
-                     pre_embed_hook before reaching the embedder (default).
+            high   → local embedders only (huggingface, ollama).
+            medium → cloud embedders permitted; PII sanitized first.
             low    → no restrictions.
 
         Raises:
-            ValueError: if a remote embedder is configured for a
-                        high-sensitivity client. Fails fast before ingestion.
+            ValueError: remote embedder configured for high-sensitivity client.
         """
-        cfg = self._client_config
-        sensitivity = "medium"
-        if cfg is not None:
-            sensitivity = getattr(
-                getattr(cfg, "security", None), "data_sensitivity", "medium"
-            )
-
-        embedder_provider = self._resolve_embedder_provider()
-
+        sensitivity = config.security.data_sensitivity
+        embedder_provider = config.embedder.type.value.lower()
         is_local = embedder_provider in _LOCAL_EMBEDDER_PROVIDERS
+
         plog.info(
             "Embedding policy applied",
             sensitivity=sensitivity,
@@ -156,41 +195,16 @@ class IngestionOrchestrator:
                 f"lower data_sensitivity in ClientConfig.security."
             )
 
-    def _resolve_embedder_provider(self) -> str:
-        """
-        Determine the active embedder provider string.
-
-        Resolution order:
-          1. ClientConfig → pipeline_factory.build() → pipeline.embedder.info.provider
-          2. Fallback to MAI_EMBEDDER env var (for legacy/env-driven pipelines)
-        """
-        cfg = self._client_config
-        if cfg is not None:
-            try:
-                from app.core.pipeline_factory import pipeline_factory
-                pipeline = pipeline_factory.get_cached(cfg.client_id)
-                if pipeline is None:
-                    pipeline = pipeline_factory.build(cfg)
-                return pipeline.embedder.info.provider.lower()
-            except Exception as e:
-                logger.debug(
-                    "Could not resolve embedder from ClientConfig: %s — "
-                    "falling back to MAI_EMBEDDER env var",
-                    e,
-                )
-
-        import os
-        return os.getenv("MAI_EMBEDDER", "unknown").lower()
-
     # ------------------------------------------------------------------
     # PII hook — defined once, reused across all ingestion paths
     # ------------------------------------------------------------------
 
+    @staticmethod
     def _make_pii_hook(
-        self,
+        config: ClientConfig,
         *,
         file_id: str,
-        client_id: Optional[str],
+        client_id: str,
         plog: PipelineLogger,
     ):
         """
@@ -201,11 +215,10 @@ class IngestionOrchestrator:
         IngestionServiceV2._run_pipeline(pre_embed_hook=...):
             (chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         """
-        client_config = self._client_config
 
         def _sanitize_hook(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             sanitized, pii_meta = sanitize_ingestion_chunks(
-                chunks, client_config=client_config,
+                chunks, client_config=config,
             )
             if pii_meta.get("chunks_with_pii"):
                 plog.info(
@@ -233,15 +246,18 @@ class IngestionOrchestrator:
     async def ingest_file(
         self,
         file_id: str,
-        client_id: Optional[str] = None,
+        client_id: str = "default",
         *,
         file_path: Optional[str] = None,
     ) -> None:
         """
         Ingest a file through the full pipeline with PII sanitization.
 
-        Delegates to IngestionServiceV2.process_file() with a pre_embed_hook
-        that redacts PII before chunks reach dedup/storage/embedding.
+        Flow:
+            1. Resolve authoritative ClientConfig.
+            2. Enforce embedding policy (fail fast).
+            3. Build PII hook from resolved config.
+            4. Delegate to IngestionServiceV2.process_file().
         """
         from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
 
@@ -251,9 +267,13 @@ class IngestionOrchestrator:
         )
         plog.info("Orchestrator: file ingestion started", file_id=file_id)
 
-        self._enforce_embedding_policy(plog=plog)
+        config = _resolve_config(client_id)
+        _log_resolved_config(config, plog=plog)
+
+        self._enforce_embedding_policy(config, plog=plog)
 
         hook = self._make_pii_hook(
+            config,
             file_id=file_id,
             client_id=client_id,
             plog=plog,
@@ -276,13 +296,16 @@ class IngestionOrchestrator:
         self,
         file_id: str,
         parsed: Dict[str, Any],
-        client_id: Optional[str] = None,
+        client_id: str = "default",
     ) -> None:
         """
         Ingest pre-parsed content with PII sanitization.
 
-        Delegates to IngestionServiceV2.ingest_parsed_output() with a
-        pre_embed_hook that redacts PII before chunks reach embedding.
+        Flow:
+            1. Resolve authoritative ClientConfig.
+            2. Enforce embedding policy (fail fast).
+            3. Build PII hook from resolved config.
+            4. Delegate to IngestionServiceV2.ingest_parsed_output().
         """
         from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
 
@@ -292,9 +315,13 @@ class IngestionOrchestrator:
         )
         plog.info("Orchestrator: parsed ingestion started", file_id=file_id)
 
-        self._enforce_embedding_policy(plog=plog)
+        config = _resolve_config(client_id)
+        _log_resolved_config(config, plog=plog)
+
+        self._enforce_embedding_policy(config, plog=plog)
 
         hook = self._make_pii_hook(
+            config,
             file_id=file_id,
             client_id=client_id,
             plog=plog,

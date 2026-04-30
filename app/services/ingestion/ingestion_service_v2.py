@@ -2855,7 +2855,7 @@ class IngestionServiceV2:
                             meta = {}
                         md = {
                             "file_id": str(_file_id),
-                            "business_id": str(_business_id) if _business_id else "",
+                            "business_id": str(_business_id) if _business_id else "default",
                             "source_type": str(_file_type) if _file_type else "",
                             "semantic_hash": str(c.get("semantic_hash", "")),
                             "file_name": str(_file_name) if _file_name else "",
@@ -2916,6 +2916,19 @@ class IngestionServiceV2:
                             )
                         except Exception:
                             pass  # cost tracking must never block ingestion
+
+                    # ── Tenant audit: ingestion write telemetry ────────────────
+                    try:
+                        from app.services.security.tenant_audit import log_ingestion_write
+                        log_ingestion_write(
+                            tenant_id=str(_business_id) if _business_id else "default",
+                            file_id=str(_file_id),
+                            collection=_col,
+                            vector_count=len(b_ids),
+                            source_type=str(_file_type) if _file_type else "unknown",
+                        )
+                    except Exception:
+                        pass
 
                     log_info(
                         f"[IngestionV2] ✅ Batch {batch_idx + 1}: "

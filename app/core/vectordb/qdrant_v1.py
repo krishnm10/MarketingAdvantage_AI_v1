@@ -16,6 +16,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -174,8 +175,9 @@ class QdrantVectorDB(BaseVectorDB):
             self._client.upsert(collection_name=collection, points=points)
             return BatchUpsertResult(inserted=len(doc_ids))
         except Exception as exc:
-            logger.error("[QdrantVectorDB] batch_upsert failed: %s", exc)
-            return BatchUpsertResult(failed=len(doc_ids))
+            raise self._wrap_error(
+                exc, operation="batch_upsert", collection=collection,
+            ) from exc
 
     def search(
         self,
@@ -183,9 +185,13 @@ class QdrantVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
-        qdrant_filter = _build_qdrant_filter(filters) if filters else None
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
+        qdrant_filter = _build_qdrant_filter(effective_filters) if effective_filters else None
         try:
             response = self._client.query_points(
                 collection_name=collection,
@@ -196,8 +202,9 @@ class QdrantVectorDB(BaseVectorDB):
             )
             results = response.points
         except Exception as exc:
-            logger.error("[QdrantVectorDB] search failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="search", collection=collection, tenant_id=tenant_id,
+            ) from exc
 
         hits = []
         for r in results:
@@ -208,6 +215,13 @@ class QdrantVectorDB(BaseVectorDB):
                 score=round(r.score, 6),
                 metadata=payload,
             ))
+        self._log_tenant_search(
+            tenant_id=tenant_id,
+            collection=collection,
+            filter_count=len(effective_filters),
+            search_mode="vector",
+            result_count=len(hits),
+        )
         return hits
 
     def exists(
@@ -229,14 +243,16 @@ class QdrantVectorDB(BaseVectorDB):
             )
             return [id_str_map[str(r.id)] for r in results if str(r.id) in id_str_map]
         except Exception as exc:
-            logger.warning("[QdrantVectorDB] exists() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="exists", collection=collection,
+            ) from exc
 
     def get_by_ids(
         self,
         *,
         collection: str,
         ids: List[str],
+        tenant_id: Optional[str] = None,
     ) -> List[VectorHit]:
         if not ids:
             return []
@@ -258,16 +274,61 @@ class QdrantVectorDB(BaseVectorDB):
                 ))
             return hits
         except Exception as exc:
-            logger.warning("[QdrantVectorDB] get_by_ids() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="get_by_ids", collection=collection, tenant_id=tenant_id,
+            ) from exc
 
     def count(self, collection: str) -> int:
         try:
             info = self._client.get_collection(collection_name=collection)
             return info.points_count or 0
         except Exception as exc:
-            logger.warning("[QdrantVectorDB] count() failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="count", collection=collection,
+            ) from exc
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        try:
+            info = self._client.get_collection(collection_name=collection)
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": info.points_count or 0,
+                "segments_count": info.segments_count,
+                "status": str(info.status),
+            }
+        except Exception:
+            return {
+                "backend": self.kind,
+                "collection": collection,
+                "document_count": -1,
+            }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        if not ids:
             return 0
+        try:
+            for doc_id, meta in zip(ids, metadatas):
+                self._client.set_payload(
+                    collection_name=collection,
+                    payload=meta,
+                    points=[_to_qdrant_id(doc_id)],
+                )
+            logger.debug(
+                "[QdrantVectorDB] update_metadata '%s': %d doc(s)",
+                collection, len(ids),
+            )
+            return len(ids)
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     def delete(self, *, collection: str, doc_id: str) -> None:
         self._client.delete(
@@ -289,8 +350,9 @@ class QdrantVectorDB(BaseVectorDB):
             )
             return len(doc_ids)
         except Exception as exc:
-            logger.warning("[QdrantVectorDB] delete_many failed: %s", exc)
-            return 0
+            raise self._wrap_error(
+                exc, operation="delete_many", collection=collection,
+            ) from exc
 
 
 def _to_qdrant_id(doc_id: str) -> str:

@@ -3,10 +3,11 @@
 # =============================================
 import asyncio
 import os
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from pydantic import BaseModel
 
 from app.db.models.admin_audit_log import AdminAuditLog
@@ -18,27 +19,83 @@ from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 # Use _get_pipeline() directly — works with ANY backend (Chroma, Qdrant, Milvus...)
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2, _get_pipeline
 from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
+from app.services.ingestion.tenant_guard import resolve_tenant_from_db_record
 from app.llm.llm_client import run_llm_normalization
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
+from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
+from app.utils.tenant_storage_uuid import storage_business_uuid_for_tenant
 
 router = APIRouter(
     prefix="/api/v2/ingestion-admin",
     tags=["Ingestion Admin"],
 )
 
+
+def _assert_filescoped_to_tenant(file: IngestedFileV2, tenant_id: Optional[str]) -> None:
+    """
+    Enforce isolation when requesting file detail/chunks scoped to tenant_id.
+    """
+    if not tenant_id or not str(tenant_id).strip():
+        return
+    try:
+        ctx = validate_tenant_id(
+            str(tenant_id).strip(),
+            source="query",
+            endpoint="ingestion_admin_scope",
+            allow_default=True,
+        )
+    except TenantValidationError:
+        raise HTTPException(status_code=422, detail="Invalid tenant_id") from None
+
+    scoped_uuid = storage_business_uuid_for_tenant(ctx.tenant_id, None)
+    if file.business_id == scoped_uuid:
+        return
+    # Legacy uploads before deterministic UUID wiring (typically default tenant).
+    if ctx.tenant_id == "default" and file.business_id is None:
+        return
+
+    raise HTTPException(status_code=404, detail="File not found")
+
+
 # ===========================================================
 # 1️⃣  LIST ALL INGESTED FILES
 # ===========================================================
 @router.get("/files")
 async def list_ingested_files(
+    tenant_id: Optional[str] = Query(
+        None,
+        description="When set, return only ingestion rows belonging to this tenant (isolated slice).",
+    ),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
-    """Returns a list of all ingested files with metadata."""
-    result = await db.execute(
-        select(IngestedFileV2).order_by(IngestedFileV2.created_at.desc())
-    )
+    """Returns a list of ingested files; optional tenant isolation via tenant_id."""
+    stmt = select(IngestedFileV2)
+    if tenant_id is not None and str(tenant_id).strip():
+        try:
+            ctx = validate_tenant_id(
+                str(tenant_id).strip(),
+                source="query",
+                endpoint="ingestion_admin_files",
+                allow_default=True,
+            )
+        except TenantValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+
+        scoped_uuid = storage_business_uuid_for_tenant(ctx.tenant_id, None)
+        if ctx.tenant_id == "default":
+            stmt = stmt.where(
+                or_(
+                    IngestedFileV2.business_id == scoped_uuid,
+                    IngestedFileV2.business_id.is_(None),
+                )
+            )
+        else:
+            stmt = stmt.where(IngestedFileV2.business_id == scoped_uuid)
+
+    stmt = stmt.order_by(IngestedFileV2.created_at.desc())
+    result = await db.execute(stmt)
     files = result.scalars().all()
     return [
         {
@@ -65,12 +122,14 @@ async def list_ingested_files(
 @router.get("/files/{file_id}")
 async def get_file_detail(
     file_id: str,
+    tenant_id: Optional[str] = Query(None, description="Scope check — rejects files outside tenant"),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
     file = await db.get(IngestedFileV2, file_id)
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
+    _assert_filescoped_to_tenant(file, tenant_id)
     return {
         "id":               str(file.id),
         "file_name":        file.file_name,
@@ -96,9 +155,15 @@ async def get_file_detail(
 @router.get("/files/{file_id}/chunks")
 async def list_file_chunks(
     file_id: str,
+    tenant_id: Optional[str] = Query(None, description="Scope check — rejects files outside tenant"),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
+    parent = await db.get(IngestedFileV2, file_id)
+    if not parent:
+        raise HTTPException(status_code=404, detail="File not found")
+    _assert_filescoped_to_tenant(parent, tenant_id)
+
     result = await db.execute(
         select(IngestedContentV2, GlobalContentIndexV2)
         .outerjoin(
@@ -139,11 +204,21 @@ async def list_file_chunks(
 @router.post("/files/{file_id}/retry")
 async def retry_ingestion(
     file_id: str,
+    db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin")),
 ):
-    """Re-runs full ingestion for the file. Role: admin only."""
-    await IngestionOrchestrator().ingest_file(file_id=file_id)
-    return {"status": "retry_started", "file_id": file_id}
+    """Re-runs full ingestion for the file. Role: admin only.
+    Recovers tenant_id from the existing DB record — never defaults blindly."""
+    file_record = await db.scalar(
+        select(IngestedFileV2).where(IngestedFileV2.id == file_id)
+    )
+    if not file_record:
+        raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
+    tenant_ctx = resolve_tenant_from_db_record(file_record, source="admin_retry")
+    await IngestionOrchestrator().ingest_file(
+        file_id=file_id, client_id=tenant_ctx.tenant_id,
+    )
+    return {"status": "retry_started", "file_id": file_id, "tenant_id": tenant_ctx.tenant_id}
 
 # ===========================================================
 # 5️⃣  CHUNK EDIT / LLM NORMALIZATION

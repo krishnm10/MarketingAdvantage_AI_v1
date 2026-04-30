@@ -14,6 +14,7 @@ from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.utils.logger import log_info, log_warning
 from app.config import ingestion_settings
 from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
+from app.utils.tenant_validator import validate_business_id, TenantValidationError
 import aiofiles
 import re
 import uuid
@@ -87,6 +88,14 @@ async def ingest_file(
     Uses async-safe routing via file_router_v2.
     """
     try:
+        _bctx = validate_business_id(
+            business_id, endpoint="ingest_file", allow_default=True,
+        )
+        business_id = _bctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    try:
         log_info(f"[ingestion_api_v2] Received upload: {file.filename}")
         response = await route_file_ingestion(file=file, business_id=business_id)
         details_status = response.get("status")
@@ -137,6 +146,14 @@ async def ingest_external(
     Ingests external data sources — webpages, RSS feeds, or APIs.
     Honors ENABLE_LLM_NORMALIZATION toggle.
     """
+    try:
+        _bctx = validate_business_id(
+            business_id, endpoint="ingest_external", allow_default=True,
+        )
+        business_id = _bctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     try:
         log_info(f"[ingestion_api_v2] External ingestion triggered: {source_type} → {source_url}")
         if not ingestion_settings.ENABLE_LLM_NORMALIZATION:
@@ -296,6 +313,14 @@ async def ingest_media(
         - message: Human-readable status message
         - perceptual_hash/acoustic_hash: Hash used for deduplication
     """
+    try:
+        _bctx = validate_business_id(
+            business_id, endpoint="ingest_media", allow_default=True,
+        )
+        business_id = _bctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     try:
         # --------------------------------------------------
         # 1. Validate media_kind

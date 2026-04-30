@@ -25,9 +25,10 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.auth.guards import require_role
+from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
 
 logger = logging.getLogger("embedding_alignment_api")
 
@@ -507,32 +508,34 @@ def _check_pii_middleware_status(client_id: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Endpoint
+# Shared report builder (used by GET and admin aggregates)
 # =============================================================================
 
-@router.get("")
-async def get_embedding_alignment(
-    client_id: str = Query(
-        default="default",
-        description=(
-            "Client / tenant identifier. "
-            "Uses the same env-var resolution logic as the live ingestion pipeline. "
-            "Defaults to 'default'."
-        ),
-    ),
-    _user: Any = Depends(require_role("admin", "superadmin")),
+async def compute_embedding_alignment_report(
+    client_id: str,
+    *,
+    allow_default: bool = True,
+    catch_tenant_error: bool = False,
 ) -> Dict[str, Any]:
     """
-    Return the Phase 1 RAG readiness report for the requested client pipeline.
+    Build the embedding-alignment readiness payload for ``client_id``.
 
-    The report includes:
-    - Per-component compatibility checks (Embedder, Tokenizer, Chunking,
-      VectorDB, Reranker, LLM Tokenizer).
-    - An overall readiness score (0–100) and ingestion_ready boolean.
-    - EmbedderBundle summary (model_id, tokenizer_family, embed_max_tokens, …).
-    - Safe chunk-size recommendation derived from DefaultChunkSizer.
-    - Full AlignmentReport (errors, warnings, failure_modes).
+    When ``catch_tenant_error`` is True, invalid tenant IDs return a structured
+    error-shaped dict instead of raising (for batch admin endpoints).
     """
+    try:
+        _tctx = validate_tenant_id(
+            client_id,
+            source="query",
+            endpoint="embedding_alignment",
+            allow_default=allow_default,
+        )
+        client_id = _tctx.tenant_id
+    except TenantValidationError as e:
+        if catch_tenant_error:
+            return _config_error_response(f"Invalid tenant: {e}")
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
     # ── 1. Resolve ClientConfig ──────────────────────────────────────────────
     try:
         config = _resolve_client_config(client_id)
@@ -663,3 +666,37 @@ async def get_embedding_alignment(
         "pii_middleware_status": pii_result["status"],
     })
     return resp
+
+
+# =============================================================================
+# Endpoint
+# =============================================================================
+
+@router.get("")
+async def get_embedding_alignment(
+    client_id: str = Query(
+        default="default",
+        description=(
+            "Client / tenant identifier. "
+            "Uses the same env-var resolution logic as the live ingestion pipeline. "
+            "Defaults to 'default'."
+        ),
+    ),
+    _user: Any = Depends(require_role("admin", "superadmin")),
+) -> Dict[str, Any]:
+    """
+    Return the Phase 1 RAG readiness report for the requested client pipeline.
+
+    The report includes:
+    - Per-component compatibility checks (Embedder, Tokenizer, Chunking,
+      VectorDB, Reranker, LLM Tokenizer).
+    - An overall readiness score (0–100) and ingestion_ready boolean.
+    - EmbedderBundle summary (model_id, tokenizer_family, embed_max_tokens, …).
+    - Safe chunk-size recommendation derived from DefaultChunkSizer.
+    - Full AlignmentReport (errors, warnings, failure_modes).
+    """
+    return await compute_embedding_alignment_report(
+        client_id,
+        allow_default=True,
+        catch_tenant_error=False,
+    )

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -165,7 +166,9 @@ class WeaviateVectorDB(BaseVectorDB):
             self._client.collections.delete(cls_name)
             logger.info("[WeaviateVectorDB] Collection '%s' deleted.", cls_name)
         except Exception as exc:
-            logger.warning("[WeaviateVectorDB] delete_collection failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="delete_collection", collection=collection,
+            ) from exc
 
     # ── Write ─────────────────────────────────────────────────────────
 
@@ -309,8 +312,12 @@ class WeaviateVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
         import weaviate.classes.query as wq
         try:
             from weaviate.collections.classes.filters import Filter
@@ -321,8 +328,8 @@ class WeaviateVectorDB(BaseVectorDB):
         col = self._client.collections.get(cls_name)
 
         where_filter = None
-        if filters:
-            conditions = self._build_weaviate_filters(filters, Filter)
+        if effective_filters:
+            conditions = self._build_weaviate_filters(effective_filters, Filter)
             if conditions:
                 where_filter = (
                     conditions[0] if len(conditions) == 1
@@ -337,7 +344,7 @@ class WeaviateVectorDB(BaseVectorDB):
                 collection=collection,
                 query_embedding=query_embedding,
                 top_k=top_k,
-                filters=filters,
+                filters=effective_filters,
             )
 
         try:
@@ -359,10 +366,17 @@ class WeaviateVectorDB(BaseVectorDB):
                     score=round(score, 6),
                     metadata=props,
                 ))
+            self._log_tenant_search(
+                tenant_id=tenant_id,
+                collection=collection,
+                filter_count=len(effective_filters),
+                search_mode="vector",
+                result_count=len(hits),
+            )
             return hits
         except Exception as exc:
             logger.warning("[WeaviateVectorDB] search gRPC path failed, using REST fallback: %s", exc)
-            return self._search_rest(collection=collection, query_embedding=query_embedding, top_k=top_k, filters=filters)
+            return self._search_rest(collection=collection, query_embedding=query_embedding, top_k=top_k, filters=effective_filters)
 
     def exists(self, *, collection: str, ids: List[str]) -> List[str]:
         """
@@ -392,7 +406,7 @@ class WeaviateVectorDB(BaseVectorDB):
             logger.warning("[WeaviateVectorDB] exists() gRPC path failed, using REST fallback: %s", exc)
             return self._exists_rest(collection, ids)
 
-    def get_by_ids(self, *, collection: str, ids: List[str]) -> List[VectorHit]:
+    def get_by_ids(self, *, collection: str, ids: List[str], tenant_id: Optional[str] = None) -> List[VectorHit]:
         if not ids:
             return []
         if self._prefer_rest_reads:
@@ -436,8 +450,9 @@ class WeaviateVectorDB(BaseVectorDB):
             try:
                 return self._count_rest(collection)
             except Exception as rest_exc:
-                logger.warning("[WeaviateVectorDB] count() REST fallback failed: %s", rest_exc)
-                return 0
+                raise self._wrap_error(
+                    rest_exc, operation="count", collection=collection,
+                ) from rest_exc
 
     def get_all(
         self,
@@ -515,6 +530,45 @@ class WeaviateVectorDB(BaseVectorDB):
         if fetch_embeddings:
             result["embeddings"] = embeddings
         return result
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        try:
+            doc_count = self.count(collection)
+        except Exception:
+            doc_count = -1
+        return {
+            "backend": self.kind,
+            "collection": collection,
+            "document_count": doc_count,
+            "url": self._url,
+        }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        if not ids:
+            return 0
+        cls_name = self._class_name(collection)
+        col = self._client.collections.get(cls_name)
+        updated = 0
+        try:
+            for doc_id, meta in zip(ids, metadatas):
+                weaviate_uuid = self._uuid_for_doc_id(doc_id)
+                col.data.update(uuid=weaviate_uuid, properties=meta)
+                updated += 1
+            logger.debug(
+                "[WeaviateVectorDB] update_metadata '%s': %d doc(s)",
+                collection, updated,
+            )
+            return updated
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     # ── Delete ────────────────────────────────────────────────────────
 

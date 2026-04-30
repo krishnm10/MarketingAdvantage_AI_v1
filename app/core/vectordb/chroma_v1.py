@@ -21,6 +21,7 @@ import chromadb
 from chromadb.config import Settings
 
 from app.core.vectordb.base import BaseVectorDB, BatchUpsertResult, VectorHit
+from app.core.runtime.errors import VectorDBError
 
 logger = logging.getLogger(__name__)
 
@@ -192,9 +193,9 @@ class ChromaVectorDB(BaseVectorDB):
             self._collections.pop(collection, None)
             logger.info("[ChromaVectorDB] Collection '%s' deleted.", collection)
         except Exception as exc:
-            logger.warning(
-                "[ChromaVectorDB] delete_collection '%s' failed: %s", collection, exc
-            )
+            raise self._wrap_error(
+                exc, operation="delete_collection", collection=collection,
+            ) from exc
 
     def get_raw_collection(self, collection: str) -> chromadb.Collection:
         """
@@ -298,12 +299,9 @@ class ChromaVectorDB(BaseVectorDB):
             return BatchUpsertResult(inserted=inserted, updated=updated)
 
         except Exception as exc:
-            logger.error(
-                "[ChromaVectorDB] batch_upsert FAILED on collection '%s': %s\n"
-                "  Attempted: %d vectors | First ID: %s",
-                collection, exc, len(doc_ids), doc_ids[0] if doc_ids else "n/a",
-            )
-            raise   # ← CRITICAL: re-raise so ingestion marks file as FAILED
+            raise self._wrap_error(
+                exc, operation="batch_upsert", collection=collection,
+            ) from exc
 
     # ── Read ──────────────────────────────────────────────────────────
 
@@ -313,8 +311,12 @@ class ChromaVectorDB(BaseVectorDB):
         collection: str,
         query_embedding: List[float],
         top_k: int = 10,
+        tenant_id: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
     ) -> List[VectorHit]:
+        effective_filters = self._enforce_tenant_filter(
+            tenant_id, filters, caller="search", collection=collection,
+        )
         col = self._get_collection(collection)
         n   = min(top_k, col.count() or 1)
 
@@ -323,14 +325,15 @@ class ChromaVectorDB(BaseVectorDB):
             "n_results":        n,
             "include":          ["documents", "metadatas", "distances"],
         }
-        if filters:
-            kwargs["where"] = filters
+        if effective_filters:
+            kwargs["where"] = effective_filters
 
         try:
             res = col.query(**kwargs)
         except Exception as exc:
-            logger.error("[ChromaVectorDB] search failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="search", collection=collection, tenant_id=tenant_id,
+            ) from exc
 
         ids       = res.get("ids",       [[]])[0]
         docs      = res.get("documents", [[]])[0]
@@ -349,6 +352,13 @@ class ChromaVectorDB(BaseVectorDB):
                 score    = round(score, 6),
                 metadata = metas[i] if i < len(metas) else {},
             ))
+        self._log_tenant_search(
+            tenant_id=tenant_id,
+            collection=collection,
+            filter_count=len(effective_filters),
+            search_mode="vector",
+            result_count=len(hits),
+        )
         return hits
 
     def exists(
@@ -368,14 +378,16 @@ class ChromaVectorDB(BaseVectorDB):
             result = col.get(ids=ids, include=[])
             return result.get("ids", [])
         except Exception as exc:
-            logger.warning("[ChromaVectorDB] exists() check failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="exists", collection=collection,
+            ) from exc
 
     def get_by_ids(
         self,
         *,
         collection: str,
         ids: List[str],
+        tenant_id: Optional[str] = None,
     ) -> List[VectorHit]:
         if not ids:
             return []
@@ -383,8 +395,9 @@ class ChromaVectorDB(BaseVectorDB):
         try:
             result = col.get(ids=ids, include=["documents", "metadatas"])
         except Exception as exc:
-            logger.warning("[ChromaVectorDB] get_by_ids() failed: %s", exc)
-            return []
+            raise self._wrap_error(
+                exc, operation="get_by_ids", collection=collection,
+            ) from exc
 
         hits  = []
         r_ids = result.get("ids", [])
@@ -404,8 +417,46 @@ class ChromaVectorDB(BaseVectorDB):
         try:
             return self._get_collection(collection).count()
         except Exception as exc:
-            logger.warning("[ChromaVectorDB] count() failed: %s", exc)
+            raise self._wrap_error(
+                exc, operation="count", collection=collection,
+            ) from exc
+
+    def stats(self, collection: str) -> Dict[str, Any]:
+        try:
+            col = self._get_collection(collection)
+            doc_count = col.count()
+        except Exception:
+            doc_count = -1
+        return {
+            "backend": self.kind,
+            "collection": collection,
+            "document_count": doc_count,
+            "mode": self._mode,
+            "path": self._path,
+        }
+
+    def update_metadata(
+        self,
+        *,
+        collection: str,
+        ids: List[str],
+        metadatas: List[Dict[str, Any]],
+    ) -> int:
+        if not ids:
             return 0
+        col = self._get_collection(collection)
+        safe_metas = [_sanitize_metadata(m) for m in metadatas]
+        try:
+            col.update(ids=ids, metadatas=safe_metas)
+            logger.debug(
+                "[ChromaVectorDB] update_metadata '%s': %d doc(s) updated",
+                collection, len(ids),
+            )
+            return len(ids)
+        except Exception as exc:
+            raise self._wrap_error(
+                exc, operation="update_metadata", collection=collection,
+            ) from exc
 
     def get_all(
         self,
@@ -437,7 +488,9 @@ class ChromaVectorDB(BaseVectorDB):
         try:
             col.delete(ids=[doc_id])
         except Exception as exc:
-            logger.warning("[ChromaVectorDB] delete(%s) failed: %s", doc_id, exc)
+            raise self._wrap_error(
+                exc, operation="delete", collection=collection,
+            ) from exc
 
     def delete_many(self, *, collection: str, doc_ids: List[str]) -> int:
         if not doc_ids:
@@ -449,8 +502,9 @@ class ChromaVectorDB(BaseVectorDB):
                 col.delete(ids=existing)
             return len(existing)
         except Exception as exc:
-            logger.warning("[ChromaVectorDB] delete_many failed: %s", exc)
-            return 0
+            raise self._wrap_error(
+                exc, operation="delete_many", collection=collection,
+            ) from exc
 
     # ── Internal helpers ──────────────────────────────────────────────
 

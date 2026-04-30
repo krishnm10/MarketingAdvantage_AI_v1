@@ -1,0 +1,61 @@
+{
+  "client_id": "ibm",
+  "client_name": "Ibm",
+  "version": "1.0",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingested_content",
+    "chroma": {
+      "persist_directory": "./pluggable_db"
+    }
+  },
+  "embedder": {
+    "type": "ollama",
+    "ollama": {
+      "model": "nomic-embed-text",
+      "base_url": "http://localhost:11434"
+    }
+  },
+  "retrieval": {
+    "search_mode": "semantic",
+    "enable_token_budget": true,
+    "token_budget_context_fraction": 0.6
+  },
+  "llm": {
+    "single": {
+      "type": "ollama",
+      "model": "llama3.2",
+      "base_url": "http://localhost:11434"
+    }
+  },
+  "security": {
+    "pii_middleware": {
+      "enabled": true,
+      "positions": [
+        "pre_embedding",
+        "pre_llm",
+        "post_llm"
+      ],
+      "action": "REDACT",
+      "block_on_severity": "CRITICAL",
+      "trust_score_penalty": 0.15,
+      "audit_log_enabled": true
+    }
+  },
+  "prompt": {
+    "enabled": true,
+    "prompt_type": "rag_context",
+    "max_tokens_warning": 3000
+  },
+  "formatter": {
+    "enabled": true,
+    "response_format": "plain_text",
+    "min_trust_score": 0.3,
+    "block_on_low_trust": true
+  },
+  "context_window": {
+    "enabled": true,
+    "truncation_strategy": "least_relevant",
+    "response_reserve_tokens": 1024
+  }
+}

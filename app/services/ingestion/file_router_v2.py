@@ -4,6 +4,8 @@
 # Gap-2: replaced hardwired if/elif connector routing with ingestor_registry lookup
 import os
 import uuid
+
+from app.utils.tenant_storage_uuid import storage_business_uuid_for_tenant
 import hashlib
 import asyncio
 import aiofiles
@@ -25,6 +27,11 @@ from app.services.ingestion.xml_parser_v2 import parse_xml
 from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2
 from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
+from app.services.ingestion.tenant_guard import (
+    resolve_ingestion_tenant,
+    IngestionTenantViolation,
+    log_ingestion_telemetry,
+)
 from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.session_v2 import async_engine
 from app.utils.logger import log_info, log_warning
@@ -79,13 +86,6 @@ os.makedirs(MEDIA_UPLOAD_DIR, exist_ok=True)
 # -----------------------------------------------------------
 # UTILITIES
 # -----------------------------------------------------------
-def _safe_uuid(value):
-    try:
-        return uuid.UUID(str(value))
-    except Exception:
-        return None
-
-
 def _write_log(message: str):
     """Append a log line. Offloaded to thread to avoid blocking the event loop."""
     line = f"{datetime.now().isoformat()} | {message}\n"
@@ -125,9 +125,20 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         original_file_name = file.filename
         file_ext = _validate_file_extension(original_file_name)
 
+        # ── Tenant enforcement: validate and lock before any processing ──
+        tenant_ctx = resolve_ingestion_tenant(
+            business_id=business_id,
+            file_id="",
+            source="file_upload",
+            allow_default=True,
+        )
+
         # ── Media files (image/audio/video) → route through MediaIngestionHookV1 ──
         if file_ext in MEDIA_EXT_MAP:
-            return await _route_media_ingestion(file, file_ext, business_id)
+            storage_uid_media = storage_business_uuid_for_tenant(
+                tenant_ctx.tenant_id, business_id,
+            )
+            return await _route_media_ingestion(file, file_ext, storage_uid_media)
 
         parser_func = PARSER_MAP[file_ext]
 
@@ -149,18 +160,13 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         file_hash = _compute_file_hash(temp_path)
         _write_log(f"[HASH] {original_file_name} → {file_hash}")
 
-        # ✅ DB deduplication check (hash-only, tenant-scoped)
-        safe_business_id = _safe_uuid(business_id)
+        # ✅ DB deduplication check (hash-only, tenant-scoped by stable UUID)
+        storage_uid = storage_business_uuid_for_tenant(tenant_ctx.tenant_id, business_id)
         async with async_session() as db:
             dedup_query = select(IngestedFileV2).where(
                 IngestedFileV2.meta_data["file_hash"].as_string() == file_hash
             )
-            if safe_business_id:
-                dedup_query = dedup_query.where(
-                    IngestedFileV2.business_id == safe_business_id
-                )
-            else:
-                dedup_query = dedup_query.where(IngestedFileV2.business_id.is_(None))
+            dedup_query = dedup_query.where(IngestedFileV2.business_id == storage_uid)
 
             existing = await db.scalar(dedup_query)
             if existing:
@@ -179,7 +185,7 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             await db.execute(
                 insert(IngestedFileV2).values(
                     id=file_id,
-                    business_id=safe_business_id,
+                    business_id=storage_uid,
                     file_name=original_file_name,
                     file_type=file_ext.replace(".", ""),
                     file_path=saved_path,
@@ -206,7 +212,7 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             from app.worker.broker_config import is_celery_enabled
             if is_celery_enabled():
                 from app.worker.tasks import run_ingestion_pipeline
-                task = run_ingestion_pipeline.delay(file_id, saved_path, file_ext)
+                task = run_ingestion_pipeline.delay(file_id, saved_path, file_ext, tenant_ctx.tenant_id)
                 _write_log(f"[QUEUED] {original_file_name} → task_id={task.id}")
                 log_info(f"[file_router_v2] Queued Celery task task_id={task.id} for {original_file_name}")
                 return {
@@ -224,9 +230,15 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         _write_log(f"[PARSED] {original_file_name} using {parser_func.__name__}")
         await IngestionOrchestrator().ingest_parsed_output(
             file_id=file_id, parsed=parsed_output,
+            client_id=tenant_ctx.tenant_id,
         )
         _write_log(f"[INGESTED] {original_file_name} successfully processed.")
         log_info(f"[file_router_v2] ✅ Ingestion complete (inline) for {original_file_name}")
+        log_ingestion_telemetry(
+            tenant_ctx=tenant_ctx,
+            event="INGESTION_FILE_COMPLETE",
+            extra={"final_file_id": file_id},
+        )
 
         return {"file_id": file_id, "status": "ingested", "path": saved_path, "hash": file_hash}
 
@@ -241,7 +253,11 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
 # -----------------------------------------------------------
 # MEDIA FILE ROUTING (image / audio / video → MediaIngestionHookV1)
 # -----------------------------------------------------------
-async def _route_media_ingestion(file: UploadFile, file_ext: str, business_id: str = None):
+async def _route_media_ingestion(
+    file: UploadFile,
+    file_ext: str,
+    storage_business_id: uuid.UUID,
+):
     """Route image/audio/video uploads through the media ingestion pipeline."""
     original_file_name = file.filename
     media_kind = MEDIA_EXT_MAP[file_ext]
@@ -264,7 +280,8 @@ async def _route_media_ingestion(file: UploadFile, file_ext: str, business_id: s
         await f.write(content)
 
     file_id = str(uuid.uuid4())
-    safe_business_id = str(uuid.UUID(business_id)) if business_id and _safe_uuid(business_id) else str(uuid.uuid4())
+    # Persistable UUID scoped to validated tenant — matches document upload rows.
+    business_id_str = str(storage_business_id)
 
     log_info(f"[file_router_v2] Routing {media_kind} file: {original_file_name}")
     _write_log(f"[MEDIA_ROUTE] {original_file_name} → {media_kind}")
@@ -274,7 +291,7 @@ async def _route_media_ingestion(file: UploadFile, file_ext: str, business_id: s
         file_path=abs_file_path,
         file_type=media_kind,
         parsed_output={},
-        business_id=safe_business_id,
+        business_id=business_id_str,
         media_kind=media_kind,
     )
 
@@ -297,6 +314,14 @@ async def _route_media_ingestion(file: UploadFile, file_ext: str, business_id: s
 # -----------------------------------------------------------
 async def route_external_ingestion(source_type: str, source_url: str, business_id: str = None):
     try:
+        # ── Tenant enforcement: validate and lock before any processing ──
+        tenant_ctx = resolve_ingestion_tenant(
+            business_id=business_id,
+            file_id="",
+            source=f"external/{source_type}",
+            allow_default=True,
+        )
+
         log_info(f"[file_router_v2] Routing {source_type.upper()} source: {source_url}")
         _write_log(f"[ROUTING] {source_type.upper()} → {source_url}")
 
@@ -352,8 +377,11 @@ async def route_external_ingestion(source_type: str, source_url: str, business_i
             result = await connector.fetch(source_url, db_session=db)
             parsed_output = result.to_dict()
 
-            # ✅ Create DB entry for source
-            safe_business_id = _safe_uuid(business_id)
+            # ✅ Create DB entry for source — use stable UUID tied to validated tenant slug
+            safe_business_id = storage_business_uuid_for_tenant(
+                tenant_ctx.tenant_id,
+                business_id,
+            )
             source_id = str(uuid.uuid4())
 
             await db.execute(
@@ -383,6 +411,7 @@ async def route_external_ingestion(source_type: str, source_url: str, business_i
             log_info(f"[file_router_v2] Passing parsed {source_type.upper()} output directly to ingestion pipeline...")
             await IngestionOrchestrator().ingest_parsed_output(
                 file_id=source_id, parsed=parsed_output,
+                client_id=tenant_ctx.tenant_id,
             )
         else:
             log_warning(f"[file_router_v2] No valid chunks found in parsed {source_type.upper()} output. Skipping ingestion.")

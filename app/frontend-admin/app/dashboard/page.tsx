@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import { useFormatDate } from "@/lib/useHydrated";
 import {
   FileStack,
@@ -20,11 +21,14 @@ import {
   RefreshCw,
   XCircle,
   Terminal,
+  Building2,
+  ChevronRight,
   ExternalLink,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import IngestionFeed from "./ingestion-feed";
 import apiClient from "@/lib/apiClient";
+import { API } from "@/lib/apiRoutes";
 
 /* ─── Types ─── */
 interface SystemConfig {
@@ -205,7 +209,7 @@ export default function UnifiedDashboard() {
   /* ─── Fetchers ─── */
   const fetchFiles = useCallback(async () => {
     try {
-      const res = await apiClient.get("/api/v2/ingestion-admin/files");
+      const res = await apiClient.get(API.INGESTION_ADMIN.FILES());
       setFiles(res.data ?? []);
     } catch {
       setFiles([]);
@@ -326,6 +330,14 @@ export default function UnifiedDashboard() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
           <p className="mt-1 text-sm text-slate-500">Monitor your Marketing Advantage AI platform</p>
+          <Link
+            href="/dashboard/multi-customer-rag"
+            className="inline-flex items-center gap-1.5 mt-3 text-xs font-medium text-primary-600 hover:text-primary-800"
+          >
+            <Building2 className="h-3.5 w-3.5" />
+            Multi-customer pipelines & alignment
+            <ChevronRight className="h-3.5 w-3.5 opacity-70" />
+          </Link>
         </div>
         <div className="flex items-center gap-3">
           <span className="flex items-center gap-1.5 text-xs text-slate-400">

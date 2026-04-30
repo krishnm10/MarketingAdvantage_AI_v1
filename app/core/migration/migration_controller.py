@@ -210,24 +210,28 @@ class MigrationController:
             return state
 
         try:
-            from app.core.config.client_config_resolver import get_client_config
-            from app.core.config.config_diff_logger import compare_configs
-            from app.core.config.config_drift_gate import should_block_migration
-
-            old_config = get_client_config(client_id)
-
             from app.core.config.client_config_resolver import (
                 _find_config_path,
-                _load_config_from_path,
+                _load_raw,
+                _DEFAULT_CONFIG_ID,
             )
+            from app.core.config.config_diff_logger import compare_configs
+            from app.core.config.config_drift_gate import should_block_migration
+            from app.core.config.config_drift_scorer import compute_drift_score
+
+            default_path = _find_config_path(_DEFAULT_CONFIG_ID)
             client_path = _find_config_path(client_id)
-            if client_path is None:
+            if default_path is None or client_path is None:
                 return state
 
-            new_config = _load_config_from_path(client_id, client_path)
-            diff = compare_configs(old_config, new_config, client_id)
+            from app.core.config.client_config_schema import ClientConfig
+            baseline = ClientConfig.from_dict(_load_raw(default_path))
+            merged = ClientConfig.from_dict(_load_raw(client_path))
 
-            if should_block_migration(diff):
+            diff = compare_configs(baseline, merged, client_id)
+            drift_score = compute_drift_score(diff)
+
+            if should_block_migration(diff, drift_score):
                 return MigrationState.SHADOW_EXECUTION
 
         except Exception as exc:

@@ -32,6 +32,8 @@ from app.ai.contracts.reranker_contract import (
     ScoredCandidate,
 )
 
+from app.core.runtime.runtime_telemetry import emit_runtime_event
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_CAPS: dict = {
@@ -171,13 +173,12 @@ class CrossEncoderReranker(RerankerContract):
         result = scored[:top_k]
 
         elapsed = round((time.perf_counter() - t0) * 1000, 2)
-        logger.info(
-            "[CrossEncoderReranker] model=%r | in=%d | out=%d | top_score=%.4f | %.1fms",
-            self._model_id,
-            len(candidates),
-            len(result),
-            result[0].rerank_score if result else 0.0,
-            elapsed,
+        emit_runtime_event(
+            "RERANK_EXECUTION",
+            reranker_provider="cross_encoder",
+            reranker_model=self._model_id,
+            reranked_count=len(result),
+            latency_ms={"rerank_ms": elapsed},
         )
         return result
 

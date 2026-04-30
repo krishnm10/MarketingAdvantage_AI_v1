@@ -101,34 +101,45 @@ if celery_app is not None:
         default_retry_delay=60,
         queue="ingestion",
     )
-    def run_ingestion_pipeline(self, file_id: str, saved_path: str, file_ext: str):
+    def run_ingestion_pipeline(self, file_id: str, saved_path: str, file_ext: str, business_id: str = None):
         """
         Parse a file that has already been saved to disk and ingest it.
 
         Arguments:
-            file_id     — UUID string matching the IngestedFileV2 row already created.
-            saved_path  — Absolute or relative path to the saved file on disk.
-            file_ext    — Lowercase extension including dot, e.g. ".pdf".
+            file_id      — UUID string matching the IngestedFileV2 row already created.
+            saved_path   — Absolute or relative path to the saved file on disk.
+            file_ext     — Lowercase extension including dot, e.g. ".pdf".
+            business_id  — Validated tenant ID (recovered from DB record if not provided).
         """
         from app.services.ingestion.file_router_v2 import PARSER_MAP
         from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
+        from app.services.ingestion.tenant_guard import resolve_ingestion_tenant
         from app.utils.logger import log_info, log_warning
 
         try:
+            # Resolve tenant: prefer explicit param, fall back to DB recovery
+            tenant_ctx = resolve_ingestion_tenant(
+                business_id=business_id,
+                file_id=file_id,
+                source="celery_task",
+                allow_default=True,
+            )
+
             parser_func = PARSER_MAP.get(file_ext)
             if parser_func is None:
                 raise ValueError(f"No parser registered for extension: {file_ext}")
 
-            log_info(f"[celery/ingestion] Parsing file_id={file_id}  ext={file_ext}")
+            log_info(f"[celery/ingestion] Parsing file_id={file_id}  ext={file_ext}  tenant={tenant_ctx.tenant_id}")
             parsed_output = _run(parser_func(saved_path))
 
             log_info(f"[celery/ingestion] Running ingestion pipeline for file_id={file_id}")
             _run(IngestionOrchestrator().ingest_parsed_output(
                 file_id=file_id, parsed=parsed_output,
+                client_id=tenant_ctx.tenant_id,
             ))
 
-            log_info(f"[celery/ingestion] ✅ Done — file_id={file_id}")
-            return {"status": "ingested", "file_id": file_id}
+            log_info(f"[celery/ingestion] Done — file_id={file_id}")
+            return {"status": "ingested", "file_id": file_id, "tenant_id": tenant_ctx.tenant_id}
 
         except Exception as exc:
             log_warning(f"[celery/ingestion] Task failed for file_id={file_id}: {exc}")
