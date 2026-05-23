@@ -1,6 +1,7 @@
 # app/retrieval/runtime.py
 
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
+import logging
 
 from app.retrieval.policy import (
     DEFAULT_POLICY_REGISTRY,
@@ -14,13 +15,15 @@ from app.retrieval.types_retrieve import (
     QueryContext,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class RetrievalRuntime:
     """
-    Enterprise retrieval runtime.
+    Enterprise retrieval runtime with tenant isolation.
 
     Responsibilities:
-    - Orchestrate semantic recall
+    - Orchestrate semantic recall with tenant scoping
     - Apply governance policy
     - Score and rank results
     """
@@ -36,13 +39,29 @@ class RetrievalRuntime:
         query_embedding=None,
         intent=None,
         max_results_override: Optional[int] = None,
+        tenant_id: Optional[str] = None,
+        storage_uuid: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[RankedResult], List[RetrievalCandidate]]:
         """
-        Retrieval entry point.
+        Retrieval entry point with tenant isolation.
 
         Supports:
         - Context-based calls (QueryContext)
         - Keyword-based calls (CLI compatibility)
+        
+        Args:
+            ctx: Query context with embedding and intent
+            query_embedding: Query vector (alternative to ctx)
+            intent: Retrieval intent (alternative to ctx)
+            max_results_override: Override default max results
+            tenant_id: Tenant slug for logging (e.g. "acme_corp")
+            storage_uuid: Storage UUID string for tenant isolation filtering
+            filters: Additional metadata filters
+            
+        Tenant Isolation:
+            When storage_uuid is provided, both vector search and SQL hydration
+            filter results to only include documents belonging to that tenant.
         """
 
         # -------------------------------------------------
@@ -60,6 +79,13 @@ class RetrievalRuntime:
             if not hasattr(ctx, "query_embedding"):
                 object.__setattr__(ctx, "query_embedding", query_embedding)
 
+        # Log tenant-scoped retrieval
+        if tenant_id:
+            logger.debug(
+                '{"event":"RETRIEVE_START","tenant_id":"%s","intent":"%s"}',
+                tenant_id, ctx.intent,
+            )
+
         # -------------------------------------------------
         # 1. Resolve policy
         # -------------------------------------------------
@@ -75,7 +101,7 @@ class RetrievalRuntime:
         recall_limit = max(effective_max_results * 40, 200)
 
         # -------------------------------------------------
-        # 3. Semantic recall + hydration
+        # 3. Semantic recall + hydration (with tenant filter)
         # -------------------------------------------------
         candidates: List[RetrievalCandidate] = await self.repository.fetch_candidates(
             query_embedding=(
@@ -84,6 +110,9 @@ class RetrievalRuntime:
                 or getattr(ctx, "vector", None)
             ),
             limit=recall_limit,
+            tenant_id=tenant_id,
+            storage_uuid=storage_uuid,
+            filters=filters,
         )
 
         ranked: List[RankedResult] = []

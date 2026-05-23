@@ -14,7 +14,11 @@ from app.db.models.ingested_content_v2 import IngestedContentV2
 from app.utils.logger import log_info, log_warning
 from app.config import ingestion_settings
 from app.services.ingestion.media.media_ingestion_hook_v1 import MediaIngestionHookV1
-from app.utils.tenant_validator import validate_business_id, TenantValidationError
+from app.utils.tenant_validator import (
+    validate_tenant_id_strict,
+    get_storage_uuid_str,
+    TenantValidationError,
+)
 import aiofiles
 import re
 import uuid
@@ -80,18 +84,28 @@ def _sanitize_filename(raw: str) -> str:
 @router.post("/upload")
 async def ingest_file(
     file: UploadFile = File(...),
-    business_id: str = Form(None),
+    business_id: str = Form(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant / client identifier for tenant-scoped ingestion.",
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Handles ingestion of uploaded files (PDF, DOCX, CSV, TXT, etc.)
     Uses async-safe routing via file_router_v2.
+    
+    Tenant isolation: Files are tagged with business_id and can only be
+    retrieved by queries scoped to the same tenant.
     """
     try:
-        _bctx = validate_business_id(
-            business_id, endpoint="ingest_file", allow_default=True,
+        tenant_ctx = validate_tenant_id_strict(
+            business_id, source="form", endpoint="ingest_file",
         )
-        business_id = _bctx.tenant_id
+        business_id = tenant_ctx.tenant_id
+        # Storage UUID for DB/vector tagging
+        _storage_uuid_str = get_storage_uuid_str(tenant_ctx)
     except TenantValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -139,18 +153,25 @@ async def ingest_file(
 async def ingest_external(
     source_type: str = Form(..., description="Source type: web | rss | api"),
     source_url: str = Form(..., description="URL or API endpoint"),
-    business_id: str = Form(None),
+    business_id: str = Form(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant / client identifier for tenant-scoped ingestion.",
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Ingests external data sources — webpages, RSS feeds, or APIs.
     Honors ENABLE_LLM_NORMALIZATION toggle.
+    
+    Tenant isolation: External content is tagged with business_id.
     """
     try:
-        _bctx = validate_business_id(
-            business_id, endpoint="ingest_external", allow_default=True,
+        tenant_ctx = validate_tenant_id_strict(
+            business_id, source="form", endpoint="ingest_external",
         )
-        business_id = _bctx.tenant_id
+        business_id = tenant_ctx.tenant_id
     except TenantValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
@@ -164,8 +185,14 @@ async def ingest_external(
         try:
             from app.worker.broker_config import is_celery_enabled
             if is_celery_enabled():
+                from app.core.config.client_config_resolver import (
+                    get_celery_ingestion_enqueue_kwargs,
+                )
                 from app.worker.tasks import run_external_ingestion_task
-                task = run_external_ingestion_task.delay(source_type, source_url, business_id)
+                task = run_external_ingestion_task.apply_async(
+                    args=[source_type, source_url, business_id],
+                    **get_celery_ingestion_enqueue_kwargs(business_id),
+                )
                 log_info(f"[ingestion_api_v2] Queued Celery task task_id={task.id} for {source_url}")
                 return {
                     "status": "queued",
@@ -300,11 +327,19 @@ async def update_llm_settings(
 async def ingest_media(
     file: UploadFile = File(...),
     media_kind: str = Form(..., description="audio | image | video"),
-    business_id: str = Form(None),
+    business_id: str = Form(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant / client identifier for tenant-scoped media ingestion.",
+    ),
 ):
     """
     Unified media ingestion endpoint with enterprise-grade deduplication.
     This bypasses file_router_v2 completely.
+    
+    Tenant isolation: Media files are tagged with business_id and deduplicated
+    per-tenant (same file can exist for different tenants).
     
     Returns:
         - status: success | duplicate_skipped | failed
@@ -314,10 +349,10 @@ async def ingest_media(
         - perceptual_hash/acoustic_hash: Hash used for deduplication
     """
     try:
-        _bctx = validate_business_id(
-            business_id, endpoint="ingest_media", allow_default=True,
+        tenant_ctx = validate_tenant_id_strict(
+            business_id, source="form", endpoint="ingest_media",
         )
-        business_id = _bctx.tenant_id
+        business_id = tenant_ctx.tenant_id
     except TenantValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
 

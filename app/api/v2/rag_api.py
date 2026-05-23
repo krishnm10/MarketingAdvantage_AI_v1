@@ -22,13 +22,13 @@ from __future__ import annotations
 
 import json as _json_module
 import logging
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.core.pipeline_factory import pipeline_factory
+from app.core.prompts.ssot import resolve_prompt_ssot
 from app.core.config.client_config_schema import ClientConfig
 from app.core.config.client_config_resolver import (
     get_client_config,
@@ -66,36 +66,6 @@ def _validated_tenant(
         return ctx.tenant_id
     except TenantValidationError as e:
         raise HTTPException(status_code=422, detail=str(e))
-
-_REPO_ROOT = Path(__file__).resolve().parents[3]
-_PROMPTS_DIR = _REPO_ROOT / "app" / "core" / "configs" / "prompts"
-
-
-def _resolve_prompt_template(template_id: str) -> Optional[str]:
-    """
-    Load a prompt template by ID from the prompts store and return
-    the system_instructions string for use as the LLM system prompt.
-    Returns None if the template is not found or cannot be loaded.
-    """
-    template_path = _PROMPTS_DIR / f"{template_id}.json"
-    if not template_path.exists():
-        logger.warning(
-            "[rag_api] Prompt template '%s' not found at %s",
-            template_id, template_path,
-        )
-        return None
-    try:
-        with template_path.open() as f:
-            data = _json_module.load(f)
-        return data.get("system_instructions") or data.get("content") or None
-    except Exception as e:
-        logger.warning(
-            "[rag_api] Failed to load prompt template '%s': %s", template_id, e
-        )
-        return None
-
-
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Request / Response models
@@ -243,16 +213,16 @@ async def rag_query(req: RAGQueryRequest):
 
         effective_system_prompt = req.system_prompt
         if not effective_system_prompt:
-            retrieval_cfg = getattr(
-                getattr(pipeline, "config", None), "retrieval", None
-            )
-            template_id = getattr(retrieval_cfg, "prompt_template_id", None)
-            if template_id:
-                effective_system_prompt = _resolve_prompt_template(template_id)
-                if effective_system_prompt:
+            cfg_for_prompt = getattr(pipeline, "config", None)
+            if cfg_for_prompt is not None:
+                _ps = resolve_prompt_ssot(cfg_for_prompt)
+                effective_system_prompt = _ps.instructions
+                if effective_system_prompt and _ps.effective_template_id:
                     logger.info(
-                        "[rag_api] Using prompt template '%s' for client '%s'.",
-                        template_id, tenant,
+                        "[rag_api] Using prompt SSOT '%s' (source=%s) for client '%s'.",
+                        _ps.effective_template_id,
+                        _ps.source,
+                        tenant,
                     )
 
         result = pipeline.query(

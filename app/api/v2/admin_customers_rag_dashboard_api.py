@@ -4,13 +4,18 @@ Admin aggregate: multi-customer pipeline visibility + embedding-alignment scores
 GET /api/v2/admin/customers-rag-dashboard
     Auth: admin | superadmin
     Tenant list: stems from *.json config files under app/core/configs and configs/.
+
+DELETE /api/v2/admin/tenants/{client_id}/client-config
+    Auth: admin | superadmin
+    Moves the client overlay config file to app/core/configs/_archived/ (soft delete).
 """
 from __future__ import annotations
 
 import logging
+import shutil
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from collections import Counter
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -28,6 +33,8 @@ from app.utils.tenant_validator import TenantValidationError, validate_tenant_id
 from app.utils.tenant_storage_uuid import storage_business_uuid_for_tenant
 from app.db.models.ingested_file_v2 import IngestedFileV2
 from app.db.session_v2 import get_db
+from app.utils.path_sanitizer import sanitize_client_id
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(
@@ -78,6 +85,15 @@ class CustomersRagDashboardResponse(BaseModel):
     cached_pipeline_count: int
     evaluation_templates_count: int
     customers: List[CustomerRow]
+
+
+class ArchiveClientConfigResponse(BaseModel):
+    """Result of archiving (moving) a client overlay config file off the active config path."""
+
+    status: str
+    client_id: str
+    archived_to: str
+    previous_path: str
 
 
 class TenantOverviewResponse(BaseModel):
@@ -208,6 +224,103 @@ async def get_customers_rag_dashboard(
     )
 
 
+@router.delete(
+    "/tenants/{client_id}/client-config",
+    response_model=ArchiveClientConfigResponse,
+)
+async def archive_client_config_file(
+    client_id: str,
+    _user: Any = Depends(require_role("admin", "superadmin")),
+) -> ArchiveClientConfigResponse:
+    """
+    Move the on-disk client overlay (JSON or YAML) out of active config dirs into
+    ``_archived/`` under the primary configs root, then invalidate the pipeline cache.
+    Does not use strict tenant validation so invalid stems from the dashboard can be removed.
+    """
+    try:
+        safe_id = sanitize_client_id(client_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    if safe_id == "default":
+        raise HTTPException(
+            status_code=403,
+            detail="Cannot archive the canonical default client configuration.",
+        )
+
+    # Lazy import so tests can monkeypatch ``rag_config_api._CONFIG_DIRS``.
+    from app.api.v2 import rag_config_api as _rc
+
+    overlay = _rc._get_client_config_path(client_id)
+    if overlay is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No overlay config file found for client_id={safe_id!r}.",
+        )
+
+    overlay_resolved = overlay.resolve()
+    under_allowed = False
+    for base in _rc._CONFIG_DIRS:
+        if not base.is_dir():
+            continue
+        try:
+            overlay_resolved.relative_to(base.resolve())
+            under_allowed = True
+            break
+        except ValueError:
+            continue
+    if not under_allowed:
+        raise HTTPException(
+            status_code=500,
+            detail="Resolved config path is outside allowed directories.",
+        )
+
+    primary_root = _rc._CONFIG_DIRS[0]
+    archive_dir = (primary_root / "_archived").resolve()
+    primary_resolved = primary_root.resolve()
+    if not str(archive_dir).startswith(str(primary_resolved)):
+        raise HTTPException(status_code=500, detail="Invalid archive directory path.")
+
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    dest = archive_dir / f"{ts}_{overlay.name}"
+    n = 1
+    while dest.exists():
+        dest = archive_dir / f"{ts}_{n}_{overlay.name}"
+        n += 1
+        if n > 10_000:
+            raise HTTPException(status_code=500, detail="Could not allocate archive filename.")
+
+    prev_str = str(overlay_resolved)
+    try:
+        shutil.move(prev_str, str(dest))
+    except OSError as e:
+        logger.exception("[archive_client_config] move failed: %s -> %s", prev_str, dest)
+        raise HTTPException(status_code=500, detail=f"Failed to move config file: {e}") from e
+
+    try:
+        pipeline_factory.invalidate(safe_id)
+    except Exception as ex:
+        logger.warning(
+            "[archive_client_config] pipeline cache invalidate failed for %s: %s",
+            safe_id,
+            ex,
+        )
+
+    logger.info(
+        "[archive_client_config] Archived client overlay %s -> %s",
+        prev_str,
+        dest,
+    )
+    return ArchiveClientConfigResponse(
+        status="archived",
+        client_id=safe_id,
+        archived_to=str(dest.resolve()),
+        previous_path=prev_str,
+    )
+
+
 @router.get(
     "/tenants/{client_id}/overview",
     response_model=TenantOverviewResponse,
@@ -311,7 +424,10 @@ async def get_tenant_overview(
             "vectordb_type": cfg.vectordb.type.value,
         }
         if cfg.llm is not None:
-            cfg_h["llm_type"] = cfg.llm.type.value
+            if cfg.llm.chain:
+                cfg_h["llm_type"] = cfg.llm.chain[0].type.value
+            elif cfg.llm.single:
+                cfg_h["llm_type"] = cfg.llm.single.type.value
     except Exception as ex:
         cfg_h = {"resolution_error": str(ex)[:400]}
 

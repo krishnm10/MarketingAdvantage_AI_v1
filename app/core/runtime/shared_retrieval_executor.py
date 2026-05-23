@@ -38,6 +38,7 @@ from app.core.config.client_config_schema import ClientConfig, RetrievalConfig, 
 from app.core.runtime.runtime_context import RAGRuntimeContext
 from app.core.runtime.runtime_telemetry import emit_runtime_event
 from app.core.runtime.errors import RetrievalError
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -270,6 +271,7 @@ class SharedRetrievalExecutor:
         Returns (retrieved_chunks, vector_hits, latency_dict).
         """
         lat: Dict[str, float] = {}
+        vdb_tenant_filter = storage_uuid_str_for_vectordb_metadata(tenant_id)
 
         # Embed
         t0 = time.perf_counter()
@@ -291,7 +293,7 @@ class SharedRetrievalExecutor:
             collection=collection,
             query_embedding=query_embedding,
             top_k=k_retrieval,
-            tenant_id=tenant_id,
+            tenant_id=vdb_tenant_filter,
             filters=effective_filters,
         )
         lat["vectordb_ms"] = round((time.perf_counter() - t0) * 1000, 2)

@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Marketing Advantage AI — Numbered request flows (with files)</title>
+  <style>
+    body { font-family: system-ui, Segoe UI, Arial, sans-serif; margin: 1.5rem; color: #111; max-width: 72rem; }
+    h1 { font-size: 1.35rem; }
+    h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid #ccc; padding-bottom: 0.35rem; }
+    .hint { color: #444; font-size: 0.95rem; margin-bottom: 1.25rem; }
+    .mermaid { overflow-x: auto; margin: 1rem 0; background: #fafafa; padding: 0.75rem; border-radius: 6px; }
+    footer { margin-top: 2.5rem; font-size: 0.85rem; color: #555; }
+    nav { background: #f0f4f8; padding: 0.75rem 1rem; border-radius: 6px; margin-bottom: 1.5rem; font-size: 0.9rem; }
+    nav a { margin-right: 1rem; }
+    @media print {
+      .no-print { display: none !important; }
+      body { margin: 0; max-width: none; }
+      h2 { page-break-after: avoid; }
+      .mermaid { page-break-inside: avoid; }
+    }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>
+    mermaid.initialize({
+      startOnLoad: true,
+      theme: "neutral",
+      securityLevel: "loose",
+      sequence: { actorMargin: 50, messageMargin: 40 },
+    });
+  </script>
+</head>
+<body>
+  <h1>Numbered request flows — file-level architecture</h1>
+  <p class="hint no-print">
+    Steps are <strong>1, 2, 3…</strong> on each arrow (<code>autonumber</code>).<br />
+    <strong>PDF:</strong> <kbd>Ctrl+P</kbd> → Save as PDF (Chrome or Edge).<br />
+    If diagrams do not render from <code>file://</code>, run <code>python -m http.server 8765</code> in this folder and open <code>http://localhost:8765/data_flow_with_files.html</code>.
+  </p>
+
+  <nav class="no-print">
+    <a href="#flow-shell">A. API shell</a>
+    <a href="#flow-login">B. Login</a>
+    <a href="#flow-ingest">C. Ingestion upload</a>
+    <a href="#flow-celery">D. Celery ingestion</a>
+    <a href="#flow-retrieve">E. Retrieve</a>
+    <a href="#flow-rag">F. RAG pipeline</a>
+    <a href="#flow-legacy">G. Static map</a>
+  </nav>
+
+  <h2 id="flow-shell">A. Every authenticated admin API call (HTTP shell)</h2>
+  <p>Typical path from the Next.js admin UI to a protected <code>app/api/v2/*</code> handler.</p>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant P as app/frontend-admin/app/**/page.tsx
+  participant MW as app/frontend-admin/middleware.ts
+  participant AR as app/frontend-admin/lib/apiRoutes.ts
+  participant AC as app/frontend-admin/lib/apiClient.ts
+  participant MN as app/main.py
+  participant RH as app/api/v2/TARGET_api.py
+  participant DP as app/auth/deps.py
+  participant GD as app/auth/guards.py
+
+  U->>P: Click / submit form
+  P->>MW: Navigate (Next.js request)
+  MW-->>P: Continue (matcher may be empty)
+  P->>AR: Build path constant
+      AR-->>P: Return URL e.g. /api/v2/retrieve/query
+  P->>AC: fetch(baseURL + path, Bearer token)
+  AC->>MN: HTTPS JSON request
+  MN->>RH: Dispatch to route handler
+  RH->>GD: Depends(require_role(...)) e.g. retrieve_api
+  GD->>DP: Validate JWT / user
+  DP-->>GD: payload OK
+  GD-->>RH: authorized admin
+  RH-->>AC: JSON response
+  AC-->>P: Parse body
+  P-->>U: Update UI
+  </div>
+
+  <h2 id="flow-login">B. Login → JWT (no Bearer yet on step 1)</h2>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant LP as app/frontend-admin/app/auth/login/page.tsx
+  participant AC as app/frontend-admin/lib/apiClient.ts
+  participant AA as app/api/v2/auth_api.py
+  participant GT as app/auth/generate_token.py
+  participant SE as app/db/session_v2.py
+
+  U->>LP: Enter username / password
+  LP->>AC: POST /api/v2/auth/login
+  AC->>AA: JSON body LoginRequest
+  AA->>SE: Depends(get_db) yields session
+  SE-->>AA: AsyncSession
+  AA->>AA: Verify USERS_DB + password hash
+  AA->>GT: create_access_token(...)
+  GT-->>AA: JWT string
+  AA-->>AC: access_token + role
+  AC-->>LP: Store token (localStorage / pattern in app)
+  LP-->>U: Redirect to dashboard
+  </div>
+
+  <h2 id="flow-ingest">C. Document ingestion — POST <code>/api/v2/ingestion/upload</code></h2>
+  <p>Includes tenant validation, save under <code>static/uploads/api</code>, DB row, then <strong>either</strong> Celery queue <strong>or</strong> inline orchestrator.</p>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant UP as app/frontend-admin/app/ingestion/upload/page.tsx
+  participant AC as app/frontend-admin/lib/apiClient.ts
+  participant IA as app/api/v2/ingestion_api_v2.py
+  participant TV as app/utils/tenant_validator.py
+  participant FR as app/services/ingestion/file_router_v2.py
+  participant SE as app/db/session_v2.py
+  participant MD as app/db/models/ingested_file_v2.py
+  participant ORC as app/services/ingestion/ingestion_orchestrator.py
+  participant SVC as app/services/ingestion/ingestion_service_v2.py
+  participant PR as e.g. pdf_parser_v2.py
+  participant TS as app/worker/tasks.py
+  participant BC as app/worker/broker_config.py
+
+  U->>UP: Choose file + tenant
+  UP->>AC: multipart upload + business_id
+  AC->>IA: POST /api/v2/ingestion/upload
+  IA->>TV: validate_tenant_id_strict(...)
+  TV-->>IA: tenant_ctx
+  IA->>FR: route_file_ingestion(file, business_id)
+  FR->>FR: Stream to disk static/uploads/api/
+  FR->>SE: AsyncSession — dedup query
+  SE->>MD: SELECT by file_hash + business
+  alt duplicate
+    MD-->>FR: existing row
+    FR-->>IA: duplicate_skipped
+  else new file
+    FR->>SE: INSERT IngestedFileV2 status=uploaded
+    SE->>MD: New file_id
+    FR->>BC: is_celery_enabled() broker_config.py
+    alt Celery worker path tasks.py
+      FR->>TS: run_ingestion_pipeline.delay(...)
+      TS-->>FR: task id
+      FR-->>IA: JSON status queued
+    else Inline parsers + orchestrator
+      FR->>PR: parser_func saved_path e.g. pdf_parser_v2.py
+      PR-->>FR: parsed_output
+      FR->>ORC: ingest_parsed_output(...)
+      ORC->>SVC: chunk dedup embed upsert ingestion_service_v2.py
+      SVC-->>ORC: done
+      FR-->>IA: JSON status ingested
+    end
+  end
+  IA-->>AC: JSON
+  AC-->>UP: Show status
+  </div>
+
+  <h2 id="flow-celery">D. Async ingestion continuation (Celery worker)</h2>
+  <p>Starts after the API returns <code>queued</code>; runs in a <strong>Celery worker</strong> process (not the uvicorn web process).</p>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant TS as app/worker/tasks.py
+  participant CA as app/worker/celery_app.py
+  participant BR as Message broker e.g. Redis
+  participant TG as app/services/ingestion/tenant_guard.py
+  participant MAP as file_router_v2.PARSER_MAP
+  participant ORC as app/services/ingestion/ingestion_orchestrator.py
+  participant CFG as app/core/config/client_config_resolver.py
+  participant SEC as app/services/security/ingestion_security.py
+  participant SVC as app/services/ingestion/ingestion_service_v2.py
+  participant VDB as app/core/vectordb/*.py
+
+  TS->>CA: Task consumed from queue ingestion
+  CA->>BR: Ack / transport
+  TS->>TG: resolve_ingestion_tenant(...)
+  TG-->>TS: tenant_ctx
+  TS->>MAP: parser_func = PARSER_MAP[ext]
+  MAP-->>TS: e.g. parse_pdf
+  TS->>TS: _run(parser_func(saved_path))
+  TS->>ORC: IngestionOrchestrator().ingest_parsed_output(...)
+  ORC->>CFG: get_client_config(client_id)
+  ORC->>SEC: sanitize_ingestion_chunks(...)
+  ORC->>SVC: IngestionServiceV2 pipeline
+  SVC->>VDB: Upsert vectors + metadata
+  VDB-->>SVC: OK
+  SVC-->>ORC: complete
+  ORC-->>TS: success
+  TS->>TS: Dispose DB pool cache_clear pipelines per tasks.py
+  </div>
+
+  <h2 id="flow-retrieve">E. Retrieval — POST <code>/api/v2/retrieve/query</code></h2>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant RP as e.g. retrieve/page.tsx
+  participant AC as lib/apiClient.ts
+  participant RT as app/api/v2/retrieve_api.py
+  participant TV as app/utils/tenant_validator.py
+  participant CM as app/retrieval/components.py
+  participant SM as app/middleware/security_middleware.py
+  participant ISV as app/services/ingestion/ingestion_service_v2.py
+  participant RR as app/retrieval/repository.py
+  participant RN as app/retrieval/runtime.py
+  participant POL as app/retrieval/policy.py
+  participant VDB as app/core/vectordb/*.py
+  participant LLM as app/core/llms/* (optional)
+
+  U->>RP: Enter query + client_id
+  RP->>AC: POST /api/v2/retrieve/query
+  AC->>RT: RetrieveRequest JSON + Bearer
+  RT->>RT: Depends(require_role admin) via app/auth/guards.py
+  RT->>TV: validate_tenant_id_strict(client_id)
+  RT->>CM: resolve_config_or_fail + resolve_runtime_components
+  RT->>SM: scan_text (PII + injection gate)
+  opt HyDE
+    RT->>LLM: Hypothetical doc generation
+    LLM-->>RT: embed_text variant
+  end
+  RT->>ISV: embed query (_get_pipeline path when authoritative config)
+  RT->>RR: RetrievalRepository(db, vectordb, collection)
+  RT->>RN: RetrievalRuntime.retrieve(...)
+  RN->>POL: DEFAULT_POLICY_REGISTRY
+  RN->>VDB: Vector search + filters
+  VDB-->>RN: candidate chunks
+  opt generate_answer
+    RT->>LLM: Grounded generation
+  end
+  RT-->>AC: RetrieveResponse JSON
+  AC-->>RP: Render results
+  </div>
+
+  <h2 id="flow-rag">F. Pluggable RAG — POST <code>/api/v2/rag/query</code></h2>
+  <p>Router is mounted under main with prefix from rag router; uses <code>pipeline_factory</code> and <code>rag_pipeline</code> stack.</p>
+  <div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor U as User
+  participant AC as lib/apiClient.ts
+  participant RA as app/api/v2/rag_api.py
+  participant TV as app/utils/tenant_validator.py
+  participant SM as app/middleware/security_middleware.py
+  participant PF as app/core/pipeline_factory.py
+  participant CR as app/core/config/client_config_resolver.py
+  participant RP as app/core/rag_pipeline.py (built pipeline.query)
+  participant VDB as app/core/vectordb/*.py
+  participant LLM as app/core/llms/*
+
+  U->>AC: RAG query + client_id
+  AC->>RA: POST /api/v2/rag/query
+  RA->>TV: validate_tenant_id
+  RA->>SM: scan_text (injection / PII)
+  RA->>PF: get_cached(tenant) or build
+  alt cache miss
+    RA->>CR: get_client_config(tenant)
+    CR-->>RA: ClientConfig
+    RA->>PF: pipeline_factory.build(config)
+  end
+  PF-->>RA: pipeline object
+  RA->>RP: pipeline.query(sanitized_query, ...)
+  RP->>VDB: Retrieve context
+  RP->>LLM: Generate answer
+  LLM-->>RP: text
+  RP-->>RA: RAGQueryResponse
+  RA-->>AC: JSON
+  </div>
+
+  <h2 id="flow-legacy">G. Static layer map (same as overview flowchart)</h2>
+  <p>Complement to the sequences above: boxes show primary folders/files.</p>
+  <div class="mermaid">
+flowchart LR
+  subgraph browser["User browser"]
+    UI["Next.js UI<br/>frontend-admin/app/**/page.tsx"]
+  end
+  subgraph next["Next.js"]
+    MW["middleware.ts"]
+    H["apiRoutes.ts + apiClient.ts"]
+  end
+  subgraph fastapi["FastAPI"]
+    M["app/main.py"]
+    A["app/api/v2/*.py"]
+    W["app/worker/*"]
+  end
+  subgraph data["Stores"]
+    PG[("PostgreSQL")]
+    V[("Vector DB")]
+    LL[("LLM APIs")]
+    BK[("Broker")]
+  end
+  UI --> MW --> H -->|HTTPS| A
+  M --> A
+  A --> W
+  W --> BK
+  A --> PG
+  A --> V
+  A --> LL
+  </div>
+
+  <footer>
+    Flat step list for Excel: <code>request_flow_steps.csv</code> in this folder.<br />
+    MarketingAdvantage_AI_v1 — numbered flows with filenames.
+  </footer>
+</body>
+</html>

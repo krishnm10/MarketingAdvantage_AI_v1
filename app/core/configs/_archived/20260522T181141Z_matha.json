@@ -1,0 +1,150 @@
+{
+  "client_id": "matha",
+  "client_name": "Default",
+  "version": "1.0",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingested_content",
+    "chroma": {
+      "persist_directory": "./testing_Matha",
+      "host": null,
+      "port": 8000,
+      "ssl": false,
+      "api_key_env": null,
+      "tenant": "default_tenant",
+      "database": "default_database",
+      "anonymized_telemetry": false
+    }
+  },
+  "embedder": {
+    "type": "ollama",
+    "gemini": {
+      "model": "gemini-embedding-2",
+      "api_key_env": "GOOGLE_API_KEY"
+    },
+    "ollama": {
+      "model": "nomic-embed-text",
+      "base_url": "http://localhost:11434"
+    }
+  },
+  "retrieval": {
+    "search_mode": "hybrid",
+    "enable_token_budget": true,
+    "token_budget_context_fraction": 0.6,
+    "enable_threshold_gate": false,
+    "threshold_min_score": 0.0,
+    "threshold_min_results": 1,
+    "answer_min_score": 0.25,
+    "enable_hyde": true,
+    "enable_multi_query": true,
+    "multi_query_count": 3,
+    "hybrid_alpha": 0.7,
+    "prompt_template_id": "querysystem"
+  },
+  "ingestion": {
+    "batch_size": 256,
+    "embed_parallelism": 4,
+    "allow_legacy_env_overrides": false,
+    "visual_llm_concurrency": 4,
+    "phantom": {
+      "embed_batch_size": 64,
+      "embed_prefetch": 2,
+      "upsert_batch_size": 128,
+      "upsert_concurrency": 2,
+      "ingest_workers": 4,
+      "parse_workers": 4,
+      "io_thread_pool": 8,
+      "bloom_capacity": 2000000,
+      "bloom_error_rate": 0.001,
+      "l2_dedup_batch": 32,
+      "gravity_clusters": 16,
+      "gravity_batch_size": 512,
+      "stage_collapse_concurrency": 4
+    },
+    "chunk_soft_cap_factors": {
+      "google": 0.85,
+      "openai": 0.92,
+      "cohere": 0.88,
+      "huggingface": 0.98,
+      "ollama": 0.96,
+      "mistral": 0.92,
+      "default": 0.9
+    },
+    "chunking": {
+      "strategy": "semantic",
+      "chunk_size": 512,
+      "chunk_overlap": 64,
+      "min_chunk_len": 30
+    },
+    "deduplication": {
+      "enable_hash_dedup": true,
+      "enable_embedding_dedup": true,
+      "enable_gci_dedup": true,
+      "similarity_threshold": 0.95,
+      "l3_redis_threshold": 500,
+      "l3_embed_batch_size": 64,
+      "l3_search_concurrency": 32
+    }
+  },
+  "tokenization": {
+    "default_tokenizer_backend": "huggingface",
+    "hf_tokenizer_model": "bert-base-multilingual-cased",
+    "use_model_native_tokenizer_for_chunking": true,
+    "chunking_token_counter_cache_size": 512
+  },
+  "celery_dispatch": {
+    "ingestion_queue": "ingestion",
+    "validation_queue": "validation",
+    "max_retries": 3,
+    "retry_delay_seconds": 60,
+    "soft_time_limit": 0,
+    "hard_time_limit": 0
+  },
+  "llm": {
+    "single": {
+      "type": "ollama",
+      "model": "llama3.2:1b",
+      "api_key_env": null,
+      "base_url": "http://localhost:11434",
+      "temperature": 0.3,
+      "max_tokens": 1024
+    }
+  },
+  "reranker": {
+    "type": "flashrank",
+    "model": "ms-marco-MiniLM-L-12-v2",
+    "api_key_env": null,
+    "top_k": 5
+  },
+  "security": {
+    "pii_middleware": {
+      "enabled": true,
+      "positions": [
+        "pre_embedding",
+        "pre_llm",
+        "post_llm"
+      ],
+      "action": "REDACT",
+      "block_on_severity": "CRITICAL",
+      "trust_score_penalty": 0.15,
+      "audit_log_enabled": true
+    }
+  },
+  "prompt": {
+    "enabled": true,
+    "prompt_type": "rag_context",
+    "max_tokens_warning": 3000,
+    "template": null
+  },
+  "formatter": {
+    "enabled": true,
+    "response_format": "plain_text",
+    "min_trust_score": 0.3,
+    "block_on_low_trust": true
+  },
+  "context_window": {
+    "enabled": true,
+    "truncation_strategy": "least_relevant",
+    "response_reserve_tokens": 1024
+  }
+}

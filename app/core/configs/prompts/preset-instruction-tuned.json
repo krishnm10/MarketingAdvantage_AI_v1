@@ -1,0 +1,7 @@
+{
+  "template_id": "preset-instruction-tuned",
+  "name": "Instruction Tuned (preset)",
+  "system_instructions": "Follow the instruction and use only the supplied context to respond.",
+  "version": "1.0.0",
+  "tags": ["preset", "instruction_tuned"]
+}

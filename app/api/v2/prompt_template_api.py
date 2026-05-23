@@ -154,14 +154,26 @@ def _load_template(template_id: str) -> dict:
             status_code=404,
             detail=f"Prompt template '{template_id}' not found.",
         )
-    with path.open() as f:
-        return json.load(f)
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except json.JSONDecodeError as e:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Prompt template '{template_id}' on disk is invalid JSON "
+                f"(line {e.lineno}, column {e.colno}). "
+                "Repair the file under app/core/configs/prompts/ or restore from backup."
+            ),
+        ) from e
 
 
 def _save_template(data: dict) -> None:
     path = _template_path(data["template_id"])
-    with path.open("w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    body = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(path)
 
 
 def _build_prompt_template(data: dict) -> PromptTemplate:

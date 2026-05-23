@@ -10,7 +10,8 @@
 #   POST /api/v2/pipeline-recommendations/preview
 #       → Generate a full pipeline recommendation for a chosen model,
 #         including VectorDB, Reranker, LLM, chunking strategy, safe
-#         token limits, and ready-to-apply env delta sets.
+#         token limits; `env_deltas` carries `tenant_json_hints` (chunking + tokenization)
+#         and empty `infra_env_hints` for those semantics; `pipeline_pluggable_patch` for topology.
 #
 # Security:
 #   - Auth-protected (admin/superadmin only).

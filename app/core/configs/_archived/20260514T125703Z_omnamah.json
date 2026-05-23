@@ -1,0 +1,107 @@
+{
+  "client_id": "omnamah",
+  "client_name": "Default",
+  "version": "1.0",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingested_content",
+    "chroma": {
+      "persist_directory": "./chroma_default",
+      "host": null,
+      "port": 8000,
+      "ssl": false,
+      "api_key_env": null,
+      "tenant": "default_tenant",
+      "database": "default_database",
+      "anonymized_telemetry": false
+    }
+  },
+  "embedder": {
+    "type": "huggingface",
+    "huggingface": {
+      "model": "BAAI/bge-large-en-v1.5",
+      "device": "auto"
+    },
+    "query_prefix": "",
+    "document_prefix": ""
+  },
+  "retrieval": {
+    "search_mode": "hybrid",
+    "enable_token_budget": true,
+    "token_budget_context_fraction": 0.6,
+    "enable_threshold_gate": false,
+    "threshold_min_score": 0.0,
+    "threshold_min_results": 1,
+    "answer_min_score": 0.25,
+    "enable_hyde": true,
+    "enable_multi_query": true,
+    "multi_query_count": 3,
+    "hybrid_alpha": 0.7
+  },
+  "ingestion": {
+    "batch_size": 256,
+    "embed_parallelism": 4,
+    "chunk_soft_cap_factors": {
+      "google": 0.85,
+      "openai": 0.92,
+      "cohere": 0.88,
+      "huggingface": 0.98,
+      "ollama": 0.96,
+      "mistral": 0.92,
+      "default": 0.9
+    },
+    "chunking": {
+      "strategy": "semantic",
+      "chunk_size": 512,
+      "chunk_overlap": 64,
+      "min_chunk_len": 30
+    }
+  },
+  "llm": {
+    "single": {
+      "type": "gemini",
+      "model": "gemini-2.5-flash",
+      "base_url": "https://generativelanguage.googleapis.com/v1",
+      "api_key_env": "GOOGLE_API_KEY",
+      "temperature": 0.3,
+      "max_tokens": 1024
+    }
+  },
+  "reranker": {
+    "type": "llm_judge",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "top_k": 5
+  },
+  "security": {
+    "pii_middleware": {
+      "enabled": true,
+      "positions": [
+        "pre_embedding",
+        "pre_llm",
+        "post_llm"
+      ],
+      "action": "REDACT",
+      "block_on_severity": "CRITICAL",
+      "trust_score_penalty": 0.15,
+      "audit_log_enabled": true
+    }
+  },
+  "prompt": {
+    "enabled": true,
+    "prompt_type": "rag_context",
+    "max_tokens_warning": 3000,
+    "template": "Finance & Invoice Specialist Prompt\nRole: You are a Senior Financial Operations Specialist and Invoice Auditor. Your goal is to provide precise, grounded analysis of financial documents, billing cycles, and payment statuses.\n\nInstructions:\n\nAccuracy: Only use the provided {{context}} to answer queries. If an invoice number, date, or amount is not explicitly stated, do not hallucinate it.\n\nCalculations: When summarizing multiple invoices, provide a breakdown of the sum to ensure transparency.\n\nFormatting: Use tables for line-item details and bold text for \"Due Dates\" and \"Total Amounts.\"\n\nDiscrepancy Detection: Flag any inconsistencies (e.g., duplicate invoice numbers or mismatched tax calculations) immediately.\n\nResponse Structure:\n\nExecutive Summary: A 1-2 sentence overview of the financial status.\n\nDetail Table: A breakdown of relevant invoices (Date, ID, Status, Amount).\n\nAction Items: Any pending payments or required approvals.\n\nContext: {{context}}\n\nUser Query: {{query}}"
+  },
+  "formatter": {
+    "enabled": true,
+    "response_format": "plain_text",
+    "min_trust_score": 0.3,
+    "block_on_low_trust": true
+  },
+  "context_window": {
+    "enabled": true,
+    "truncation_strategy": "least_relevant",
+    "response_reserve_tokens": 1024
+  }
+}

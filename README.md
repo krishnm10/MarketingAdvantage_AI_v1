@@ -6,6 +6,7 @@ FastAPI application: ingestion, RAG, admin APIs, and pipeline configuration.
 
 | Topic | Where |
 |--------|--------|
+| **Architecture & onboarding (single PDF-ready guide)** | **[`docs/MarketingAdvantage_AI_Architecture_Guide.md`](docs/MarketingAdvantage_AI_Architecture_Guide.md)** |
 | **Config: `app/config` vs `core/config` vs `core/configs` vs `settings`** | **[`docs/configuration_layout.md`](docs/configuration_layout.md)** — start here |
 | **Package index: legacy ingestion / multimodal toggles** | **[`app/config/README.md`](app/config/README.md)** |
 | **Package index: tenant pipeline schema & resolution** | **[`app/core/config/README.md`](app/core/config/README.md)** |

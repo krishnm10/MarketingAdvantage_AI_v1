@@ -73,6 +73,7 @@ from app.core.runtime.runtime_context import RAGRuntimeContext
 from app.core.runtime.runtime_telemetry import emit_runtime_event
 from app.core.runtime.errors import GenerationError, RetrievalError
 from app.core.runtime.runtime_flags import ENABLE_SHARED_RETRIEVAL, ENABLE_SHARED_GENERATION
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 
 if ENABLE_SHARED_RETRIEVAL:
     from app.core.runtime.shared_retrieval_executor import (
@@ -1014,6 +1015,8 @@ class RAGPipeline:
         """
         latency: Dict[str, float] = {}
 
+        vdb_tenant_filter = storage_uuid_str_for_vectordb_metadata(tenant_id)
+
         # ── STEP 0.5 — HyDE expansion ────────────────────────────────
         embed_base_text = user_query
         if retrieval_cfg.enable_hyde and self.llm is not None:
@@ -1065,7 +1068,7 @@ class RAGPipeline:
                 collection=collection,
                 query_embedding=query_embedding,
                 top_k=k_retrieval,
-                tenant_id=tenant_id,
+                tenant_id=vdb_tenant_filter,
                 filters=effective_filters,
             )
             latency["vectordb_ms"] = round((time.perf_counter() - t0) * 1000, 2)
@@ -1367,6 +1370,7 @@ class RAGPipeline:
         )
 
         lat: Dict[str, Any] = {}
+        vdb_tenant_filter = storage_uuid_str_for_vectordb_metadata(tenant_id)
         t0_total = time.perf_counter()
 
         # ── Generate variants ────────────────────────────────────────
@@ -1407,7 +1411,7 @@ class RAGPipeline:
                 collection=collection,
                 query_embedding=embedding,
                 top_k=k_retrieval,
-                tenant_id=tenant_id,
+                tenant_id=vdb_tenant_filter,
                 filters=effective_filters,
             )
             chunk_dicts = [

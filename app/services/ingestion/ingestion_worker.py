@@ -224,20 +224,22 @@ class IngestionWorker:
         t0 = time.monotonic()
 
         # ── Tenant enforcement: validate before processing ────────────
+        from app.core.config.pipeline_runtime import get_pipeline_identity
         from app.services.ingestion.tenant_guard import resolve_ingestion_tenant
+
         tenant_ctx = resolve_ingestion_tenant(
             business_id=command.business_id,
             file_id=command.file_id,
             source="worker",
             allow_default=True,
         )
-
+        _piw = get_pipeline_identity(tenant_ctx.tenant_id)
         plog = PipelineLogger(
             request_path="ingestion",
             client_id=tenant_ctx.tenant_id,
             pipeline_id=command.command_id,
-            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
-            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+            embedder_model=str(_piw.get("embedder", "unknown")),
+            vectordb_backend=str(_piw.get("vectordb", "unknown")),
         )
         try:
             from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator

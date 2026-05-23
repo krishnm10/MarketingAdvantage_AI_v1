@@ -7,7 +7,8 @@ import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
 import Table from "@/components/ui/Table";
 import Button from "@/components/ui/Button";
-import { FileText, Upload, Loader2, FolderOpen } from "lucide-react";
+import { FileText, Upload, Loader2, FolderOpen, Building2 } from "lucide-react";
+import { useTenant } from "@/contexts/TenantContext";
 
 interface IngestedFile {
   id: string;
@@ -22,14 +23,16 @@ interface IngestedFile {
 }
 
 export default function IngestionListPage() {
+  const { clientId } = useTenant();
   const [files, setFiles] = useState<IngestedFile[]>([]);
   const [loading, setLoading] = useState(true);
   const { formatDateTime } = useFormatDate();
 
   useEffect(() => {
     const loadFiles = async () => {
+      setLoading(true);
       try {
-        const res = await apiClient.get(API.INGESTION_ADMIN.FILES());
+        const res = await apiClient.get(API.INGESTION_ADMIN.FILES(clientId));
         setFiles(res.data ?? []);
       } catch (err) {
         console.error("Failed to fetch ingested files:", err);
@@ -39,7 +42,7 @@ export default function IngestionListPage() {
       }
     };
     loadFiles();
-  }, []);
+  }, [clientId]);
 
   const statusColor = (s: string) => {
     if (s === "completed" || s === "success") return "badge-success";
@@ -49,7 +52,7 @@ export default function IngestionListPage() {
   };
 
   const rows = files.map((f) => [
-    <Link key={f.id} href={`/ingestion/${f.id}`} className="text-primary-400 hover:text-primary-300 font-medium transition-colors flex items-center gap-2">
+    <Link key={f.id} href={`/ingestion/${f.id}?tenant=${encodeURIComponent(clientId)}`} className="text-primary-400 hover:text-primary-300 font-medium transition-colors flex items-center gap-2">
       <FileText className="w-4 h-4" />
       {f.file_name}
     </Link>,
@@ -67,7 +70,13 @@ export default function IngestionListPage() {
       <div className="flex justify-between items-center">
         <div>
           <h1 className="text-2xl font-bold text-white">Ingested Files</h1>
-          <p className="text-slate-400 text-sm mt-1">{files.length} files in the ingestion pipeline</p>
+          <p className="text-slate-400 text-sm mt-1 flex items-center gap-2">
+            {files.length} files in the ingestion pipeline
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-700 text-slate-300 text-xs">
+              <Building2 className="w-3 h-3" />
+              {clientId}
+            </span>
+          </p>
         </div>
         <Link href="/ingestion/upload">
           <Button className="flex items-center gap-2">

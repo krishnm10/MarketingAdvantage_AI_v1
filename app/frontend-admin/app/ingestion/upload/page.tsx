@@ -3,7 +3,8 @@
 import { useState, useRef } from "react";
 import apiClient from "@/lib/apiClient";
 import { useAuth } from "@/lib/useAuth";
-import { Upload, FileUp, CheckCircle2, XCircle, Lock, Loader2, AlertTriangle } from "lucide-react";
+import { Upload, FileUp, CheckCircle2, XCircle, Lock, Loader2, AlertTriangle, Building2 } from "lucide-react";
+import { useTenant } from "@/contexts/TenantContext";
 
 type UploadState = "idle" | "success" | "duplicate" | "error";
 type UploadResultState = Exclude<UploadState, "idle">;
@@ -28,6 +29,7 @@ type UploadResult = {
 
 export default function UploadPage() {
   const { role } = useAuth();
+  const { clientId } = useTenant();
   const [files, setFiles] = useState<File[]>([]);
   const [status, setStatus] = useState<UploadState>("idle");
   const [statusMessage, setStatusMessage] = useState("");
@@ -58,6 +60,7 @@ export default function UploadPage() {
     for (const file of files) {
       const formData = new FormData();
       formData.append("file", file);
+      formData.append("business_id", clientId);
 
       try {
         const res = await apiClient.post<UploadResponse>("/api/v2/ingestion/upload", formData, {
@@ -158,7 +161,13 @@ export default function UploadPage() {
     <div className="max-w-lg space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-white">Upload Files</h1>
-        <p className="text-slate-400 text-sm mt-1">Drag & drop or browse to upload one or more files for ingestion</p>
+        <p className="text-slate-400 text-sm mt-1 flex items-center gap-2">
+          Drag & drop or browse to upload one or more files for ingestion
+        </p>
+        <div className="mt-2 inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-slate-700 text-slate-300 text-xs">
+          <Building2 className="w-3 h-3" />
+          Uploading to tenant: <span className="font-medium text-white">{clientId}</span>
+        </div>
       </div>
 
       <div className="rounded-xl border border-slate-700/50 bg-slate-800/50 backdrop-blur-sm p-6 space-y-5">

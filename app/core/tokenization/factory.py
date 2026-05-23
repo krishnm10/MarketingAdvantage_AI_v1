@@ -98,6 +98,46 @@ def _default_backend() -> str:
 # PUBLIC API
 # ─────────────────────────────────────────────────────────────────────────────
 
+def get_tokenizer_for_client(tokenization_cfg: Any) -> BaseTokenizer:
+    """
+    Build a tokenizer from tenant TokenizationConfig (JSON).
+    Does not read DEFAULT_TOKENIZER_BACKEND / HF_TOKENIZER_MODEL from .env.
+    """
+    from app.core.tokenization.backends import (
+        HuggingFaceTokenizer,
+        NLTKTokenizer,
+        SpacyTokenizer,
+        WhitespaceTokenizer,
+    )
+
+    backend = str(
+        getattr(tokenization_cfg, "default_tokenizer_backend", None) or "huggingface"
+    ).strip().lower()
+    if backend == "huggingface":
+        model = getattr(tokenization_cfg, "hf_tokenizer_model", None) or "bert-base-multilingual-cased"
+        try:
+            return HuggingFaceTokenizer(model_name=str(model))
+        except Exception as e:
+            log_warning("[Tokenization] HuggingFace from client config failed: %s — whitespace", e)
+            return WhitespaceTokenizer()
+    if backend == "spacy":
+        try:
+            return SpacyTokenizer()
+        except Exception as e:
+            log_warning("[Tokenization] spaCy from client config failed: %s — whitespace", e)
+            return WhitespaceTokenizer()
+    if backend == "nltk":
+        try:
+            return NLTKTokenizer()
+        except Exception as e:
+            log_warning("[Tokenization] NLTK from client config failed: %s — whitespace", e)
+            return WhitespaceTokenizer()
+    if backend == "whitespace":
+        return WhitespaceTokenizer()
+    log_warning("[Tokenization] Unknown client backend %r — whitespace", backend)
+    return WhitespaceTokenizer()
+
+
 def get_tokenizer(backend: Optional[str] = None) -> BaseTokenizer:
     """
     Get a tokenizer instance for the specified backend.

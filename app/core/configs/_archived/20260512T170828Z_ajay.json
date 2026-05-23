@@ -1,0 +1,84 @@
+{
+  "client_id": "ajay",
+  "client_name": "Default",
+  "version": "1.0",
+  "vectordb": {
+    "type": "chroma",
+    "collection": "ingested_content",
+    "chroma": {
+      "persist_directory": "./pluggable_db",
+      "host": null,
+      "port": 8000,
+      "ssl": false,
+      "api_key_env": null,
+      "tenant": "default_tenant",
+      "database": "default_database",
+      "anonymized_telemetry": false
+    }
+  },
+  "embedder": {
+    "type": "gemini",
+    "gemini": {
+      "model": "gemini-embedding-001",
+      "api_key_env": "GOOGLE_API_KEY"
+    }
+  },
+  "retrieval": {
+    "search_mode": "hybrid",
+    "enable_token_budget": true,
+    "token_budget_context_fraction": 0.6,
+    "enable_threshold_gate": false,
+    "threshold_min_score": 0.0,
+    "threshold_min_results": 1,
+    "enable_hyde": true,
+    "enable_multi_query": true,
+    "multi_query_count": 3,
+    "hybrid_alpha": 0.7
+  },
+  "llm": {
+    "single": {
+      "type": "gemini",
+      "model": "gemini-2.5-flash",
+      "api_key_env": "GOOGLE_API_KEY",
+      "base_url": "https://generativelanguage.googleapis.com/v1",
+      "temperature": 0.3,
+      "max_tokens": 1024
+    }
+  },
+  "reranker": {
+    "type": "llm_judge",
+    "model": "gpt-4o-mini",
+    "api_key_env": "OPENAI_API_KEY",
+    "top_k": 5
+  },
+  "security": {
+    "pii_middleware": {
+      "enabled": true,
+      "positions": [
+        "pre_embedding",
+        "pre_llm",
+        "post_llm"
+      ],
+      "action": "MASK",
+      "block_on_severity": "CRITICAL",
+      "trust_score_penalty": 0.15,
+      "audit_log_enabled": true
+    }
+  },
+  "prompt": {
+    "enabled": true,
+    "prompt_type": "rag_context",
+    "max_tokens_warning": 3000
+  },
+  "formatter": {
+    "enabled": true,
+    "response_format": "plain_text",
+    "min_trust_score": 0.3,
+    "block_on_low_trust": true
+  },
+  "context_window": {
+    "enabled": true,
+    "truncation_strategy": "least_relevant",
+    "response_reserve_tokens": 1024
+  }
+}

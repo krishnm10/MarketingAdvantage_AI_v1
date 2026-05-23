@@ -1,10 +1,12 @@
 "use client";
-import { useState } from "react";
+
+import { Suspense } from "react";
 import Sidebar from "./Sidebar";
 import Navbar from "./Navbar";
 import Footer from "./Footer";
+import { TenantProvider } from "@/contexts/TenantContext";
 
-export default function AppShell({ children }: { children: React.ReactNode }) {
+function AppShellContent({ children }: { children: React.ReactNode }) {
   return (
     <div className="flex h-screen overflow-hidden bg-slate-50">
       {/* Sidebar */}
@@ -21,5 +23,15 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         <Footer />
       </div>
     </div>
+  );
+}
+
+export default function AppShell({ children }: { children: React.ReactNode }) {
+  return (
+    <Suspense fallback={<div className="flex h-screen items-center justify-center">Loading...</div>}>
+      <TenantProvider>
+        <AppShellContent>{children}</AppShellContent>
+      </TenantProvider>
+    </Suspense>
   );
 }

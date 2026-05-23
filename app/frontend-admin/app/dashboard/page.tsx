@@ -29,6 +29,7 @@ import { cn } from "@/lib/utils";
 import IngestionFeed from "./ingestion-feed";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { useTenant } from "@/contexts/TenantContext";
 
 /* ─── Types ─── */
 interface SystemConfig {
@@ -196,6 +197,7 @@ function StatusBadge({ status }: { status: string }) {
 /* ═══  MAIN DASHBOARD                        ═══ */
 /* ═══════════════════════════════════════════════ */
 export default function UnifiedDashboard() {
+  const { clientId } = useTenant();
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [files, setFiles] = useState<any[]>([]);
   const [health, setHealth] = useState<HealthData | null>(null);
@@ -209,37 +211,68 @@ export default function UnifiedDashboard() {
   /* ─── Fetchers ─── */
   const fetchFiles = useCallback(async () => {
     try {
-      const res = await apiClient.get(API.INGESTION_ADMIN.FILES());
+      const res = await apiClient.get(API.INGESTION_ADMIN.FILES(clientId));
       setFiles(res.data ?? []);
     } catch {
       setFiles([]);
     }
-  }, []);
+  }, [clientId]);
 
   const fetchHealth = useCallback(async () => {
     try {
-      const res = await apiClient.get("/api/v2/ingestion/health");
+      const res = await apiClient.get(`/api/v2/ingestion/health?client_id=${encodeURIComponent(clientId)}&scope=active`);
       setHealth(res.data);
     } catch {
       setHealth({ status: "offline" });
     }
-  }, []);
+  }, [clientId]);
 
   const fetchConfig = useCallback(async () => {
     try {
-      const [healthRes, configRes] = await Promise.all([
-        apiClient.get("/api/v2/ingestion/health"),
+      const [healthRes, configRes, plugRes] = await Promise.all([
+        apiClient.get(`/api/v2/ingestion/health?client_id=${encodeURIComponent(clientId)}&scope=active`),
         apiClient.get("/api/v2/config/").catch(() => null),
+        apiClient.get(API.RAG_CONFIG.PIPELINE_PLUGGABLE_GET(clientId)).catch(() => null),
       ]);
       const env = configRes?.data?.config || {};
+      const plug = plugRes?.data as {
+        vectordb?: string;
+        embedder?: string;
+        embedder_model?: string;
+        llm?: string;
+        llm_model?: string;
+        collection?: string;
+      } | undefined;
+      const emb = (plug?.embedder || "").toLowerCase();
+      const llmP = (plug?.llm || "").toLowerCase();
+      const embModel = (plug?.embedder_model || "").trim();
+      const llmModel = (plug?.llm_model || "").trim();
+
+      const openaiEmbed =
+        emb === "openai" && embModel ? embModel : env.OPENAI_EMBED_MODEL || "text-embedding-3-small";
+      const cohereEmbed =
+        emb === "cohere" && embModel ? embModel : env.COHERE_EMBED_MODEL || "embed-english-v3.0";
+      const geminiEmbed =
+        (emb === "gemini" || emb === "google") && embModel
+          ? embModel
+          : env.GEMINI_EMBED_MODEL || env.GOOGLE_EMBED_MODEL || "gemini-embedding-2";
+      const hfEmbed =
+        emb === "huggingface" && embModel ? embModel : env.HF_EMBED_MODEL || "BAAI/bge-large-en-v1.5";
+
+      const geminiLlm =
+        (llmP === "gemini" || llmP === "google") && llmModel
+          ? llmModel
+          : env.GEMINI_LLM_MODEL || "gemini-1.5-flash";
+      const openaiLlm =
+        llmP === "openai" && llmModel ? llmModel : env.OPENAI_LLM_MODEL || "gpt-4o-mini";
       setConfig({
-        vectordb: healthRes.data?.active?.vectordb || env.MAI_VECTORDB || "qdrant",
-        embedder: healthRes.data?.active?.embedder || env.MAI_EMBEDDER || "huggingface",
-        llm: healthRes.data?.active?.llm || env.MAI_LLM || "ollama",
-        collection: env.MAI_COLLECTION || "ingested_content",
+        vectordb: healthRes.data?.active?.vectordb || plug?.vectordb || "qdrant",
+        embedder: healthRes.data?.active?.embedder || plug?.embedder || "huggingface",
+        llm: healthRes.data?.active?.llm || plug?.llm || "ollama",
+        collection: plug?.collection || "ingested_content",
         ollama_base: env.OLLAMA_BASE_URL || "http://localhost:11434",
         ollama_model: env.OLLAMA_LLM_MODEL || "llama3.1:8b",
-        hf_model: env.HF_EMBED_MODEL || "BAAI/bge-large-en-v1.5",
+        hf_model: hfEmbed,
         db_url: env.DATABASE_URL || "postgresql://localhost/marketing_advantage",
         qdrant_host: env.QDRANT_HOST || "localhost",
         qdrant_port: env.QDRANT_PORT || "6333",
@@ -279,13 +312,13 @@ export default function UnifiedDashboard() {
         redis_ssl: env.REDIS_SSL || "false",
         redis_ssl_ca_certs: env.REDIS_SSL_CA_CERTS || "",
         redis_prefix: env.REDIS_PREFIX || "vec:",
-        openai_embed_model: env.OPENAI_EMBED_MODEL || "text-embedding-3-small",
-        cohere_embed_model: env.COHERE_EMBED_MODEL || "embed-english-v3.0",
-        gemini_embed_model: env.GEMINI_EMBED_MODEL || "gemini-embedding-001",
-        openai_llm_model: env.OPENAI_LLM_MODEL || "gpt-4o-mini",
+        openai_embed_model: openaiEmbed,
+        cohere_embed_model: cohereEmbed,
+        gemini_embed_model: geminiEmbed,
+        openai_llm_model: openaiLlm,
         groq_llm_model: env.GROQ_LLM_MODEL || "llama-3.1-8b-instant",
         anthropic_llm_model: env.ANTHROPIC_LLM_MODEL || "claude-3-5-sonnet-20241022",
-        gemini_llm_model: env.GEMINI_LLM_MODEL || "gemini-1.5-flash",
+        gemini_llm_model: geminiLlm,
         validation_enabled: true,
         conflict_enabled: true,
         temporal_enabled: true,
@@ -293,7 +326,7 @@ export default function UnifiedDashboard() {
     } catch {
       setConfig(null);
     }
-  }, []);
+  }, [clientId]);
 
   const refreshAll = useCallback(async () => {
     setFetching(true);
@@ -637,14 +670,14 @@ export default function UnifiedDashboard() {
               </div>
               <div>
                 <h2 className="text-base font-semibold text-slate-900">Pluggable Pipeline</h2>
-                <p className="text-xs text-slate-400">Global defaults from .env configuration</p>
+                <p className="text-xs text-slate-400">Resolved from merged Client JSON (tenant in NEXT_PUBLIC_DEFAULT_TENANT)</p>
               </div>
             </div>
             <div className="grid grid-cols-1 gap-0 sm:grid-cols-2">
-              <ConfigRow label="MAI_VECTORDB" value={config.vectordb} icon={Database} />
-              <ConfigRow label="MAI_EMBEDDER" value={config.embedder} icon={Brain} />
-              <ConfigRow label="MAI_LLM" value={config.llm} icon={Zap} />
-              <ConfigRow label="MAI_COLLECTION" value={config.collection} icon={HardDrive} />
+              <ConfigRow label="Vector DB" value={config.vectordb} icon={Database} />
+              <ConfigRow label="Embedder" value={config.embedder} icon={Brain} />
+              <ConfigRow label="LLM provider" value={config.llm} icon={Zap} />
+              <ConfigRow label="Collection" value={config.collection} icon={HardDrive} />
             </div>
           </div>
 

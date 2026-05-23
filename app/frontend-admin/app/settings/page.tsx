@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useMemo } from "react";
 import Link from "next/link";
-import { useFormatDate } from "@/lib/useHydrated";
+import { useTenant } from "@/contexts/TenantContext";
 import {
   Database,
   Server,
@@ -47,6 +47,7 @@ import {
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { isTenantJsonEnvKey, pipelineSettingsHref } from "@/lib/forbiddenEnvConfigKeys";
 import InfoTooltip from "@/components/ui/InfoTooltip";
 
 /* ─── Types ─── */
@@ -93,6 +94,42 @@ const CATEGORIES: Category[] = [
   { id: "security",      label: "Security & App",           icon: Shield,       color: "text-red-600" },
 ];
 
+const DEFAULT_PIPELINE_TENANT = process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default";
+
+interface PipelineIdentitySummary {
+  client_id: string;
+  client_name?: string;
+  vectordb: string;
+  embedder: string;
+  llm: string;
+  collection: string;
+  chroma_persist_directory?: string;
+  search_mode?: string;
+  reranker?: string;
+  transport?: string;
+  ingestion?: {
+    chunking?: {
+      strategy?: string;
+      chunk_size?: number;
+      chunk_overlap?: number;
+      min_chunk_len?: number;
+    };
+    batch_size?: number;
+    embed_parallelism?: number;
+  };
+  tokenization?: {
+    default_tokenizer_backend?: string;
+    hf_tokenizer_model?: string;
+    use_model_native_tokenizer_for_chunking?: boolean;
+  };
+  celery_dispatch?: {
+    ingestion_queue?: string;
+    validation_queue?: string;
+    max_retries?: number;
+    retry_delay_seconds?: number;
+  };
+}
+
 /**
  * Concept-aware category matcher.
  * The three concept categories (embedding, storage, generation) use keyword
@@ -124,28 +161,31 @@ const SECTIONS: ConfigSection[] = [
   /* ────────────────── PIPELINE ────────────────── */
   {
     category: "pipeline",
-    title: "Pluggable Pipeline — Global Defaults",
-    description: "Core pipeline configuration driving the entire platform",
+    title: "Pluggable Pipeline — Client JSON vs .env",
+    description:
+      "Embedder / Vector DB / LLM / collection come from merged Client JSON (Pipeline Builder). Here you edit vector transport defaults in .env only.",
     icon: Zap,
     gradient: "from-primary-500 to-primary-700 shadow-primary-600/20",
     keys: [
-      { key: "MAI_VECTORDB", label: "Vector Database", type: "select", options: ["qdrant", "chroma", "pinecone", "milvus", "weaviate", "redis"], tooltip: "Which vector database to use for storing and searching embeddings. Changing this switches the entire storage backend." },
-      { key: "MAI_EMBEDDER", label: "Embedder Provider", type: "select", options: ["huggingface", "ollama", "openai", "cohere", "google"], tooltip: "The AI model provider used to convert text into vector embeddings. HuggingFace/Ollama run locally; OpenAI, Cohere, and Google (Gemini) call external APIs." },
-      { key: "MAI_LLM", label: "LLM Provider", type: "select", options: ["ollama", "openai", "groq", "anthropic", "gemini"], tooltip: "The large language model provider for generating answers, summaries, and HyDE expansions. Ollama runs locally; others require API keys." },
-      { key: "MAI_COLLECTION", label: "Default Collection", tooltip: "The default vector database collection name where all embeddings are stored. Think of it like a database table name." },
-      { key: "MAI_VECTOR_TRANSPORT", label: "Vector Transport", type: "select", options: ["auto", "grpc", "http"], tooltip: "Network protocol for communicating with the vector database. gRPC is faster for large payloads; HTTP is more compatible. Auto picks the best option." },
+      {
+        key: "MAI_VECTOR_TRANSPORT",
+        label: "Vector Transport",
+        type: "select",
+        options: ["auto", "grpc", "http"],
+        tooltip:
+          "Network protocol for vector DB clients when not fully specified in connector config. Pipeline topology (which DB) comes from Client JSON.",
+      },
     ],
   },
   {
     category: "pipeline",
     title: "Ingestion & Deduplication",
-    description: "Control batch ingestion and dedup layers from the .env configuration",
+    description:
+      "Embed parallelism, dedup toggles, L3 batching, and overlap tuning are stored in merged Client JSON (ingestion.*, deduplication.*). Keys below are shown for legacy .env visibility only — they are disabled for edits and must be changed in Pipeline Settings.",
     icon: SettingsIcon,
     gradient: "from-fuchsia-500 to-fuchsia-700 shadow-fuchsia-600/20",
     keys: [
-      { key: "INGEST_BATCH_SIZE", label: "Vector Upsert Batch Size", type: "number", tooltip: "How many embedding vectors are sent to the vector database in one batch during ingestion. Larger batches are faster but use more memory." },
       { key: "INGEST_EMBED_PARALLELISM", label: "Embed Parallelism", type: "number", tooltip: "Number of parallel threads used to generate embeddings during ingestion. Higher values speed up ingestion on multi-core machines." },
-      { key: "CHUNKING_STRATEGY", label: "Chunking Strategy", type: "select", options: ["semantic", "recursive", "overlap", "smart_check", "recursive_overlap", "rust", "structure_aware", "document_aware", "elite", "elite_v2", "token_aware"], tooltip: "How documents are split into smaller chunks before embedding. token_aware uses model-native tokenization for exact limits; semantic/recursive split by meaning; elite/elite_v2 use LLM-assisted intelligent splitting." },
       { key: "MAI_DEDUP_L1_ENABLED", label: "L1 Hash Dedup", type: "boolean", tooltip: "Layer 1 deduplication: fast SHA-256 hash check. Catches exact duplicate chunks instantly with zero performance cost." },
       { key: "MAI_DEDUP_L2_ENABLED", label: "L2 GCI Dedup", type: "boolean", tooltip: "Layer 2 deduplication: Global Content Index lookup. Catches near-duplicate chunks that have the same normalized text content." },
       { key: "MAI_DEDUP_L3_ENABLED", label: "L3 Semantic Dedup", type: "boolean", tooltip: "Layer 3 deduplication: embedding-based similarity search. Catches paraphrased duplicates by comparing vector similarity. Most expensive layer." },
@@ -162,7 +202,8 @@ const SECTIONS: ConfigSection[] = [
   {
     category: "pipeline",
     title: "PHANTOM Hardware Tuning",
-    description: "High-performance tuning for embedding, upsert, and bloom filter",
+    description:
+      "PHANTOM batch and worker settings are in Client JSON (ingestion.phantom). Values below reflect any legacy .env only — use Pipeline Settings to edit.",
     icon: Zap,
     gradient: "from-purple-500 to-purple-700 shadow-purple-600/20",
     keys: [
@@ -177,7 +218,8 @@ const SECTIONS: ConfigSection[] = [
   {
     category: "pipeline",
     title: "Tokenization Engine",
-    description: "Token-aware chunking backend — controls how text is split into tokens for accurate chunk sizing",
+    description:
+      "Tokenizer backend, HF model, native-tokenizer flag, and token chunk limits live in Client JSON (tokenization + ingestion.chunking). Shown here for reference; edits go to Pipeline Settings.",
     icon: Brain,
     gradient: "from-sky-500 to-indigo-600 shadow-sky-600/20",
     keys: [
@@ -186,8 +228,6 @@ const SECTIONS: ConfigSection[] = [
       { key: "CHUNK_SIZE", label: "Token Chunk Size", type: "number", placeholder: "512", tooltip: "Maximum number of tokens per chunk. Controls how large each piece of text is before embedding. 512 is a good default for most embedding models." },
       { key: "CHUNK_OVERLAP", label: "Token Chunk Overlap", type: "number", placeholder: "64", tooltip: "Number of tokens shared between consecutive chunks. Overlap prevents information loss at chunk boundaries." },
       { key: "MIN_CHUNK_TOKENS", label: "Min Chunk Tokens", type: "number", placeholder: "30", tooltip: "Chunks smaller than this token count are discarded as too short to be meaningful. Prevents noisy micro-chunks from polluting search results." },
-      { key: "GEMINI_CHUNK_SOFT_CAP_FACTOR", label: "Gemini Soft Cap Factor", type: "number", placeholder: "0.85", tooltip: "Safety factor applied to Gemini's embed_max_tokens to compute the soft token limit for chunking. Lower = more conservative (0.85 = 85% of model max). Reduces costly remote countTokens API calls for near-limit chunks." },
-      { key: "OPENAI_CHUNK_SOFT_CAP_FACTOR", label: "OpenAI Soft Cap Factor", type: "number", placeholder: "0.92", tooltip: "Safety factor for OpenAI tiktoken chunk sizing. Higher than Gemini since tiktoken is a local tokenizer with no API cost." },
       { key: "CHUNKING_TOKEN_COUNTER_CACHE_SIZE", label: "Token Counter LRU Cache Size", type: "number", placeholder: "512", tooltip: "Number of token count results cached per ingestion pipeline instance. Avoids re-counting repeated text segments during recursive chunking." },
       { key: "HF_TOKENIZER_MODEL", label: "HuggingFace Tokenizer Model", type: "select", options: [
         "bert-base-multilingual-cased",
@@ -223,11 +263,11 @@ const SECTIONS: ConfigSection[] = [
   {
     category: "vectordb",
     title: "ChromaDB",
-    description: "ChromaDB vector store — local path or remote server",
+    description:
+      "Process-wide remote Chroma client (.env). Local on-disk storage for the pluggable RAG pipeline is per-tenant: edit Chroma persist path under Configuration → Tenant vector store (Client JSON), or app/core/configs/<tenant>.json (vectordb.chroma.persist_directory).",
     icon: HardDrive,
     gradient: "from-orange-500 to-orange-700 shadow-orange-600/20",
     keys: [
-      { key: "CHROMA_PATH", label: "Local Storage Path", placeholder: "./chroma_db (leave empty for remote)", tooltip: "File system path where ChromaDB stores data locally. Leave empty if connecting to a remote ChromaDB server instead." },
       { key: "CHROMA_HOST", label: "Remote Host", placeholder: "e.g. chromadb-server (empty = local mode)", tooltip: "Hostname or IP of a remote ChromaDB server. When set, ChromaDB connects via HTTP instead of using local files." },
       { key: "CHROMA_PORT", label: "Remote Port", type: "number", tooltip: "Port number for the remote ChromaDB server. Default is typically 8000." },
       { key: "CHROMA_SSL", label: "SSL", type: "select", options: ["false", "true"], tooltip: "Enable HTTPS encryption for the connection to a remote ChromaDB server. Required for production deployments." },
@@ -735,6 +775,8 @@ function ConfigField({
   onEditChange,
   onReveal,
   original,
+  movedToTenantJson,
+  pipelineHref,
 }: {
   keyDef: ConfigKey;
   value: string;
@@ -743,6 +785,8 @@ function ConfigField({
   onEditChange: (v: string) => void;
   onReveal: () => void;
   original: string;
+  movedToTenantJson?: boolean;
+  pipelineHref?: string;
 }) {
   const [hidden, setHidden] = useState(keyDef.sensitive ?? false);
   const [copied, setCopied] = useState(false);
@@ -772,20 +816,46 @@ function ConfigField({
         "py-3.5 border-b border-slate-100 last:border-0 px-4 -mx-4 rounded-lg transition-colors",
         isChanged ? "bg-amber-50/60" : "hover:bg-slate-50/50"
       )}>
-        <div className="flex items-center gap-2 mb-1.5">
+        <div className="flex items-center gap-2 mb-1.5 flex-wrap">
           <span className="text-xs font-mono text-slate-400">{keyDef.key}</span>
           <span className="text-xs font-medium text-slate-600">{keyDef.label}</span>
+          {movedToTenantJson && (
+            <span
+              className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide text-violet-800"
+              title="Managed via Tenant Pipeline Config (merged Client JSON)"
+            >
+              Moved
+            </span>
+          )}
           {keyDef.tooltip && <InfoTooltip text={keyDef.tooltip} />}
-          {isChanged && (
+          {movedToTenantJson && pipelineHref && (
+            <Link
+              href={pipelineHref}
+              className="ml-auto text-[10px] font-semibold text-primary-600 hover:underline"
+            >
+              Tenant Pipeline →
+            </Link>
+          )}
+          {isChanged && !movedToTenantJson && (
             <span className="ml-auto text-[10px] font-semibold text-amber-600 bg-amber-100 rounded px-1.5 py-0.5">Modified</span>
           )}
         </div>
+        {movedToTenantJson && (
+          <p className="mb-2 text-[11px] text-slate-500">
+            This value is no longer written to <code className="rounded bg-slate-100 px-0.5">.env</code>. Edit it under{" "}
+            <strong>Tenant Pipeline Settings</strong> (chunking, tokenization, PHANTOM, dedup, Celery dispatch).
+          </p>
+        )}
 
         {keyDef.type === "select" && keyDef.options ? (
           <select
             value={editValue}
+            disabled={movedToTenantJson}
             onChange={(e) => onEditChange(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none"
+            className={cn(
+              "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none",
+              movedToTenantJson && "cursor-not-allowed bg-slate-50 text-slate-500",
+            )}
           >
             <option value="">— select —</option>
             {keyDef.options.map((o) => (
@@ -795,8 +865,12 @@ function ConfigField({
         ) : keyDef.type === "boolean" ? (
           <select
             value={editValue}
+            disabled={movedToTenantJson}
             onChange={(e) => onEditChange(e.target.value)}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none"
+            className={cn(
+              "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none",
+              movedToTenantJson && "cursor-not-allowed bg-slate-50 text-slate-500",
+            )}
           >
             <option value="true">true</option>
             <option value="false">false</option>
@@ -805,9 +879,13 @@ function ConfigField({
           <input
             type={keyDef.type === "number" ? "number" : "text"}
             value={editValue}
+            disabled={movedToTenantJson}
             onChange={(e) => onEditChange(e.target.value)}
             placeholder={keyDef.placeholder || keyDef.label}
-            className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none"
+            className={cn(
+              "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-mono focus:border-primary-500 focus:ring-1 focus:ring-primary-500 outline-none",
+              movedToTenantJson && "cursor-not-allowed bg-slate-50 text-slate-500",
+            )}
           />
         )}
       </div>
@@ -819,9 +897,19 @@ function ConfigField({
     <div className="group flex items-center justify-between py-3.5 border-b border-slate-100 last:border-0 hover:bg-slate-50/50 px-4 -mx-4 rounded-lg transition-colors">
       <div className="flex flex-col gap-0.5">
         <span className="text-xs font-mono text-slate-400">{keyDef.key}</span>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 flex-wrap">
           <span className="text-sm font-medium text-slate-700">{keyDef.label}</span>
+          {movedToTenantJson && (
+            <span className="rounded bg-violet-100 px-1.5 py-0.5 text-[10px] font-bold uppercase text-violet-800">
+              Moved
+            </span>
+          )}
           {keyDef.tooltip && <InfoTooltip text={keyDef.tooltip} />}
+          {movedToTenantJson && pipelineHref && (
+            <Link href={pipelineHref} className="text-[10px] font-semibold text-primary-600 hover:underline">
+              Edit in Pipeline →
+            </Link>
+          )}
         </div>
       </div>
       <div className="flex items-center gap-2">
@@ -1009,14 +1097,21 @@ function EmbeddingAlignmentCard({
   error,
   onRefresh,
   chunkSizeEnvVal,
+  chunkSizeTenantVal,
 }: {
   data: AlignmentData | null;
   loading: boolean;
   error: string | null;
   onRefresh: () => void;
   chunkSizeEnvVal: string;
+  /** Preferred: merged Client JSON `ingestion.chunking.chunk_size` for active tenant */
+  chunkSizeTenantVal?: string;
 }) {
-  const chunkSizeNum = parseInt(chunkSizeEnvVal, 10) || null;
+  const effectiveChunkStr =
+    chunkSizeTenantVal != null && String(chunkSizeTenantVal).trim() !== ""
+      ? String(chunkSizeTenantVal)
+      : chunkSizeEnvVal;
+  const chunkSizeNum = parseInt(effectiveChunkStr, 10) || null;
   const isSizeUnsafe =
     data?.safe_chunk_size != null &&
     chunkSizeNum != null &&
@@ -1178,31 +1273,39 @@ function EmbeddingAlignmentCard({
                     isSizeUnsafe ? "text-amber-800" : "text-emerald-800"
                   )}>
                     <span>
-                      Recommended&nbsp;
+                      Safe cap&nbsp;
                       <code className={cn("rounded px-1 font-mono", isSizeUnsafe ? "bg-amber-100" : "bg-emerald-100")}>
-                        CHUNK_SIZE={data.safe_chunk_size}
+                        {data.safe_chunk_size}
+                      </code>
+                      <span className="text-slate-500 font-normal"> tokens (embedder)</span>
+                    </span>
+                    <span>
+                      Your&nbsp;
+                      <code className={cn("rounded px-1 font-mono", isSizeUnsafe ? "bg-amber-100" : "bg-emerald-100")}>
+                        chunk_size={effectiveChunkStr || "—"}
                       </code>
                     </span>
                     {data.recommended_chunk_overlap != null && (
                       <span>
                         <code className={cn("rounded px-1 font-mono", isSizeUnsafe ? "bg-amber-100" : "bg-emerald-100")}>
-                          CHUNK_OVERLAP={data.recommended_chunk_overlap}
+                          chunk_overlap≤{data.recommended_chunk_overlap}
                         </code>
                       </span>
                     )}
                   </p>
                   {isSizeUnsafe && chunkSizeNum != null ? (
                     <p className="text-xs text-amber-700">
-                      Your <code className="bg-amber-100 rounded px-1">CHUNK_SIZE={chunkSizeNum}</code> exceeds the safe
-                      limit of <strong>{data.safe_chunk_size}</strong> — chunks will overflow the embedder context window (F-02).
+                      Your configured chunk size ({chunkSizeNum}) exceeds the safe limit of{" "}
+                      <strong>{data.safe_chunk_size}</strong> — chunks may overflow the embedder context window (F-02).
                     </p>
                   ) : chunkSizeNum != null ? (
                     <p className="text-xs text-emerald-700">
-                      <code className="bg-emerald-100 rounded px-1">CHUNK_SIZE={chunkSizeNum}</code> is within safe bounds.
+                      Configured chunk size ({chunkSizeNum}) is within safe bounds for this embedder.
                     </p>
                   ) : (
                     <p className="text-xs text-slate-500">
-                      CHUNK_SIZE not set — use the safe default above to prevent silent token overflow.
+                      Set <code className="rounded bg-slate-100 px-1">ingestion.chunking.chunk_size</code> in Pipeline Settings
+                      (or legacy .env) to compare against the safe default above.
                     </p>
                   )}
                 </div>
@@ -1238,17 +1341,9 @@ function EmbeddingAlignmentCard({
 
             {/* ── Row 4: tokenizer alignment footer ─────────────────── */}
             <p className="text-[11px] text-slate-400 border-t border-slate-100 pt-3 leading-relaxed">
-              When{" "}
-              <code className="rounded bg-slate-100 px-1">USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING=true</code>{" "}
-              (default), <strong className="text-slate-600">all</strong> chunking strategies use{" "}
-              <strong className="text-slate-600">
-                {data.tokenizer_family ?? "the model's native tokenizer"}
-              </strong>{" "}
-              for accurate token counts —{" "}
-              <code className="rounded bg-slate-100 px-1">token_aware</code> uses it for hard
-              limits; all others use it for quality scoring and metadata.{" "}
-              <code className="rounded bg-slate-100 px-1">DEFAULT_TOKENIZER_BACKEND</code>{" "}
-              is the fallback when no embedder bundle is available.
+              When <strong className="text-slate-600">model-native tokenization</strong> is enabled in tenant JSON, chunking
+              strategies use the embedder tokenizer for counts. Fallback factory tokenizer is{" "}
+              <code className="rounded bg-slate-100 px-1">tokenization.default_tokenizer_backend</code> in Client JSON.
             </p>
           </>
         )}
@@ -1269,6 +1364,7 @@ function SectionCard({
   onRevealKey,
   originalConfig,
   highlight,
+  clientId,
 }: {
   section: ConfigSection;
   config: Record<string, string>;
@@ -1278,9 +1374,15 @@ function SectionCard({
   onRevealKey: (key: string) => void;
   originalConfig: Record<string, string>;
   highlight?: boolean;
+  clientId: string;
 }) {
+  const phRef = pipelineSettingsHref(clientId);
   const changedCount = editing
-    ? section.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length
+    ? section.keys.filter(
+        (k) =>
+          !isTenantJsonEnvKey(k.key) &&
+          editDraft[k.key] !== originalConfig[k.key],
+      ).length
     : 0;
 
   return (
@@ -1317,6 +1419,8 @@ function SectionCard({
             onEditChange={(v) => onEditChange(keyDef.key, v)}
             onReveal={() => onRevealKey(keyDef.key)}
             original={originalConfig[keyDef.key] ?? ""}
+            movedToTenantJson={isTenantJsonEnvKey(keyDef.key)}
+            pipelineHref={phRef}
           />
         ))}
       </div>
@@ -1328,7 +1432,7 @@ function SectionCard({
 /* ─── SETTINGS PAGE ─── */
 /* ═══════════════════════════════════════════════════════════════════════════ */
 export default function SettingsPage() {
-  const { nowTimeStr } = useFormatDate();
+  const { clientId } = useTenant();
 
   /* ── State ── */
   const [config, setConfig] = useState<Record<string, string>>({});
@@ -1345,6 +1449,15 @@ export default function SettingsPage() {
   const [alignmentLoading, setAlignmentLoading] = useState(false);
   const [alignmentError, setAlignmentError] = useState<string | null>(null);
 
+  /* ── Resolved pipeline (Client JSON) for summary chips ── */
+  const [pipelineIdentity, setPipelineIdentity] = useState<PipelineIdentitySummary | null>(null);
+
+  /* ── Per-tenant Chroma / collection (Client JSON patch, not .env) ── */
+  const [tenantChromaPersist, setTenantChromaPersist] = useState("");
+  const [tenantCollection, setTenantCollection] = useState("");
+  const [tenantDisplayName, setTenantDisplayName] = useState("");
+  const [savingTenantVdb, setSavingTenantVdb] = useState(false);
+
   /* ── Category & search state ── */
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchQuery, setSearchQuery] = useState("");
@@ -1354,7 +1467,7 @@ export default function SettingsPage() {
     setAlignmentLoading(true);
     setAlignmentError(null);
     try {
-      const res = await apiClient.get(API.EMBEDDING_ALIGNMENT());
+      const res = await apiClient.get(API.EMBEDDING_ALIGNMENT(clientId));
       setAlignmentData(res.data as AlignmentData);
     } catch (err: any) {
       const msg =
@@ -1365,31 +1478,63 @@ export default function SettingsPage() {
     } finally {
       setAlignmentLoading(false);
     }
-  }, []);
+  }, [clientId]);
+
+  const fetchPipelineIdentity = useCallback(async () => {
+    try {
+      const res = await apiClient.get(API.RAG_CONFIG.PIPELINE_PLUGGABLE_GET(clientId));
+      setPipelineIdentity(res.data as PipelineIdentitySummary);
+    } catch {
+      setPipelineIdentity(null);
+    }
+  }, [clientId]);
+
+  useEffect(() => {
+    if (!pipelineIdentity) {
+      setTenantChromaPersist("");
+      setTenantCollection("");
+      setTenantDisplayName("");
+      return;
+    }
+    setTenantChromaPersist(pipelineIdentity.chroma_persist_directory ?? "");
+    setTenantCollection(pipelineIdentity.collection ?? "");
+    setTenantDisplayName(pipelineIdentity.client_name ?? "");
+  }, [clientId, pipelineIdentity]);
+
+  const tenantVdbDirty = useMemo(() => {
+    if (!pipelineIdentity) return false;
+    return (
+      tenantChromaPersist !== (pipelineIdentity.chroma_persist_directory ?? "") ||
+      tenantCollection !== (pipelineIdentity.collection ?? "") ||
+      tenantDisplayName !== (pipelineIdentity.client_name ?? "")
+    );
+  }, [pipelineIdentity, tenantChromaPersist, tenantCollection, tenantDisplayName]);
 
   /* ── Fetch config from backend ── */
   const fetchConfig = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await apiClient.get("/api/v2/config/");
+      const res = await apiClient.get(API.CONFIG.GET());
       const data: Record<string, string> = res.data.config ?? {};
       setConfig(data);
       setOriginalConfig(data);
       setEditDraft(data);
-      setLastRefreshStr(nowTimeStr());
+      setLastRefreshStr(
+        typeof window !== "undefined" ? new Date().toLocaleTimeString() : "—",
+      );
     } catch (err: any) {
       console.error("Failed to load config:", err);
       setToast({ type: "error", msg: err?.response?.data?.detail || "Failed to load configuration" });
     } finally {
       setLoading(false);
     }
-  }, [nowTimeStr]);
+  }, []);
 
   useEffect(() => {
     fetchConfig();
     fetchAlignment();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    fetchPipelineIdentity();
+  }, [fetchConfig, fetchAlignment, fetchPipelineIdentity]);
 
   /* ── Derived ── */
   const changedKeys = useMemo(() => {
@@ -1400,9 +1545,18 @@ export default function SettingsPage() {
     return keys;
   }, [editDraft, originalConfig]);
 
-  const hasChanges = changedKeys.length > 0;
+  const hasWritableEnvChanges = useMemo(
+    () => changedKeys.some((k) => !isTenantJsonEnvKey(k)),
+    [changedKeys],
+  );
 
-  /* ── Filter sections by category + search ── */
+  const writableChangedCount = useMemo(
+    () => changedKeys.filter((k) => !isTenantJsonEnvKey(k)).length,
+    [changedKeys],
+  );
+
+  const hasDraftChanges = changedKeys.length > 0;
+
   const filteredSections = useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     return SECTIONS.filter((section) => {
@@ -1436,7 +1590,11 @@ export default function SettingsPage() {
     if (!editing) return {};
     const counts: Record<string, number> = {};
     for (const s of SECTIONS) {
-      const changed = s.keys.filter((k) => editDraft[k.key] !== originalConfig[k.key]).length;
+      const changed = s.keys.filter(
+        (k) =>
+          !isTenantJsonEnvKey(k.key) &&
+          editDraft[k.key] !== originalConfig[k.key],
+      ).length;
       if (changed > 0) {
         // Increment all categories this section belongs to
         for (const cat of CATEGORIES) {
@@ -1461,25 +1619,94 @@ export default function SettingsPage() {
   };
 
   const handleSave = async () => {
-    if (!hasChanges) return;
+    const forbidden = changedKeys.filter(isTenantJsonEnvKey);
+    const writable = changedKeys.filter((k) => !isTenantJsonEnvKey(k));
+    if (writable.length === 0) {
+      if (forbidden.length > 0) {
+        setToast({
+          type: "error",
+          msg:
+            "These keys are managed in Tenant Client JSON (Pipeline Settings), not .env: " +
+            `${forbidden.sort().join(", ")}. Open Pipeline Settings to edit them.`,
+        });
+      }
+      return;
+    }
     setSaving(true);
     setToast(null);
 
     const updates: Record<string, string> = {};
-    for (const k of changedKeys) {
+    for (const k of writable) {
       updates[k] = editDraft[k];
     }
 
     try {
-      const res = await apiClient.put("/api/v2/config/", { updates });
-      setToast({ type: "success", msg: `Saved ${changedKeys.length} change(s). ${res.data.message ?? ""}` });
+      const res = await apiClient.put(API.CONFIG.PUT(), { updates });
+      setToast({
+        type: "success",
+        msg: `Saved ${writable.length} change(s). ${res.data.message ?? ""}${
+          forbidden.length ? ` (${forbidden.length} tenant-owned key(s) skipped.)` : ""
+        }`,
+      });
       await fetchConfig();
+      await fetchPipelineIdentity();
       setEditing(false);
     } catch (err: any) {
       console.error("Save failed:", err);
-      setToast({ type: "error", msg: err?.response?.data?.detail || "Failed to save configuration" });
+      const detail = err?.response?.data?.detail;
+      setToast({
+        type: "error",
+        msg:
+          typeof detail === "string"
+            ? detail
+            : detail
+              ? JSON.stringify(detail)
+              : "Failed to save configuration",
+      });
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSaveTenantVectorStore = async () => {
+    if (!tenantVdbDirty || !pipelineIdentity) return;
+    const coll = tenantCollection.trim();
+    if (!coll) {
+      setToast({ type: "error", msg: "Collection name cannot be empty." });
+      return;
+    }
+    if (pipelineIdentity.vectordb === "chroma" && !tenantChromaPersist.trim()) {
+      setToast({ type: "error", msg: "Chroma persist directory cannot be empty for local Chroma in Client JSON." });
+      return;
+    }
+    setSavingTenantVdb(true);
+    setToast(null);
+    const body: Record<string, string> = {};
+    if (coll !== (pipelineIdentity.collection ?? "")) body.collection = coll;
+    const dn = tenantDisplayName.trim();
+    if (dn !== (pipelineIdentity.client_name ?? "").trim()) body.client_name = dn;
+    if (pipelineIdentity.vectordb === "chroma") {
+      const pd = tenantChromaPersist.trim();
+      if (pd !== (pipelineIdentity.chroma_persist_directory ?? "").trim()) {
+        body.chroma_persist_directory = pd;
+      }
+    }
+    if (Object.keys(body).length === 0) {
+      setSavingTenantVdb(false);
+      return;
+    }
+    try {
+      await apiClient.patch(API.RAG_CONFIG.PIPELINE_PLUGGABLE_PATCH(clientId), body);
+      setToast({
+        type: "success",
+        msg: `Saved tenant vector settings for ${clientId} (Client JSON only — does not change .env).`,
+      });
+      await fetchPipelineIdentity();
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || "Failed to save tenant vector store settings.";
+      setToast({ type: "error", msg: typeof msg === "string" ? msg : JSON.stringify(msg) });
+    } finally {
+      setSavingTenantVdb(false);
     }
   };
 
@@ -1497,10 +1724,10 @@ export default function SettingsPage() {
     }
   };
 
-  /* ── Summary values ── */
-  const vectorDb = config["MAI_VECTORDB"] || "—";
-  const embedder = config["MAI_EMBEDDER"] || "—";
-  const llm = config["MAI_LLM"] || "—";
+  /* ── Summary values (pipeline from resolver; task queue still from .env) ── */
+  const vectorDb = pipelineIdentity?.vectordb || "—";
+  const embedder = pipelineIdentity?.embedder || "—";
+  const llm = pipelineIdentity?.llm || "—";
   const celeryOn = config["CELERY_ENABLED"] === "true";
   const celeryBroker = config["CELERY_BROKER"] || "redis";
   const workersActive = [
@@ -1520,7 +1747,7 @@ export default function SettingsPage() {
     <div className="space-y-5">
       {/* ── Pipeline Builder Banner ── */}
       <Link
-        href="/settings/pipeline"
+        href={pipelineSettingsHref(clientId)}
         className="group flex items-center justify-between rounded-xl border border-primary-200 bg-gradient-to-r from-primary-50 to-violet-50 px-5 py-3.5 shadow-sm hover:shadow-md hover:border-primary-300 transition-all duration-200"
       >
         <div className="flex items-center gap-3">
@@ -1561,7 +1788,15 @@ export default function SettingsPage() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900">Configuration</h1>
           <p className="mt-1 text-sm text-slate-500">
-            Read and edit <code className="text-xs bg-slate-100 rounded px-1 py-0.5">.env</code> settings — Admin only
+            <span className="font-medium text-slate-700">System infrastructure</span> — read / edit{" "}
+            <code className="text-xs bg-slate-100 rounded px-1 py-0.5">.env</code> for DB, Redis, Kafka, Celery broker, JWT, and
+            secrets (admin only).{" "}
+            <span className="font-medium text-slate-700">Tenant logic</span> — models, chunking, PHANTOM, dedup, and task dispatch
+            are in merged Client JSON; fields marked <span className="text-violet-700 font-medium">Moved</span> must be edited in{" "}
+            <Link className="text-primary-600 hover:underline font-medium" href={pipelineSettingsHref(clientId)}>
+              Pipeline Settings
+            </Link>
+            .
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1572,7 +1807,11 @@ export default function SettingsPage() {
           {!editing ? (
             <>
               <button
-                onClick={fetchConfig}
+                onClick={() => {
+                  void fetchConfig();
+                  void fetchAlignment();
+                  void fetchPipelineIdentity();
+                }}
                 disabled={loading}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
               >
@@ -1598,7 +1837,7 @@ export default function SettingsPage() {
               </button>
               <button
                 onClick={() => setEditDraft({ ...originalConfig })}
-                disabled={!hasChanges}
+                disabled={!hasDraftChanges}
                 className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-40"
               >
                 <Undo2 className="h-3.5 w-3.5" />
@@ -1606,21 +1845,116 @@ export default function SettingsPage() {
               </button>
               <button
                 onClick={handleSave}
-                disabled={!hasChanges || saving}
+                disabled={!hasWritableEnvChanges || saving}
                 className={cn(
                   "inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-xs font-semibold text-white shadow transition-colors",
-                  hasChanges
+                  hasWritableEnvChanges
                     ? "bg-emerald-600 hover:bg-emerald-700"
                     : "bg-slate-300 cursor-not-allowed"
                 )}
               >
                 {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
-                Save {hasChanges ? `(${changedKeys.length})` : ""}
+                Save {hasWritableEnvChanges ? `(${writableChangedCount})` : ""}
               </button>
             </>
           )}
         </div>
       </div>
+
+      {/* ── Deployment vs tenant pipeline scope ── */}
+      <div className="rounded-xl border border-sky-200 bg-sky-50/90 px-5 py-4 text-slate-800">
+        <p className="text-sm font-semibold text-sky-900">Where settings live</p>
+        <ul className="mt-2 space-y-1.5 text-xs text-sky-900/90 leading-relaxed">
+          <li>
+            <span className="font-medium">Deployment (.env)</span> — database URL, JWT/CORS, Celery/Kafka flags, and{" "}
+            <em>secret values</em> for env names referenced in tenant JSON (for example API keys named in{" "}
+            <code className="rounded bg-white/80 px-1">api_key_env</code>).
+          </li>
+          <li>
+            <span className="font-medium">Per-tenant pipeline (Client JSON)</span> — chunking, tokenization, PHANTOM tuning,
+            dedup L3 knobs, Celery dispatch (queues / retries), embedder / VectorDB / LLM topology, and retrieval settings live in merged{" "}
+            <code className="rounded bg-white/80 px-1">ClientConfig</code>{" "}
+            (<code className="rounded bg-white/80 px-1">default.json</code> +{" "}
+            <code className="rounded bg-white/80 px-1">app/core/configs/&lt;tenant&gt;.json</code>). The .env UI blocks writes for migrated keys — use{" "}
+            <Link href={pipelineSettingsHref(clientId)} className="font-medium text-primary-700 underline-offset-2 hover:underline">
+              Pipeline Settings
+            </Link>{" "}
+            for those values.
+          </li>
+        </ul>
+      </div>
+
+      {/* ── Per-tenant Chroma / collection (Client JSON) ── */}
+      {!loading && pipelineIdentity && (
+        <div className="rounded-xl border border-violet-200 bg-gradient-to-br from-violet-50/90 to-white px-5 py-4 shadow-sm">
+          <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <p className="text-sm font-semibold text-violet-900">Tenant vector store (Client JSON)</p>
+              <p className="mt-1 text-xs text-violet-900/80 leading-relaxed">
+                Applies only to tenant <code className="rounded bg-white/90 px-1 text-[11px]">{clientId}</code> — file{" "}
+                <code className="rounded bg-white/90 px-1 text-[11px]">app/core/configs/{clientId}.json</code>. Does not
+                change <code className="rounded bg-white/90 px-1 text-[11px]">CHROMA_PATH</code> in{" "}
+                <code className="rounded bg-white/90 px-1 text-[11px]">.env</code>.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void handleSaveTenantVectorStore()}
+              disabled={!tenantVdbDirty || savingTenantVdb}
+              className={cn(
+                "inline-flex shrink-0 items-center justify-center gap-1.5 rounded-lg px-4 py-2 text-xs font-semibold text-white shadow transition-colors",
+                tenantVdbDirty && !savingTenantVdb
+                  ? "bg-violet-600 hover:bg-violet-700"
+                  : "bg-slate-300 cursor-not-allowed",
+              )}
+            >
+              {savingTenantVdb ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
+              Save tenant JSON
+            </button>
+          </div>
+          <div className="mt-4 grid gap-3 sm:grid-cols-3">
+            <label className="block text-xs">
+              <span className="font-medium text-slate-700">Display name (client_name)</span>
+              <input
+                type="text"
+                value={tenantDisplayName}
+                onChange={(e) => setTenantDisplayName(e.target.value)}
+                placeholder="e.g. Acme Corp"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-200"
+              />
+            </label>
+            <label className="block text-xs">
+              <span className="font-medium text-slate-700">Collection</span>
+              <input
+                type="text"
+                value={tenantCollection}
+                onChange={(e) => setTenantCollection(e.target.value)}
+                placeholder="ingested_content"
+                className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800 focus:border-violet-400 focus:outline-none focus:ring-1 focus:ring-violet-200"
+              />
+            </label>
+            <label className="block text-xs">
+              <span className="font-medium text-slate-700">Chroma persist directory</span>
+              <input
+                type="text"
+                value={tenantChromaPersist}
+                onChange={(e) => setTenantChromaPersist(e.target.value)}
+                disabled={pipelineIdentity.vectordb !== "chroma"}
+                placeholder={pipelineIdentity.vectordb === "chroma" ? "./chroma_data/my_tenant" : "N/A (not Chroma)"}
+                className={cn(
+                  "mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm focus:outline-none focus:ring-1",
+                  pipelineIdentity.vectordb === "chroma"
+                    ? "bg-white text-slate-800 focus:border-violet-400 focus:ring-violet-200"
+                    : "cursor-not-allowed bg-slate-100 text-slate-400",
+                )}
+              />
+              {pipelineIdentity.vectordb !== "chroma" && (
+                <span className="mt-1 block text-[10px] text-slate-500">Only shown when merged pipeline uses Chroma.</span>
+              )}
+            </label>
+          </div>
+        </div>
+      )}
 
       {/* ── Edit mode banner ── */}
       {editing && (
@@ -1630,8 +1964,8 @@ export default function SettingsPage() {
             <p className="text-sm font-semibold text-amber-800">Edit Mode Active</p>
             <p className="text-xs text-amber-600">
               Changes are written to the <code className="bg-amber-100 rounded px-1">.env</code> file and applied to the running process.
-              {hasChanges
-                ? ` You have ${changedKeys.length} unsaved change(s).`
+              {hasDraftChanges
+                ? ` You have ${changedKeys.length} unsaved change(s) in this draft (${writableChangedCount} can be saved to .env).`
                 : " No changes yet."}
             </p>
           </div>
@@ -1648,7 +1982,8 @@ export default function SettingsPage() {
 
       {/* ── Quick Summary ── */}
       {!loading && (
-        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+        <>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
             <p className="text-lg font-bold text-primary-600 capitalize">{vectorDb}</p>
             <p className="text-[11px] text-slate-400 mt-0.5">Vector DB</p>
@@ -1677,7 +2012,31 @@ export default function SettingsPage() {
             </p>
             <p className="text-[11px] text-slate-400 mt-0.5">Sentry</p>
           </div>
-        </div>
+          </div>
+          <p className="-mt-1 text-center text-[11px] text-slate-500">
+            {pipelineIdentity ? (
+              <>
+                Client JSON tenant <code className="text-[10px]">{pipelineIdentity.client_id}</code>
+                {pipelineIdentity.client_name ? (
+                  <> · display name {pipelineIdentity.client_name}</>
+                ) : null}
+                {" "}
+                · collection <code className="text-[10px]">{pipelineIdentity.collection}</code>
+                {pipelineIdentity.vectordb === "chroma" && pipelineIdentity.chroma_persist_directory ? (
+                  <>
+                    {" "}
+                    · Chroma path <code className="text-[10px]">{pipelineIdentity.chroma_persist_directory}</code>
+                  </>
+                ) : null}
+                {pipelineIdentity.transport ? (
+                  <> · transport <code className="text-[10px]">{pipelineIdentity.transport}</code></>
+                ) : null}
+              </>
+            ) : (
+              <>Pipeline summary unavailable — check admin API or default tenant JSON.</>
+            )}
+          </p>
+        </>
       )}
 
       {/* ── Category Tabs + Search ── */}
@@ -1756,6 +2115,11 @@ export default function SettingsPage() {
           error={alignmentError}
           onRefresh={fetchAlignment}
           chunkSizeEnvVal={config["CHUNK_SIZE"] ?? ""}
+          chunkSizeTenantVal={
+            pipelineIdentity?.ingestion?.chunking?.chunk_size != null
+              ? String(pipelineIdentity.ingestion.chunking.chunk_size)
+              : ""
+          }
         />
       )}
 
@@ -1773,6 +2137,7 @@ export default function SettingsPage() {
               onRevealKey={handleRevealKey}
               originalConfig={originalConfig}
               highlight={!!searchQuery && searchQuery.length > 1}
+              clientId={clientId}
             />
           ))}
         </div>

@@ -45,7 +45,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
-import os
+import contextvars
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Callable, Dict, Optional, Tuple
@@ -68,17 +69,44 @@ _REMOTE_TOKENIZER_SOURCES: Tuple[str, ...] = (
 # Texts shorter than this are so small they are always safe; skip the API call.
 _APPROX_ONLY_CHAR_THRESHOLD = 80
 
-# Default soft_cap factors per provider family (overrideable via env vars).
-# These are upper bounds on the automatically calibrated value.
-_DEFAULT_SOFT_CAP_FACTORS: Dict[str, float] = {
-    "google":      float(os.getenv("GEMINI_CHUNK_SOFT_CAP_FACTOR",     "0.85")),
-    "openai":      float(os.getenv("OPENAI_CHUNK_SOFT_CAP_FACTOR",     "0.92")),
-    "cohere":      float(os.getenv("COHERE_CHUNK_SOFT_CAP_FACTOR",     "0.88")),
-    "huggingface": float(os.getenv("HF_CHUNK_SOFT_CAP_FACTOR",         "0.98")),
-    "ollama":      float(os.getenv("OLLAMA_CHUNK_SOFT_CAP_FACTOR",     "0.96")),
-    "mistral":     float(os.getenv("MISTRAL_CHUNK_SOFT_CAP_FACTOR",    "0.92")),
-    "default":     float(os.getenv("DEFAULT_CHUNK_SOFT_CAP_FACTOR",    "0.90")),
+_BUILTIN_SOFT_CAP_FACTORS: Dict[str, float] = {
+    "google": 0.85,
+    "openai": 0.92,
+    "cohere": 0.88,
+    "huggingface": 0.98,
+    "ollama": 0.96,
+    "mistral": 0.92,
+    "default": 0.90,
 }
+
+_SOFT_CAP_CTX: contextvars.ContextVar[Optional[Dict[str, float]]] = contextvars.ContextVar(
+    "chunk_soft_cap_factors", default=None
+)
+
+
+def current_soft_cap_factors() -> Dict[str, float]:
+    """Active soft-cap map (request/task scoped when ingestion pushes tenant JSON)."""
+    merged = _SOFT_CAP_CTX.get()
+    if merged is not None:
+        return merged
+    return dict(_BUILTIN_SOFT_CAP_FACTORS)
+
+
+@contextmanager
+def soft_cap_factors_from_client(factors: Optional[Dict[str, float]]):
+    """Temporarily merge *factors* over built-in defaults for chunking token counts."""
+    base = dict(_BUILTIN_SOFT_CAP_FACTORS)
+    if factors:
+        for k, v in factors.items():
+            try:
+                base[str(k).lower()] = float(v)
+            except (TypeError, ValueError):
+                continue
+    tok = _SOFT_CAP_CTX.set(base)
+    try:
+        yield
+    finally:
+        _SOFT_CAP_CTX.reset(tok)
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +167,8 @@ def _default_alignment_metrics(
     Construct conservative default AlignmentMetrics without running calibration.
     Used when calibration has not been run or is unavailable.
     """
-    factor = _DEFAULT_SOFT_CAP_FACTORS.get(
-        provider.lower(), _DEFAULT_SOFT_CAP_FACTORS["default"]
+    factor = current_soft_cap_factors().get(
+        provider.lower(), current_soft_cap_factors()["default"]
     )
     # For remote tokenizers, assume up to 25 % over-count by BERT (ratio_p95=1.25).
     # For local tokenizers, assume up to 5 % variance (ratio_p95=1.05).
@@ -336,6 +364,7 @@ class ChunkingTokenCounter:
         *,
         alignment_metrics: Optional[AlignmentMetrics] = None,
         cache_size: int = 512,
+        factory_backend: Optional[str] = None,
     ) -> "ChunkingTokenCounter":
         """
         Build a ChunkingTokenCounter from an EmbedderBundle.
@@ -359,11 +388,12 @@ class ChunkingTokenCounter:
         is_remote = any(tag in tokenizer_source for tag in _REMOTE_TOKENIZER_SOURCES)
 
         if alignment_metrics is None:
+            fb = (factory_backend or "huggingface").strip().lower()
             alignment_metrics = _default_alignment_metrics(
                 provider=provider,
                 hard_cap=hard_cap,
                 model_id=bundle.model_id,
-                factory_backend=os.getenv("DEFAULT_TOKENIZER_BACKEND", "huggingface"),
+                factory_backend=fb,
             )
 
         return cls(

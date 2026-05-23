@@ -195,7 +195,7 @@ class TestModelDiscovery:
 
     def test_all_providers_have_required_fields(self):
         from app.api.v2.model_discovery_api import _LLM_PROVIDER_DEFS
-        required = {"provider", "display_name", "model_env", "default_model", "key_env"}
+        required = {"provider", "display_name", "default_model", "key_env"}
         for d in _LLM_PROVIDER_DEFS:
             missing = required - set(d.keys())
             assert not missing, f"Provider {d.get('provider', '?')} missing: {missing}"

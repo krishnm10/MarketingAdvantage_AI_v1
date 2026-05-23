@@ -23,6 +23,7 @@ from app.retrieval.types_retrieve import (
 )
 
 from app.db.models.ingested_content_v2 import IngestedContentV2
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 
 # Import async trust signal fetchers
 from app.services.validation.semantic_conflict_engine import (
@@ -299,6 +300,7 @@ class RetrievalRepository:
                     ssl=use_ssl,
                     api_key=api_key,
                     persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db") if not chroma_host else None,
+                    anonymized_telemetry=False,
                 )
             elif db_type == "pinecone":
                 from app.core.vectordb.pinecone_v1 import PineconeVectorDB
@@ -360,32 +362,55 @@ class RetrievalRepository:
         self,
         query_embedding: List[float],
         limit: int = 200,
+        tenant_id: Optional[str] = None,
+        storage_uuid: Optional[str] = None,
+        filters: Optional[Dict[str, Any]] = None,
     ) -> List[RetrievalCandidate]:
         """
-        Fetch and hydrate retrieval candidates.
+        Fetch and hydrate retrieval candidates with tenant isolation.
         
         Pipeline:
-        1. Semantic search (vector similarity)
-        2. Batch database hydration (single query)
+        1. Semantic search (vector similarity) with tenant filter
+        2. Batch database hydration (single query) with tenant filter
         3. Trust signal extraction (async, batched)
         4. Candidate construction
         
         Args:
             query_embedding: Query vector (4096 dims for Qwen3-8B)
             limit: Max candidates to fetch
+            tenant_id: Tenant slug for logging/telemetry (e.g. "acme_corp")
+            storage_uuid: Storage UUID string for vector/SQL filtering (from get_storage_uuid_str)
+            filters: Additional metadata filters to apply
         
         Returns:
             List of hydrated RetrievalCandidate objects
+            
+        Tenant Isolation:
+            When storage_uuid is provided:
+            - Vector search filters on business_id = storage_uuid
+            - SQL hydration filters on business_id = storage_uuid
+            This ensures tenant A cannot retrieve tenant B's documents.
         """
         
         # -------------------------------------------------
-        # 1. SEMANTIC SEARCH (Vector Layer)
+        # 1. SEMANTIC SEARCH (Vector Layer) with tenant filter
         # -------------------------------------------------
+        # Vector layer: ingestion stores metadata["business_id"] as the stable storage
+        # UUID (IngestedFileV2.business_id). Filtering with the tenant slug (e.g. "default")
+        # returns zero hits. Prefer caller-provided storage_uuid; else derive from tenant slug.
+        vectordb_tenant_key: Optional[str]
+        if storage_uuid:
+            vectordb_tenant_key = storage_uuid
+        elif tenant_id:
+            vectordb_tenant_key = storage_uuid_str_for_vectordb_metadata(tenant_id)
+        else:
+            vectordb_tenant_key = None
         log_debug(
             f"[REPO] Starting semantic search | limit={limit} | "
-            f"embedding_dim={len(query_embedding)}"
+            f"embedding_dim={len(query_embedding)} | tenant_slug={tenant_id or 'none'} | "
+            f"vdb_business_id_filter={vectordb_tenant_key or 'none'}"
         )
-        
+
         try:
             import asyncio
             vectordb = self._get_vectordb()
@@ -396,6 +421,8 @@ class RetrievalRepository:
                     collection=self._collection,
                     query_embedding=query_embedding,
                     top_k=limit,
+                    tenant_id=vectordb_tenant_key,
+                    filters=filters,
                 )
             
             vector_hits = await asyncio.get_running_loop().run_in_executor(
@@ -440,12 +467,16 @@ class RetrievalRepository:
         
         log_debug(f"[REPO] Batch fetching {len(semantic_hashes)} by hash + {len(content_ids)} by content_id")
         
-        # Fetch by semantic_hash
+        # Fetch by semantic_hash with tenant filter
         contents_by_hash: Dict[str, IngestedContentV2] = {}
         if semantic_hashes:
             stmt = select(IngestedContentV2).where(
                 IngestedContentV2.semantic_hash.in_(semantic_hashes)
             )
+            # Apply tenant filter if storage_uuid is provided
+            if storage_uuid:
+                stmt = stmt.where(IngestedContentV2.business_id == storage_uuid)
+                log_debug(f"[REPO] Applying tenant filter: business_id={storage_uuid[:8]}...")
             try:
                 result = await self.db.execute(stmt)
                 for c in result.scalars().all():
@@ -454,13 +485,16 @@ class RetrievalRepository:
                 log_warning(f"[REPO] Database fetch by hash FAILED: {e}")
                 return []
         
-        # Fetch by content_id (global_content_id fallback)
+        # Fetch by content_id (global_content_id fallback) with tenant filter
         contents_by_id: Dict[str, IngestedContentV2] = {}
         if content_ids:
             from sqlalchemy import cast, String
             stmt2 = select(IngestedContentV2).where(
                 cast(IngestedContentV2.id, String).in_(content_ids)
             )
+            # Apply tenant filter if storage_uuid is provided
+            if storage_uuid:
+                stmt2 = stmt2.where(IngestedContentV2.business_id == storage_uuid)
             try:
                 result2 = await self.db.execute(stmt2)
                 for c in result2.scalars().all():

@@ -43,7 +43,7 @@ class OllamaLLM(BaseLLM):
         *,
         model: str,
         base_url: str = "http://localhost:11434",
-        timeout: int = 120,
+        timeout: int = 120,  # seconds; retrieve/chat overrides via instantiate_llm + OLLAMA_LLM_TIMEOUT_SECONDS
         keep_alive: str = "5m",
     ):
         try:
@@ -58,7 +58,10 @@ class OllamaLLM(BaseLLM):
         self._client    = _ol.Client(host=base_url, timeout=timeout)
 
         logger.info(
-            "[OllamaLLM] Initialized | model=%s | url=%s", model, base_url
+            "[OllamaLLM] Initialized | model=%s | url=%s | timeout=%ss",
+            model,
+            base_url,
+            timeout,
         )
 
     # ── Properties ──────────────────────────────────────────────────────

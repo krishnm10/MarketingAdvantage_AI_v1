@@ -10,7 +10,7 @@ RESPONSIBILITIES:
     1. Load the default config (base layer — always present).
     2. Load a client-specific override config (if one exists).
     3. Deep-merge the client overrides onto the default base.
-    4. Apply environment-variable overrides (MAI_* vars).
+    4. Optionally apply legacy environment-variable overlays (currently none for pipeline).
     5. Parse the merged dict through Pydantic (schema validation).
     6. Run compatibility validation (embedder ↔ vectordb, API keys, etc.).
     7. Emit structured log with config fingerprint.
@@ -36,6 +36,7 @@ import hashlib
 import json as _json_module
 import logging
 import os
+import uuid as _uuid_module
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -49,7 +50,9 @@ from app.core.config.client_config_schema import (
     VectorDBType,
 )
 from app.utils.path_sanitizer import sanitize_client_id
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 from app.core.runtime.errors import ConfigResolutionError
+from app.core.config.pipeline_runtime import warn_if_deprecated_pipeline_env_set
 
 logger = logging.getLogger(__name__)
 
@@ -109,28 +112,58 @@ def _find_config_path(client_id: str) -> Optional[Path]:
     return None
 
 
+def _resolve_client_id_for_config_lookup(client_id: str) -> str:
+    """
+    Map a canonical tenant storage UUID to its slug when a matching client JSON exists.
+
+    Upload/API callers sometimes send ``business_id`` / ``client_id`` as the derived
+    storage UUID (uuid5 namespace). That string does not match ``matha.json`` etc.,
+    so config falls back to default-only — wrong embedder and Chroma path.
+    """
+    if _find_config_path(client_id):
+        return client_id
+    try:
+        target_uuid = _uuid_module.UUID(str(client_id).strip())
+    except (ValueError, AttributeError, TypeError):
+        return client_id
+    target = str(target_uuid)
+    for base in _CONFIG_DIRS:
+        if not base.is_dir():
+            continue
+        for p in sorted(base.glob("*.json")):
+            if p.name == "default.json":
+                continue
+            stem = p.stem
+            if stem.startswith(".") or stem.endswith(".template"):
+                continue
+            try:
+                if storage_uuid_str_for_vectordb_metadata(stem) == target:
+                    logger.info(
+                        "[ConfigResolver] client_id storage UUID matched tenant slug '%s' "
+                        "for config overlay",
+                        stem,
+                    )
+                    return stem
+            except Exception:
+                continue
+    return client_id
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment overrides
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ENV_OVERRIDES: Dict[str, str] = {
-    "MAI_VECTORDB":     "vectordb.type",
-    "MAI_EMBEDDER":     "embedder.type",
-    "MAI_COLLECTION":   "vectordb.collection",
-    "MAI_SEARCH_MODE":  "retrieval.search_mode",
-}
+# Pipeline semantics (vectordb, embedder, collection, retrieval) are JSON-only —
+# never merge MAI_EMBEDDER / MAI_VECTORDB / etc. into ClientConfig dicts here.
+_ENV_OVERRIDES: Dict[str, str] = {}
 
 
 def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Overlay environment variables onto the raw config dict before Pydantic
-    parsing. Only applies overrides for env vars that are actually set.
-    """
+    """Overlay sparse env-derived fields onto merged JSON (currently none reserved)."""
     for env_var, dotted_path in _ENV_OVERRIDES.items():
         value = os.getenv(env_var)
         if value is None:
             continue
-
         keys = dotted_path.split(".")
         target = data
         for key in keys[:-1]:
@@ -144,6 +177,19 @@ def _apply_env_overrides(data: Dict[str, Any]) -> Dict[str, Any]:
         )
 
     return data
+
+
+def load_default_client_raw_dict() -> Dict[str, Any]:
+    """
+    Loads app/core/configs/default.json (or YAML) as a plain dict — no env overlay.
+    Used when creating tenant config files seeded from canonical defaults.
+    """
+    path = _find_config_path(_DEFAULT_CONFIG_ID)
+    if path is None:
+        raise FileNotFoundError(
+            f"Default config not found. Searched: {[str(d) for d in _CONFIG_DIRS]}"
+        )
+    return deepcopy(_load_raw(path))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,9 +335,59 @@ def _log_resolved_config(
         pass
 
 
+# ── Tenant blueprint drift (ingestion / tokenization / Celery dispatch) ─────
+_BLUEPRINT_TUNING_KEYS: tuple[str, ...] = ("tokenization", "celery_dispatch", "ingestion")
+_tenant_blueprint_warned: set[str] = set()
+
+
+def _blueprint_tuning_blob(raw: Dict[str, Any]) -> str:
+    blob = {k: raw.get(k) for k in _BLUEPRINT_TUNING_KEYS}
+    return _json_module.dumps(blob, sort_keys=True, default=str)
+
+
+def _maybe_warn_tenant_blueprint_drift(
+    client_id: str,
+    base_raw: Dict[str, Any],
+    merged_raw: Dict[str, Any],
+    had_client_file: bool,
+) -> None:
+    if client_id == _DEFAULT_CONFIG_ID or not had_client_file:
+        return
+    if _blueprint_tuning_blob(base_raw) == _blueprint_tuning_blob(merged_raw):
+        return
+    if client_id in _tenant_blueprint_warned:
+        return
+    _tenant_blueprint_warned.add(client_id)
+    logger.warning(
+        "[ConfigResolver] client_id=%s: merged Client JSON changes default blueprint "
+        "for tokenization, ingestion, and/or celery_dispatch — confirm intentional.",
+        client_id,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Public API — get_client_config
 # ─────────────────────────────────────────────────────────────────────────────
+
+def get_client_config_for_ingestion(client_id: str) -> ClientConfig:
+    """Same as get_client_config but disables sparse env overlays (JSON-authoritative)."""
+    return get_client_config(client_id, apply_env=False)
+
+
+def get_celery_ingestion_enqueue_kwargs(client_id: str) -> Dict[str, Any]:
+    """
+    Keyword args for Celery apply_async when enqueueing ingestion tasks for a tenant.
+    Uses celery_dispatch from merged Client JSON (queue + optional time limits).
+    """
+    cfg = get_client_config_for_ingestion(client_id)
+    d = cfg.celery_dispatch
+    out: Dict[str, Any] = {"queue": d.ingestion_queue}
+    if d.soft_time_limit and int(d.soft_time_limit) > 0:
+        out["soft_time_limit"] = int(d.soft_time_limit)
+    if d.hard_time_limit and int(d.hard_time_limit) > 0:
+        out["time_limit"] = int(d.hard_time_limit)
+    return out
+
 
 def get_client_config(
     client_id: str,
@@ -305,7 +401,7 @@ def get_client_config(
         1. Load default config (base layer).
         2. Load client-specific config (override layer, if exists).
         3. Deep-merge client overrides onto the default base.
-        4. Apply MAI_* environment variable overrides.
+        4. Sparse env overlays (none for pipeline semantics; deprecated MAI_* logged if set).
         5. Stamp client_id onto the merged dict.
         6. Parse through Pydantic (schema validation).
         7. Run compatibility validation — raise ConfigValidationError on ERROR.
@@ -314,7 +410,7 @@ def get_client_config(
 
     Args:
         client_id: Client/tenant identifier.
-        apply_env: Apply MAI_* environment overrides (default True).
+        apply_env: If True, apply any registered non-pipeline env overlays (currently empty).
 
     Returns:
         Validated, merged ClientConfig — ready for pipeline construction.
@@ -324,6 +420,8 @@ def get_client_config(
         ConfigValidationError:   Compatibility check found ERROR-severity issues.
         ValidationError:         Pydantic schema validation failed.
     """
+    client_id = _resolve_client_id_for_config_lookup(client_id)
+
     # ── Step 1: Load default config (base) ────────────────────────────────
     default_path = _find_config_path(_DEFAULT_CONFIG_ID)
     if default_path is None:
@@ -339,19 +437,24 @@ def get_client_config(
         client_raw = _load_raw(client_path)
         # ── Step 3: Deep merge ────────────────────────────────────────────
         merged_raw = _deep_merge(base_raw, client_raw)
+        had_client_file = True
         config_source = f"default+{client_id}"
         logger.debug(
             "[ConfigResolver] Merged client config '%s' onto default", client_id,
         )
     else:
         merged_raw = base_raw
+        had_client_file = False
         if client_id != _DEFAULT_CONFIG_ID:
             logger.debug(
                 "[ConfigResolver] No override for '%s' — using default only",
                 client_id,
             )
 
-    # ── Step 4: Apply env overrides ───────────────────────────────────────
+    _maybe_warn_tenant_blueprint_drift(client_id, base_raw, merged_raw, had_client_file)
+
+    # ── Step 4: Apply sparse env overlays (pipeline MAI_* no longer merged) ─
+    warn_if_deprecated_pipeline_env_set()
     if apply_env:
         merged_raw = _apply_env_overrides(merged_raw)
 
@@ -432,6 +535,7 @@ def validate_config_compatibility(config: ClientConfig) -> List[ConfigIssue]:
     issues: List[ConfigIssue] = []
 
     _check_required_fields(config, issues)
+    _check_provider_models(config, issues)
     _check_api_keys(config, issues)
     _check_embedder_vectordb_compat(config, issues)
     _check_embedding_dimension_compat(config, issues)
@@ -457,6 +561,63 @@ def _check_required_fields(config: ClientConfig, issues: List[ConfigIssue]) -> N
             component="vectordb",
             message="vectordb.collection is empty — a collection name is required.",
         ))
+
+
+def _check_provider_models(config: ClientConfig, issues: List[ConfigIssue]) -> None:
+    """Require non-empty model ids in Client JSON (no silent .env fallback)."""
+    sub = getattr(config.embedder, config.embedder.type.value, None)
+    if sub is not None:
+        model = getattr(sub, "model", None)
+        if model is None or not str(model).strip():
+            issues.append(ConfigIssue(
+                severity=IssueSeverity.ERROR,
+                component="embedder",
+                message=(
+                    f"Embedder type '{config.embedder.type.value}' requires a non-empty "
+                    "'model' in Client JSON — configure embedder.<provider>.model."
+                ),
+            ))
+    if config.llm and config.llm.single:
+        m = config.llm.single.model
+        if not m or not str(m).strip():
+            issues.append(ConfigIssue(
+                severity=IssueSeverity.ERROR,
+                component="llm",
+                message="llm.single.model is empty — set the LLM model id in Client JSON.",
+            ))
+    if config.llm and config.llm.chain:
+        for i, step in enumerate(config.llm.chain):
+            if not step.model or not str(step.model).strip():
+                issues.append(ConfigIssue(
+                    severity=IssueSeverity.ERROR,
+                    component="llm",
+                    message=(
+                        f"llm.chain[{i}].model is empty — set each chain step model in Client JSON."
+                    ),
+                ))
+    rr = config.reranker
+    if rr is None:
+        return
+    if rr.type == RerankerType.LLM_JUDGE:
+        if not rr.model or not str(rr.model).strip():
+            issues.append(ConfigIssue(
+                severity=IssueSeverity.ERROR,
+                component="reranker",
+                message="llm_judge reranker requires a non-empty 'model' in Client JSON.",
+            ))
+    elif rr.type in (
+        RerankerType.CROSS_ENCODER,
+        RerankerType.BGE_RERANKER,
+        RerankerType.FLASHRANK,
+        RerankerType.COHERE,
+        RerankerType.COLBERT,
+    ):
+        if not rr.model or not str(rr.model).strip():
+            issues.append(ConfigIssue(
+                severity=IssueSeverity.ERROR,
+                component="reranker",
+                message=f"Reranker type '{rr.type.value}' requires a non-empty 'model' in Client JSON.",
+            ))
 
 
 def _check_api_keys(config: ClientConfig, issues: List[ConfigIssue]) -> None:

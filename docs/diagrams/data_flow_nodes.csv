@@ -1,0 +1,15 @@
+NodeID,Layer,Title,PrimaryFiles,Notes
+UI,User browser,Next.js admin UI,app/frontend-admin/app/**/page.tsx; app/frontend-admin/components/**,User clicks and forms
+MW,Next.js,middleware,app/frontend-admin/middleware.ts,Next.js edge middleware
+APIhelper,Next.js,API routing + HTTP client,app/frontend-admin/lib/apiRoutes.ts; app/frontend-admin/lib/apiClient.ts; app/frontend-admin/hooks/useApi.ts; app/frontend-admin/hooks/useTenantApi.ts,Maps paths to backend; adds bearer token
+MAIN,FastAPI,Application entry,app/main.py,Registers routers; lifespan; CORS; optional rate limits
+API,FastAPI,HTTP routers,app/api/v2/ingestion_api_v2.py; app/api/v2/ingestion_admin_api.py; app/api/v2/retrieve_api.py; app/api/v2/retrieve_chat_api.py; app/api/v2/rag_api.py; app/api/v2/rag_config_api.py; app/api/v2/config_api.py; app/api/v2/auth_api.py; app/api/v2/* (other modules),REST/WebSocket surface
+AUTH,FastAPI,Authentication,app/auth/deps.py; app/auth/guards.py; app/auth/generate_token.py,JWT dependencies for protected routes
+SVC,FastAPI,Domain services,app/services/ingestion/ingestion_service_v2.py; app/services/ingestion/ingestion_worker.py; app/services/classification/*; app/services/validation/*; app/services/retrieval/query_embedder.py,Business logic orchestration
+CORE,FastAPI,Pipeline + ML IO,app/core/pipeline_factory.py; app/core/rag_pipeline.py; app/core/embedders/*; app/core/llms/*; app/core/vectordb/*; app/core/chunking_stratagies/*; app/core/rerankers/*,Pluggable RAG + ingestion engines
+DBORM,FastAPI,ORM + session,app/db/session_v2.py; app/db/models/*.py,PostgreSQL access layer
+WORKER,Background,Celery (optional),app/worker/celery_app.py; app/worker/tasks.py; app/worker/broker_config.py,Async ingestion when enabled
+PG,External,PostgreSQL,alembic/versions/*.py; .env DATABASE_URL*,Relational metadata
+VDB,External,Vector database,app/core/vectordb/*.py + provider SDKs,Embeddings + vector metadata
+LLM,External,Model APIs,app/core/llms/*; app/core/embedders/*,Third-party HTTP APIs
+BROKER,External,Task queue,,Redis/RabbitMQ/etc. per CELERY_BROKER

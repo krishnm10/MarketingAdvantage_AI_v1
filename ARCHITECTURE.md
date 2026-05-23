@@ -56,6 +56,8 @@
           └───────────────────────────────────────┘
 ```
 
+**Per-tenant Celery queues:** `celery_dispatch.ingestion_queue` in merged Client JSON is passed to `apply_async` when enqueueing ingestion tasks. Run workers with `-Q` listing every queue name used by your tenants (comma-separated), or keep a single shared queue name across tenants. See `get_celery_ingestion_enqueue_kwargs` in `app/core/config/client_config_resolver.py`.
+
 **Answer to your question:**
 > "After loading files/data through any broker, it processes and sends back to our ingestion system — to parse, chunk, embed, and upsert into vector DB"
 

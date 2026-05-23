@@ -1,0 +1,25 @@
+# Phase 7 — lightweight tenant correctness gates (no torch / vector DB required).
+name: Tenant isolation (Phase 7)
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pytest-tenant-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pytest only
+        run: pip install "pytest>=8"
+
+      - name: Run tenant validator suite
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest tests/test_tenant_validator_phase7.py -q --tb=short

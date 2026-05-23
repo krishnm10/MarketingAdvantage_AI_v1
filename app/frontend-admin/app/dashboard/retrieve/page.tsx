@@ -36,6 +36,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import InfoTooltip from "@/components/ui/InfoTooltip";
+import { useTenant } from "@/contexts/TenantContext";
 
 /* ────────────────────────────────────────────────────────────
    Types
@@ -417,6 +418,7 @@ function ResultCard({ result }: { result: ResultItem }) {
    ──────────────────────────────────────────────────────────── */
 
 export default function RetrievePage() {
+  const { clientId } = useTenant();
   const [query, setQuery] = useState("");
   const [intent, setIntent] = useState<string>("answer");
   const [topK, setTopK] = useState<string>("");
@@ -443,7 +445,11 @@ export default function RetrievePage() {
     setError("");
 
     try {
-      const payload: Record<string, any> = { query: q, intent };
+      const payload: Record<string, any> = {
+        query: q,
+        intent,
+        client_id: clientId,
+      };
       if (topK && parseInt(topK) > 0) payload.top_k = parseInt(topK);
       if (searchMode !== "semantic") payload.search_mode = searchMode;
       if (enableHyde) payload.enable_hyde = true;
@@ -492,8 +498,12 @@ export default function RetrievePage() {
           <Search className="w-6 h-6 text-primary-600" />
           Enterprise Retrieval
         </h1>
-        <p className="text-slate-500 text-sm mt-1">
+        <p className="text-slate-500 text-sm mt-1 flex items-center gap-2">
           Semantic search with governance scoring — mirrors the Retrieve CLI
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-xs">
+            <Building2 className="w-3 h-3" />
+            {clientId}
+          </span>
         </p>
         <Link
           href="/dashboard/multi-customer-rag"
@@ -653,7 +663,7 @@ export default function RetrievePage() {
                     Generate LLM Answer
                   </span>
                 </label>
-                <InfoTooltip text="After retrieval, send the top chunks as context to the configured LLM (MAI_LLM env var) to generate a grounded, cited answer. Requires a valid LLM API key." />
+                <InfoTooltip text="After retrieval, send the top chunks as context to the LLM resolved from merged Client JSON (single_llm_provider / routing) to generate a grounded, cited answer. Requires a valid LLM API key or credential." />
                 <span className="text-[10px] text-slate-400">
                   Full RAG: retrieve → ground → LLM generates a cited answer from your documents
                 </span>

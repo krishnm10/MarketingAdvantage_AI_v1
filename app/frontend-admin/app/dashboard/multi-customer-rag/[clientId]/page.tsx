@@ -17,6 +17,7 @@ import {
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
 import { cn } from "@/lib/utils";
+import { useTenant } from "@/contexts/TenantContext";
 
 interface OverviewData {
   client_id: string;
@@ -45,6 +46,7 @@ interface OverviewData {
 
 export default function TenantIsolationDashboardPage() {
   const params = useParams();
+  const { setClientId: setContextClientId, clientId: contextClientId } = useTenant();
   const raw =
     typeof params.clientId === "string"
       ? params.clientId
@@ -52,6 +54,13 @@ export default function TenantIsolationDashboardPage() {
         ? params.clientId[0]
         : "";
   const clientId = raw ? decodeURIComponent(raw) : "";
+
+  // Sync URL param to TenantContext on mount
+  useEffect(() => {
+    if (clientId && clientId !== contextClientId) {
+      setContextClientId(clientId);
+    }
+  }, [clientId, contextClientId, setContextClientId]);
 
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(true);

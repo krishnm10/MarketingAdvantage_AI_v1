@@ -237,7 +237,7 @@ class PipelineFactory:
     # Main public entry point
     # =========================================================================
 
-    def build(self, config: ClientConfig) -> AssembledPipeline:
+    def build(self, config: ClientConfig, *, skip_cache: bool = False) -> AssembledPipeline:
         """
         Build a complete pipeline from a validated ClientConfig.
 
@@ -248,6 +248,10 @@ class PipelineFactory:
           4. Reranker              (optional)
           5. ensure_collection()   (creates VectorDB collection if missing)
           6. Wrap into AssembledPipeline → RAGPipeline
+
+        Args:
+            skip_cache: If True, do not read or write the factory's tenant pipeline cache
+                (for short-lived builds such as ingestion-admin vectordb shims).
 
         Returns:
             AssembledPipeline ready for .query() calls.
@@ -298,7 +302,7 @@ class PipelineFactory:
             )
 
         # ── Return cached pipeline if available ──────────────────────
-        if self._cache_enabled:
+        if self._cache_enabled and not skip_cache:
             with self._lock:
                 if client_id in self._cache:
                     cached_fingerprint = self._cache_fingerprints.get(client_id)
@@ -341,7 +345,7 @@ class PipelineFactory:
         )
         embedder = self._build_embedder(config.embedder)
         llm      = self._build_llm(config.llm)
-        reranker = self._build_reranker(config.reranker)
+        reranker = self._build_reranker(config.reranker, parent_config=config)
 
         # ── Ensure VectorDB collection exists ─────────────────────────
         # embedding_dim must match what the embedder actually produces.
@@ -443,7 +447,7 @@ class PipelineFactory:
         pipeline._collection_ensured = True
         pipeline._embedding_dim = embedding_dim
 
-        if self._cache_enabled:
+        if self._cache_enabled and not skip_cache:
             with self._lock:
                 self._cache[client_id] = pipeline
                 self._cache_fingerprints[client_id] = config_fingerprint
@@ -451,6 +455,13 @@ class PipelineFactory:
                     "[PipelineFactory] Cached pipeline for client '%s'.",
                     client_id,
                 )
+
+        if skip_cache:
+            logger.info(
+                "[PipelineFactory] Built non-cached pipeline for client '%s' "
+                "(ingestion adapter / admin shim).",
+                client_id,
+            )
 
         return pipeline
 
@@ -810,14 +821,33 @@ class PipelineFactory:
     def _build_reranker(
         self,
         cfg: Optional[RerankerConfig],
+        *,
+        parent_config: Optional["ClientConfig"] = None,
     ) -> Optional[BaseReranker]:
 
         if cfg is None:
             logger.info("[PipelineFactory] No reranker configured.")
             return None
 
+        from app.core.config.reranker_config_coercion import (
+            coerce_reranker_config,
+            is_local_ollama_stack,
+            normalize_model_for_plugin,
+            _TYPE_TO_PLUGIN,
+        )
+
+        local_stack = (
+            is_local_ollama_stack(parent_config)
+            if parent_config is not None
+            else False
+        )
+        cfg = coerce_reranker_config(cfg, local_stack=local_stack)
+
         t         = cfg.type
-        model     = cfg.model
+        model     = normalize_model_for_plugin(
+            _TYPE_TO_PLUGIN.get(t, t.value),
+            cfg.model,
+        )
         api_key   = _env(cfg.api_key_env) if cfg.api_key_env else None
         device    = cfg.device or "cpu"
 
@@ -943,10 +973,14 @@ class PipelineFactory:
         prompt_cfg = getattr(config, "prompt", None)
         if prompt_cfg and getattr(prompt_cfg, "enabled", False):
             from app.core.pipeline_nodes.prompt_node import PromptNode
+            from app.core.prompts.ssot import resolve_prompt_ssot
+
+            _ps = resolve_prompt_ssot(config)
+            _use_library = bool(_ps.effective_template_id and _ps.library_found)
             nodes.prompt_node = PromptNode(
                 prompt_type=prompt_cfg.prompt_type,
-                template=prompt_cfg.template,
-                template_id=prompt_cfg.template_id,
+                template=None if _use_library else prompt_cfg.template,
+                template_id=_ps.effective_template_id or prompt_cfg.template_id,
                 variable_map=dict(prompt_cfg.variable_map),
                 max_tokens_warning=prompt_cfg.max_tokens_warning,
             )

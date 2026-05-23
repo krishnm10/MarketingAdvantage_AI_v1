@@ -34,9 +34,70 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 logger = logging.getLogger("phantom.config_bridge")
+
+# Tenant JSON overrides + legacy env gate (set during ingestion pipeline runs).
+_phantom_runtime_ctx: ContextVar[Optional[Tuple[Dict[str, Any], bool]]] = ContextVar(
+    "_phantom_runtime_ctx", default=None
+)
+
+
+@contextmanager
+def phantom_runtime_from_client(
+    phantom: Any,
+    *,
+    allow_legacy_env_overrides: bool,
+) -> Iterator[None]:
+    """
+    Apply tenant ingestion.phantom JSON for the duration of the wrapped block.
+    When allow_legacy_env_overrides is False, PHANTOM_* env vars are ignored.
+    """
+    if phantom is None:
+        token = _phantom_runtime_ctx.set(None)
+    else:
+        payload = phantom.model_dump() if hasattr(phantom, "model_dump") else dict(phantom)
+        token = _phantom_runtime_ctx.set((payload, bool(allow_legacy_env_overrides)))
+    try:
+        yield
+    finally:
+        _phantom_runtime_ctx.reset(token)
+
+
+def _phantom_ctx_allow_env() -> bool:
+    ctx = _phantom_runtime_ctx.get()
+    if ctx is None:
+        return True
+    return bool(ctx[1])
+
+
+def _phantom_override_int(key: str) -> Optional[int]:
+    ctx = _phantom_runtime_ctx.get()
+    if not ctx:
+        return None
+    raw = ctx[0].get(key)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _phantom_override_float(key: str) -> Optional[float]:
+    ctx = _phantom_runtime_ctx.get()
+    if not ctx:
+        return None
+    raw = ctx[0].get(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
 
 # ── lazy import to keep startup fast when hardware probe isn't needed ─────────
 _profile = None          # PHANTOMHardwareProfile singleton
@@ -111,16 +172,22 @@ class PHANTOMConfig:
                 BATCH_SIZE = phantom_cfg.embed_batch_size
         """
         self._require()
-        # Allow env override for manual tuning
-        env = os.getenv("PHANTOM_EMBED_BATCH_SIZE")
-        if env:
-            return int(env)
+        ov = _phantom_override_int("embed_batch_size")
+        if ov is not None:
+            return ov
+        if _phantom_ctx_allow_env():
+            env = os.getenv("PHANTOM_EMBED_BATCH_SIZE")
+            if env:
+                return int(env)
         return self._profile.embed_batch_size if self._profile else 64
 
     @property
     def embed_prefetch(self) -> int:
         """Number of embedding batches to prefetch ahead of upsert."""
         self._require()
+        ov = _phantom_override_int("embed_prefetch")
+        if ov is not None:
+            return ov
         return self._profile.embed_prefetch if self._profile else 2
 
     # ── vector DB ───────────────────────────────────────────────────────────
@@ -128,14 +195,21 @@ class PHANTOMConfig:
     @property
     def upsert_batch_size(self) -> int:
         self._require()
-        env = os.getenv("PHANTOM_UPSERT_BATCH_SIZE")
-        if env:
-            return int(env)
+        ov = _phantom_override_int("upsert_batch_size")
+        if ov is not None:
+            return ov
+        if _phantom_ctx_allow_env():
+            env = os.getenv("PHANTOM_UPSERT_BATCH_SIZE")
+            if env:
+                return int(env)
         return self._profile.upsert_batch_size if self._profile else 128
 
     @property
     def upsert_concurrency(self) -> int:
         self._require()
+        ov = _phantom_override_int("upsert_concurrency")
+        if ov is not None:
+            return ov
         return self._profile.upsert_concurrency if self._profile else 2
 
     # ── ingestion workers ────────────────────────────────────────────────────
@@ -147,14 +221,21 @@ class PHANTOMConfig:
         Used by Phase 1 to replace sequential file processing.
         """
         self._require()
-        env = os.getenv("PHANTOM_INGEST_WORKERS")
-        if env:
-            return int(env)
+        ov = _phantom_override_int("ingest_workers")
+        if ov is not None:
+            return ov
+        if _phantom_ctx_allow_env():
+            env = os.getenv("PHANTOM_INGEST_WORKERS")
+            if env:
+                return int(env)
         return self._profile.ingest_workers if self._profile else 4
 
     @property
     def parse_workers(self) -> int:
         self._require()
+        ov = _phantom_override_int("parse_workers")
+        if ov is not None:
+            return ov
         return self._profile.parse_workers if self._profile else 4
 
     @property
@@ -164,6 +245,9 @@ class PHANTOMConfig:
         Used in BUG-2 fixes (run_in_executor) and Phase 2 Bloom gate.
         """
         self._require()
+        ov = _phantom_override_int("io_thread_pool")
+        if ov is not None:
+            return ov
         return self._profile.io_thread_pool if self._profile else 8
 
     # ── deduplication ────────────────────────────────────────────────────────
@@ -175,19 +259,29 @@ class PHANTOMConfig:
         Sized to RAM to keep false-positive rate at 0.1%.
         """
         self._require()
-        env = os.getenv("PHANTOM_BLOOM_CAPACITY")
-        if env:
-            return int(env)
+        ov = _phantom_override_int("bloom_capacity")
+        if ov is not None:
+            return ov
+        if _phantom_ctx_allow_env():
+            env = os.getenv("PHANTOM_BLOOM_CAPACITY")
+            if env:
+                return int(env)
         return self._profile.bloom_capacity if self._profile else 2_000_000
 
     @property
     def bloom_error_rate(self) -> float:
+        ov = _phantom_override_float("bloom_error_rate")
+        if ov is not None:
+            return ov
         return self._profile.bloom_error_rate if self._profile else 0.001
 
     @property
     def l2_dedup_batch(self) -> int:
         """Chunk batch size for L2 embedding dedup (Phase 2 batch L2 fix)."""
         self._require()
+        ov = _phantom_override_int("l2_dedup_batch")
+        if ov is not None:
+            return ov
         return self._profile.l2_dedup_batch if self._profile else 32
 
     # ── Phase 3: Gravity clustering ─────────────────────────────────────────
@@ -195,11 +289,17 @@ class PHANTOMConfig:
     @property
     def gravity_clusters(self) -> int:
         self._require()
+        ov = _phantom_override_int("gravity_clusters")
+        if ov is not None:
+            return ov
         return self._profile.gravity_clusters if self._profile else 16
 
     @property
     def gravity_batch_size(self) -> int:
         self._require()
+        ov = _phantom_override_int("gravity_batch_size")
+        if ov is not None:
+            return ov
         return self._profile.gravity_batch_size if self._profile else 512
 
     # ── Phase 5: Stage collapse ──────────────────────────────────────────────
@@ -207,6 +307,9 @@ class PHANTOMConfig:
     @property
     def stage_collapse_concurrency(self) -> int:
         self._require()
+        ov = _phantom_override_int("stage_collapse_concurrency")
+        if ov is not None:
+            return ov
         return self._profile.stage_collapse_concurrency if self._profile else 4
 
     # ── diagnostics ─────────────────────────────────────────────────────────

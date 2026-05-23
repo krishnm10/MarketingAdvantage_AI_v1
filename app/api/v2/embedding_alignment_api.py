@@ -53,6 +53,8 @@ def _build_component_checks(
     errors: List[str],
     warnings: List[str],
     safe_chunk_size: Optional[int],
+    chunk_size_env: int,
+    chunking_strategy: str,
 ) -> Tuple[List[Dict[str, Any]], int, bool, str]:
     """
     Build per-component compatibility checks and compute the overall RAG
@@ -73,16 +75,7 @@ def _build_component_checks(
     """
     checks: List[Dict[str, Any]] = []
 
-    # Read relevant env vars once (server-side reflects the live pipeline)
-    chunk_size_raw = (os.getenv("CHUNK_SIZE") or "0").strip()
-    try:
-        chunk_size_env = int(chunk_size_raw)
-    except ValueError:
-        chunk_size_env = 0
-
-    chunking_strategy = (os.getenv("CHUNKING_STRATEGY") or "semantic").strip().lower()
-
-    # ── 1. Embedding Model ────────────────────────────────────────────────────
+    # Chunk sizing from merged Client JSON (ingestion.chunking), not CHUNK_SIZE .env
     if not catalog_available:
         checks.append({
             "component": "embedder",
@@ -166,10 +159,10 @@ def _build_component_checks(
                 "component": "chunking",
                 "label": "Chunk Sizing",
                 "status": "error",
-                "message": f"CHUNK_SIZE={chunk_size_env} > safe limit {safe_chunk_size}",
+                "message": f"ingestion.chunking.chunk_size={chunk_size_env} > safe limit {safe_chunk_size}",
                 "detail": (
                     f"Chunks will overflow the embedding model context window (F-02). "
-                    f"Reduce CHUNK_SIZE to ≤ {safe_chunk_size} tokens."
+                    f"Reduce chunk_size in Client JSON to ≤ {safe_chunk_size} tokens."
                 ),
             })
         elif chunking_strategy == "token_aware":
@@ -371,32 +364,12 @@ def _config_error_response(reason: str) -> Dict[str, Any]:
 
 def _resolve_client_config(client_id: str):
     """
-    Build a ClientConfig for client_id using the same env-var logic as
-    ingestion_service_v2 — ensures the alignment endpoint is consistent
-    with the live pipeline path.
+    Resolved ClientConfig for client_id via merged Client JSON (same path as ingestion / RAG).
+    Deprecated MAI_* pipeline env vars are ignored for semantics; `.env` is for secrets/infra only.
     """
-    from app.services.ingestion.ingestion_service_v2 import _build_config_from_env
+    from app.core.config.client_config_resolver import get_client_config_for_ingestion
 
-    b = client_id.lower().replace("-", "_")
-    vectordb_type = os.getenv(
-        f"MAI_{b.upper()}_VECTORDB",
-        os.getenv("MAI_VECTORDB", "chroma"),
-    ).lower()
-    embedder_type = os.getenv(
-        f"MAI_{b.upper()}_EMBEDDER",
-        os.getenv("MAI_EMBEDDER", "ollama"),
-    ).lower()
-    llm_type = os.getenv(
-        f"MAI_{b.upper()}_LLM",
-        os.getenv("MAI_LLM", "ollama"),
-    ).lower()
-
-    return _build_config_from_env(
-        client_id=client_id,
-        vectordb_type=vectordb_type,
-        embedder_type=embedder_type,
-        llm_type=llm_type,
-    )
+    return get_client_config_for_ingestion(client_id)
 
 
 # =============================================================================
@@ -633,6 +606,8 @@ async def compute_embedding_alignment_report(
         errors=errors,
         warnings=warnings,
         safe_chunk_size=safe_chunk_size,
+        chunk_size_env=int(config.ingestion.chunking.chunk_size),
+        chunking_strategy=str(config.ingestion.chunking.strategy.value),
     )
 
     # PII middleware alignment check

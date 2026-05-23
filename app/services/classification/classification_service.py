@@ -1,6 +1,5 @@
 # services/classification/classification_service.py
 
-import os
 import uuid
 from typing import Dict, Any, Optional
 from datetime import datetime
@@ -17,35 +16,9 @@ from app.db.models.business_classification import BusinessClassification
 from app.db.models.classification_logs import ClassificationLogs
 
 from app.core.vectordb.base import BaseVectorDB
+from app.core.config.client_config_schema import VectorDBType
 from app.utils.logger import log_info, log_warning
-
-
-_COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
-
-# Lazy singleton for backward-compatible fallback when no VectorDB is injected.
-_fallback_vectordb: Optional[BaseVectorDB] = None
-
-
-def _get_fallback_vectordb() -> BaseVectorDB:
-    """
-    Create a BaseVectorDB instance from environment config.
-    Used only when callers don't inject a VectorDB instance.
-    """
-    global _fallback_vectordb
-    if _fallback_vectordb is not None:
-        return _fallback_vectordb
-
-    from app.core.vectordb.chroma_v1 import ChromaVectorDB
-    host = os.getenv("CHROMA_HOST") or None
-    _fallback_vectordb = ChromaVectorDB(
-        persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db"),
-        anonymized_telemetry=False,
-        host=host,
-        port=int(os.getenv("CHROMA_PORT") or "8000"),
-        ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
-        api_key=os.getenv("CHROMA_API_KEY") or None,
-    )
-    return _fallback_vectordb
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 
 
 class ClassificationService:
@@ -54,58 +27,34 @@ class ClassificationService:
     async def classify_chunk(
         db: AsyncSession,
         chunk: Dict[str, Any],
+        client_id: str,
         vectordb: Optional[BaseVectorDB] = None,
     ) -> Dict[str, Any]:
         """
         Full classification pipeline for a single chunk.
 
-        Input chunk:
-            {
-                "id": UUID,
-                "cleaned_text": "...",
-                ...
-            }
-
-        Return:
-            {
-                "classification_id": UUID,
-                "industry_id": ...,
-                "pending_taxonomy_id": ...
-            }
+        Requires client_id (tenant slug) — no env-based VectorDB fallback.
         """
+        if not client_id or not str(client_id).strip():
+            raise ValueError("client_id is required for classify_chunk()")
 
+        slug = str(client_id).strip()
         chunk_id = str(chunk["id"])
         text = chunk.get("cleaned_text") or ""
 
-        log_info(f"[classification_service] Classifying chunk: {chunk_id}")
+        log_info(f"[classification_service] Classifying chunk: {chunk_id} tenant={slug}")
 
-        # -----------------------------------------------------
-        # 1. Ensure taxonomy is loaded
-        # -----------------------------------------------------
         await load_taxonomy(db)
 
-        # -----------------------------------------------------
-        # 2. Ranking via Embedding Matcher
-        # -----------------------------------------------------
         ranked = rank_taxonomy_candidates(text)
-
-        # -----------------------------------------------------
-        # 3. LLM classification
-        # -----------------------------------------------------
         llm_output = classify_chunk_with_llm(text, ranked)
 
-        # -----------------------------------------------------
-        # 4. Canonicalization & Pending Taxonomy Logic
-        # -----------------------------------------------------
         canonical = await canonicalize_llm_output(
             db=db,
             chunk_id=chunk_id,
-            llm_output=llm_output
+            llm_output=llm_output,
         )
 
-        # -----------------------------------------------------
-        # 5. Insert into business_classification
-        # -----------------------------------------------------
         classification_id = uuid.uuid4()
 
         row = {
@@ -124,9 +73,6 @@ class ClassificationService:
         await db.execute(insert(BusinessClassification).values(**row))
         await db.commit()
 
-        # -----------------------------------------------------
-        # 6. Insert into classification_logs
-        # -----------------------------------------------------
         taxonomy_path = (
             f"{llm_output.get('industry') or ''} > "
             f"{llm_output.get('sub_industry') or ''} > "
@@ -146,30 +92,49 @@ class ClassificationService:
         await db.execute(insert(ClassificationLogs).values(**log_row))
         await db.commit()
 
-        # -----------------------------------------------------
-        # 7. Update VectorDB metadata via BaseVectorDB abstraction
-        # -----------------------------------------------------
+        from app.core.config.client_config_resolver import get_client_config
+        from app.services.ingestion.ingestion_service_v2 import (
+            _get_ingestion_pipeline_for_client,
+        )
+
+        cfg = get_client_config(slug)
+        coll_name = (cfg.vectordb.collection or "").strip()
+        if not coll_name:
+            raise ValueError(
+                f"vectordb.collection is required for client_id={slug!r}"
+            )
+
+        vdb = vectordb
+        if vdb is None:
+            vdb = _get_ingestion_pipeline_for_client(slug).vectordb
+
+        tenant_meta_key = storage_uuid_str_for_vectordb_metadata(slug)
+        base_meta = {
+            "business_id": tenant_meta_key,
+            "industry_id": canonical["industry_id"],
+            "sub_industry_id": canonical["sub_industry_id"],
+            "sub_sub_industry_id": canonical["sub_sub_industry_id"],
+            "pending_taxonomy_id": canonical["pending_taxonomy_id"],
+            "confidence": llm_output.get("confidence"),
+        }
+
         try:
-            vdb = vectordb or _get_fallback_vectordb()
             vdb.update_metadata(
-                collection=_COLLECTION_NAME,
+                collection=coll_name,
                 ids=[chunk_id],
-                metadatas=[
-                    {
-                        "industry_id": canonical["industry_id"],
-                        "sub_industry_id": canonical["sub_industry_id"],
-                        "sub_sub_industry_id": canonical["sub_sub_industry_id"],
-                        "pending_taxonomy_id": canonical["pending_taxonomy_id"],
-                        "confidence": llm_output.get("confidence"),
-                    }
-                ],
+                metadatas=[base_meta],
             )
         except Exception as e:
-            log_warning(f"[classification_service] VectorDB metadata update failed: {e}")
+            log_warning(
+                f"[classification_service] VectorDB metadata update failed "
+                f"(type={cfg.vectordb.type.value}): {e}"
+            )
+            if cfg.vectordb.type != VectorDBType.CHROMA:
+                raise ValueError(
+                    f"classification metadata update requires a vectordb supporting "
+                    f"update_metadata; got {cfg.vectordb.type.value}"
+                ) from e
 
-        # -----------------------------------------------------
-        # 8. Return result
-        # -----------------------------------------------------
         return {
             "classification_id": str(classification_id),
             "industry_id": canonical["industry_id"],

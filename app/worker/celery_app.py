@@ -16,6 +16,10 @@
 #   ingestion   — file upload & external-source ingestion tasks
 #   validation  — agentic validation, conflict detection, temporal revalidation
 #
+# Per-tenant dispatch: ingestion_queue names come from merged Client JSON
+# (celery_dispatch.ingestion_queue). Workers must pass -Q with the UNION of all
+# tenant queue names they should consume (or standardize on one shared queue name).
+#
 # BROKER SELECTION — set in .env:
 #   CELERY_ENABLED=true                    # false = inline ingestion (no broker)
 #   CELERY_BROKER=redis                    # redis | rabbitmq | kafka | redpanda

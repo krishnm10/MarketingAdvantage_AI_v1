@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UI file upload → ingestion — numbered architecture</title>
+  <style>
+    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 1.25rem 2rem; color: #1a1a1a; max-width: 92rem; line-height: 1.45; }
+    h1 { font-size: 1.35rem; border-bottom: 2px solid #2563eb; padding-bottom: 0.35rem; }
+    h2 { font-size: 1.05rem; margin-top: 2rem; color: #1e40af; }
+    .meta { background: #f1f5f9; padding: 0.9rem 1rem; border-radius: 8px; font-size: 0.9rem; margin: 1rem 0; }
+    .mermaid { overflow-x: auto; background: #fafafa; padding: 1rem; border-radius: 8px; margin: 1rem 0; border: 1px solid #e2e8f0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin: 1rem 0; }
+    th, td { border: 1px solid #cbd5e1; padding: 0.45rem 0.55rem; vertical-align: top; text-align: left; }
+    th { background: #e2e8f0; }
+    .cfg { font-family: ui-monospace, monospace; font-size: 0.78rem; color: #0f172a; }
+    code { background: #f1f5f9; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+    @media print { .no-print { display: none; } h2 { page-break-after: avoid; } }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({ startOnLoad: true, theme: "neutral", sequence: { mirrorActors: false } });</script>
+</head>
+<body>
+
+<h1>File upload from admin UI — detailed numbered flow</h1>
+
+<p class="meta no-print">
+  <strong>Scope:</strong> Standard document upload (PDF, DOCX, CSV, …) from
+  <code>app/frontend-admin/app/ingestion/upload/page.tsx</code>.
+  <strong>Not covered in the sequence diagram:</strong> external sources (RSS/web), watcher, separate media-only path — see §_branch notes below.<br />
+  <strong>PDF:</strong> Print this page from Chrome/Edge. If Mermaid does not render from <code>file://</code>, run <code>python -m http.server 8765</code> in this folder.
+</p>
+
+<div class="meta">
+  <strong>Config authority during ingestion:</strong><br />
+  <span class="cfg">get_client_config(client_id)</span> in
+  <code>app/core/config/client_config_resolver.py</code> loads
+  <code>app/core/configs/default.json</code> (base), merges optional
+  <code>app/core/configs/&lt;client_id&gt;.{json,yaml}</code> or <code>configs/</code> at repo root, validates as
+  <code>ClientConfig</code> (<code>client_config_schema.py</code>).<br />
+  <strong>Pipeline for embedding:</strong>
+  <code>IngestionServiceV2._run_pipeline</code> calls
+  <code>_get_ingestion_pipeline(business_id)</code> → builds/returns embedder+vectordb (reranker/LLM stripped) via
+  <code>pipeline_factory.build(..., skip_cache)</code> using that same merged config.<br />
+  <strong>Async queue:</strong> If <code>CELERY_ENABLED</code> is true (<code>app/worker/broker_config.py</code> → <code>is_celery_enabled()</code>), HTTP returns after queueing; work continues in <code>app/worker/tasks.py</code>.<br />
+  <strong>PII (ingestion):</strong> After chunks are built, <code>IngestionOrchestrator</code> supplies <code>pre_embed_hook</code> → <code>sanitize_ingestion_chunks</code> in <code>app/services/security/ingestion_security.py</code> (driven by <code>ClientConfig.security.pii_middleware</code>). <code>IngestionServiceV2._run_pipeline</code> applies the hook <em>before</em> dedup, SQL persistence of chunk text, and embedding/vector upsert. Optional audit: <code>SecurityAuditService.log_pii_event</code> in <code>app/services/security/security_audit_service.py</code>.
+</div>
+
+<h2>1 — Sequence diagram (numbered messages)</h2>
+<p>Numbers appear on arrows in order. Participants show the primary Python/TS module.</p>
+
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor User as User
+  participant UI as upload/page.tsx
+  participant AX as lib/apiClient.ts
+  participant MN as app/main.py
+  participant API as ingestion_api_v2.py
+  participant TV as tenant_validator.py
+  participant FR as file_router_v2.py
+  participant TG as tenant_guard.py
+  participant TU as tenant_storage_uuid.py
+  participant SE as session_v2.py
+  participant MD as models/ingested_file_v2.py
+  participant BC as broker_config.py
+  participant TS as worker/tasks.py
+  participant PS as pdf_parser_v2.py etc
+  participant ORC as ingestion_orchestrator.py
+  participant RES as client_config_resolver.py
+  participant ISV as ingestion_service_v2.py
+  participant PF as pipeline_factory.py
+  participant VDB as core/vectordb/*.py
+
+  User->>UI: Select file + tenant
+  UI->>UI: handleUpload FormData file + business_id
+  Note over UI: useTenant clientId as business_id
+  UI->>AX: axios.post multipart /api/v2/ingestion/upload
+  AX->>AX: interceptor Authorization Bearer authToken.ts
+  AX->>MN: HTTPS
+  MN->>API: POST .../ingestion/upload
+  API->>API: ingest_file UploadFile Form business_id
+  API->>TV: validate_tenant_id_strict business_id
+  TV-->>API: tenant_ctx
+  API->>FR: route_file_ingestion file business_id
+  FR->>TG: resolve_ingestion_tenant
+  TG-->>FR: tenant_ctx
+  FR->>FR: _validate_file_extension
+  FR->>FR: write temp file aiofiles _compute_file_hash SHA256
+  FR->>TU: storage_business_uuid_for_tenant
+  FR->>SE: AsyncSession dedup SELECT IngestedFileV2 by hash + business_id
+  alt duplicate row
+    FR-->>API: skipped db_duplicate
+    API-->>AX: JSON duplicate_skipped
+  else new file
+    FR->>SE: INSERT IngestedFileV2 status uploaded
+    FR->>BC: is_celery_enabled
+    alt Celery on
+      BC-->>FR: true
+      FR->>TS: run_ingestion_pipeline.delay file_id path ext tenant_id
+      FR-->>API: dict status queued task_id
+      Note over TS: worker run parser then orchestrator see diagram 2
+    else Inline API process
+      BC-->>FR: false
+      FR->>PS: await parser_func saved_path e.g. parse_pdf
+      PS-->>FR: parsed_output dict
+      FR->>ORC: ingest_parsed_output file_id parsed client_id
+      Note over ORC,ISV: Same as diagram 1b orchestrator + PII + _run_pipeline
+      ORC-->>FR: done
+      FR-->>API: dict status ingested
+    end
+  end
+  API->>API: ingest_file wrap details status success
+  API-->>AX: JSON status file_name message details
+  AX-->>UI: res.data
+  UI->>User: show success duplicate or error
+
+  Note over ISV,VDB: See diagram 1b: PII hook runs inside _run_pipeline before dedup/embed
+</div>
+
+<h2>1b — PII + orchestration inside <code>_run_pipeline</code> (inline and Celery)</h2>
+<p>Order matches <code>ingestion_service_v2.py</code>: chunk extraction and metadata → <strong>pre_embed_hook (PII)</strong> → dedup → persist → embed/vector upsert.</p>
+
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant ORC as ingestion_orchestrator.py
+  participant RES as client_config_resolver.py
+  participant ISV as ingestion_service_v2.py
+  participant PF as pipeline_factory.py
+  participant SEC as ingestion_security.py
+  participant DD as deduplication_engine_v2.py
+  participant VDB as core/vectordb/*.py
+  participant DB as PostgreSQL chunks
+
+  ORC->>RES: get_client_config client_id via _resolve_config
+  RES-->>ORC: ClientConfig
+  ORC->>ORC: _enforce_embedding_policy config
+  ORC->>ORC: _make_pii_hook → closure calls sanitize_ingestion_chunks
+  ORC->>ISV: ingest_parsed_output pre_embed_hook=hook
+  ISV->>ISV: _get_file_record _run_pipeline start
+  ISV->>PF: _get_ingestion_pipeline business_id
+  PF-->>ISV: pipeline embedder+vectordb only
+  ISV->>ISV: _extract_chunks normalize offsets page_map
+  ISV->>SEC: pre_embed_hook chunks → sanitize_ingestion_chunks client_config
+  Note over SEC: Redact PII per ClientConfig.security.pii_middleware
+  SEC-->>ISV: sanitized chunks + pii_meta
+  opt PII detected chunks_with_pii
+    Note over ORC,SEC: Hook calls _fire_pii_audit → security_audit_service.log_pii_event async
+  end
+  ISV->>DD: _dedup_chunks with pipeline embedder
+  ISV->>DB: persist IngestedContentV2 rows
+  ISV->>VDB: embed + upsert vectors
+</div>
+
+<h2>2 — Celery worker continuation (when message queued)</h2>
+<p>After <code>run_ingestion_pipeline.delay</code>, the worker runs the same orchestrator + PII path as diagram <strong>1b</strong> (not sketched again in full here).</p>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant TS as tasks.py run_ingestion_pipeline
+  participant TG as tenant_guard.py
+  participant MAP as file_router_v2 PARSER_MAP
+  participant ORC as ingestion_orchestrator.py
+  participant ISV as ingestion_service_v2.py
+  participant PF as pipeline_factory.py
+  participant VDB as vectordb adapter
+
+  TS->>TG: resolve_ingestion_tenant business_id file_id
+  TS->>MAP: parser_func = PARSER_MAP ext
+  TS->>TS: _run sync parser_func saved_path
+  TS->>ORC: ingest_parsed_output file_id parsed client_id
+  ORC->>ORC: _resolve_config get_client_config
+  ORC->>ORC: _enforce_embedding_policy _make_pii_hook PII
+  ORC->>ISV: ingest_parsed_output pre_embed_hook
+  ISV->>ISV: _run_pipeline _get_ingestion_pipeline extract PII gate dedup embed
+  Note over ISV: See diagram 1b: SEC sanitize before dedup/VDB
+  ISV->>PF: pipeline via _get_ingestion_pipeline
+  ISV->>VDB: upsert vectors after PII+dedup+persist
+  TS->>TS: dispose async_engine cache_clear pipelines
+</div>
+
+<h2>3 — Layer diagram (where code lives)</h2>
+<div class="mermaid">
+flowchart TB
+  subgraph FE["Browser / Next.js"]
+    A[upload/page.tsx / handleUpload]
+    B[apiClient.ts + authToken.ts]
+    C[TenantContext.tsx clientId]
+  end
+  subgraph API["FastAPI"]
+    D[main.py include_router]
+    E[ingestion_api_v2.py ingest_file]
+    F[file_router_v2.py route_file_ingestion]
+  end
+  subgraph CFG["Configuration"]
+    G[client_config_resolver.get_client_config]
+    H[configs/default.json + client overlay]
+    I[client_config_schema ClientConfig]
+  end
+  subgraph ORC["Orchestration + pipeline"]
+    J[ingestion_orchestrator.py]
+    JPII[PII hook _make_pii_hook]
+    K[ingestion_service_v2.py _run_pipeline]
+    L[pipeline_factory.build]
+    M[embedders + vectordb]
+  end
+  subgraph PII["PII & audit (pre-embed)"]
+    S1[ingestion_security.sanitize_ingestion_chunks]
+    S2[security_audit_service optional]
+  end
+  subgraph DATA["Persistence"]
+    N[(PostgreSQL IngestedFileV2 IngestedContentV2)]
+    O[(Vector DB)]
+  end
+  subgraph Q["Optional"]
+    P[worker/tasks.py Celery broker]
+  end
+  A --> B
+  C --> A
+  B --> D --> E --> F
+  J --> G
+  G --> H
+  G --> I
+  F --> J --> JPII
+  JPII --> K
+  S1 -.-> S2
+  J --> K
+  K --> L --> M
+  K --> S1
+  K --> N
+  M --> O
+  F -.-> P
+  P -.-> J
+</div>
+
+<h2>4 — Step table: file · method · config / data</h2>
+<table>
+  <thead>
+    <tr><th>#</th><th>Phase</th><th>File</th><th>Method / symbol</th><th>Config / env / data loaded</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>UI</td><td><code>app/frontend-admin/app/ingestion/upload/page.tsx</code></td><td><code>handleUpload</code></td><td>Builds <code>FormData</code>: <code>file</code>, <code>business_id</code> from <code>useTenant().clientId</code>. Role gate: admin/editor.</td></tr>
+    <tr><td>2</td><td>UI</td><td><code>app/frontend-admin/lib/apiClient.ts</code></td><td>Axios instance + request interceptor</td><td><code>NEXT_PUBLIC_BACKEND_API_URL</code> or default <code>http://127.0.0.1:8000</code>. Attaches <code>Authorization: Bearer</code> from <code>authToken.ts</code>.</td></tr>
+    <tr><td>3</td><td>HTTP</td><td><code>app/main.py</code></td><td><code>include_router(ingestion_router)</code></td><td>CORS, middleware, mounts <code>/api/v2/ingestion</code> from <code>ingestion_api_v2</code>.</td></tr>
+    <tr><td>4</td><td>API</td><td><code>app/api/v2/ingestion_api_v2.py</code></td><td><code>ingest_file</code></td><td><code>Depends(get_db)</code> — session available; upload path uses <code>route_file_ingestion</code> for core work. Form: <code>business_id</code> required.</td></tr>
+    <tr><td>5</td><td>API</td><td><code>app/utils/tenant_validator.py</code></td><td><code>validate_tenant_id_strict</code></td><td>Tenant enforcement mode from env / validator rules.</td></tr>
+    <tr><td>6</td><td>Router</td><td><code>app/services/ingestion/file_router_v2.py</code></td><td><code>route_file_ingestion</code></td><td><code>UPLOAD_DIR = static/uploads/api</code>, <code>PARSER_MAP</code> extension → parser function.</td></tr>
+    <tr><td>7</td><td>Tenant</td><td><code>app/services/ingestion/tenant_guard.py</code></td><td><code>resolve_ingestion_tenant</code></td><td>Validates <code>business_id</code> for upload source.</td></tr>
+    <tr><td>8</td><td>Router</td><td><code>file_router_v2.py</code></td><td><code>_validate_file_extension</code></td><td>Allowed extensions: keys of <code>PARSER_MAP</code> / <code>MEDIA_EXT_MAP</code>.</td></tr>
+    <tr><td>9</td><td>Branch</td><td><code>file_router_v2.py</code></td><td>media vs document</td><td>If ext ∈ <code>MEDIA_EXT_MAP</code> → <code>_route_media_ingestion</code> + <code>MediaIngestionHookV1</code> (separate pipeline; not the table rows below).</td></tr>
+    <tr><td>10</td><td>Router</td><td><code>file_router_v2.py</code></td><td>stream save + <code>_compute_file_hash</code></td><td>Temp file then rename under <code>static/uploads/api</code>.</td></tr>
+    <tr><td>11</td><td>Storage ID</td><td><code>app/utils/tenant_storage_uuid.py</code></td><td><code>storage_business_uuid_for_tenant</code></td><td>Stable UUID for DB row <code>business_id</code> (tenant-scoped dedup).</td></tr>
+    <tr><td>12</td><td>DB</td><td><code>app/db/session_v2.py</code></td><td><code>async_engine</code> / session factory</td><td><code>DATABASE_URL</code> (typical).</td></tr>
+    <tr><td>13</td><td>DB</td><td><code>app/db/models/ingested_file_v2.py</code></td><td><code>IngestedFileV2</code></td><td>Dedup SELECT on <code>meta_data.file_hash</code> + <code>business_id</code>. Insert with <code>status="uploaded"</code>.</td></tr>
+    <tr><td>14</td><td>Queue</td><td><code>app/worker/broker_config.py</code></td><td><code>is_celery_enabled</code></td><td><code>CELERY_ENABLED</code> and broker settings.</td></tr>
+    <tr><td>15</td><td>Worker</td><td><code>app/worker/tasks.py</code></td><td><code>run_ingestion_pipeline</code></td><td><code>_run()</code> + dispose pool + <code>_get_pipeline_for_client.cache_clear</code> pattern in finally (see file).</td></tr>
+    <tr><td>16</td><td>Parse</td><td><code>pdf_parser_v2.py</code> / <code>docx_parser_v2.py</code> / …</td><td>e.g. <code>parse_pdf</code></td><td>Format-specific; may use <code>app/utils/text_cleaner_v2.py</code>, <code>app/config/ingestion_settings.py</code> for toggles on some paths.</td></tr>
+    <tr><td>17</td><td>Orchestrator</td><td><code>ingestion_orchestrator.py</code></td><td><code>ingest_parsed_output</code></td><td>Entry after parse; loads <code>ClientConfig</code>, builds PII hook, delegates to service.</td></tr>
+    <tr><td>18</td><td>Orchestrator</td><td><code>ingestion_orchestrator.py</code></td><td><code>_resolve_config</code> → <code>get_client_config</code></td><td>Same as <code>client_config_resolver.py</code>: <code>default.json</code> + tenant overlay → <code>ClientConfig</code>.</td></tr>
+    <tr><td>19</td><td>Orchestrator</td><td><code>ingestion_orchestrator.py</code></td><td><code>_enforce_embedding_policy</code></td><td><code>ClientConfig.security.data_sensitivity</code> vs local/cloud embedder rules.</td></tr>
+    <tr><td>20</td><td>Orchestrator</td><td><code>ingestion_orchestrator.py</code></td><td><code>_make_pii_hook</code></td><td>Returns closure that calls <code>sanitize_ingestion_chunks(chunks, client_config=config)</code>; may call <code>_fire_pii_audit</code> → <code>SecurityAuditService.log_pii_event</code>.</td></tr>
+    <tr><td>21</td><td>Security</td><td><code>app/services/security/ingestion_security.py</code></td><td><code>sanitize_ingestion_chunks</code></td><td>PII redaction driven by <code>ClientConfig.security.pii_middleware</code> (and related fields). Invoked <strong>only when</strong> service runs <code>pre_embed_hook</code>.</td></tr>
+    <tr><td>22</td><td>Security</td><td><code>app/services/security/security_audit_service.py</code></td><td><code>log_pii_event</code> (async)</td><td>Optional audit when hook detects PII; best-effort from orchestrator <code>_fire_pii_audit</code>.</td></tr>
+    <tr><td>23</td><td>Service</td><td><code>ingestion_service_v2.py</code></td><td><code>ingest_parsed_output</code></td><td>Requires <code>pre_embed_hook</code> if <code>STRICT_INGESTION_SECURITY</code>; loads <code>IngestedFileV2</code>; calls <code>_run_pipeline</code>.</td></tr>
+    <tr><td>24</td><td>Service</td><td><code>ingestion_service_v2.py</code></td><td><code>_run_pipeline</code></td><td><code>_set_file_processing</code>; resolve <code>_get_ingestion_pipeline(business_id)</code> via <code>pipeline_factory.build</code> (ingestion-only cache).</td></tr>
+    <tr><td>25</td><td>Service</td><td><code>ingestion_service_v2.py</code></td><td><code>_extract_chunks</code> + offsets / <code>page_map</code></td><td>Chunk text from parsed payload; strategy from client config / segmenters.</td></tr>
+    <tr><td>26</td><td>Service + PII</td><td><code>ingestion_service_v2.py</code></td><td><code>_run_pipeline</code> → <code>pre_embed_hook(chunks)</code></td><td><strong>PII gate:</strong> runs <strong>before</strong> <code>_dedup_chunks</code>, DB chunk persistence, and embedding. Comment in code: “PII sanitization before dedup/storage/embedding”.</td></tr>
+    <tr><td>27</td><td>Service</td><td><code>ingestion_service_v2.py</code></td><td><code>_dedup_chunks</code></td><td>Uses embedder from pipeline + dedup logic; operates on <strong>sanitized</strong> chunk text.</td></tr>
+    <tr><td>28</td><td>Persistence</td><td><code>ingestion_service_v2.py</code> + models</td><td>SQL + vectordb upsert</td><td><code>IngestedContentV2</code> etc.; <code>app/core/vectordb/*.py</code> per <code>ClientConfig.vectordb</code>.</td></tr>
+    <tr><td>29</td><td>API wrap</td><td><code>ingestion_api_v2.py</code></td><td>response envelope</td><td>Returns <code>status: "success"</code> + <code>details</code> (may include <code>queued</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>5 — Feature branches not expanded in the main sequence</h2>
+<ul>
+  <li><strong>Media upload</strong> (image/audio/video): <code>file_router_v2._route_media_ingestion</code> → <code>MediaIngestionHookV1.handle</code> → vision/audio pipelines; different parser map <code>MEDIA_EXT_MAP</code>, save under <code>static/uploads/media</code>.</li>
+  <li><strong>External ingestion</strong> UI/API: <code>ingest_external</code> + <code>route_external_ingestion</code> / Celery <code>run_external_ingestion_task</code>; may read <code>app/config/ingestion_settings.py</code> <code>ENABLE_LLM_NORMALIZATION</code>.</li>
+  <li><strong>Registry ingestors</strong>: <code>route_external_ingestion</code> can use <code>ingestor_registry</code> (<code>plugin_registry.py</code>) for connector types.</li>
+  <li><strong>PHANTOM / hardware</strong>: Startup tuning via <code>phantom_config_bridge.py</code> in <code>main.py</code> lifespan affects runtime env, not each upload step directly.</li>
+  <li><strong>Query-time PII / injection</strong> (user questions, not file upload): <code>security_middleware.scan_text</code> on routes such as <code>retrieve_api</code> / <code>rag_api</code> — separate from ingestion chunk sanitization above.</li>
+</ul>
+
+<p class="no-print" style="margin-top:2rem;font-size:0.9rem;color:#64748b;">
+  Companion: <a href="request_flow_steps.csv"><code>request_flow_steps.csv</code></a> (flow <code>C_INGEST_UPLOAD</code>),
+  <a href="data_flow_with_files.html"><code>data_flow_with_files.html</code></a> for broader API flows.
+</p>
+
+</body>
+</html>

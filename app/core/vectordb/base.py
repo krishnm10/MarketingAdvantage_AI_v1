@@ -334,17 +334,10 @@ class BaseVectorDB(abc.ABC):
 
         # ── Rule 1: tenant_id required in multi-tenant mode ───────────
         if tenant_id is None:
-            warnings.warn(
-                f"BaseVectorDB.{caller}() called without tenant_id. "
-                "This is deprecated and will become a hard error. "
-                "Pass tenant_id=config.client_id explicitly.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
             logger.warning(
                 '{"event":"TENANT_ID_MISSING",'
                 '"caller":"%s","backend":"%s",'
-                '"collection":"%s","severity":"security_warning"}',
+                '"collection":"%s","severity":"security_error"}',
                 caller, self.kind, collection,
             )
             try:
@@ -352,11 +345,14 @@ class BaseVectorDB(abc.ABC):
                 log_missing_tenant_context(
                     component=f"vectordb/{self.kind}",
                     operation=caller,
-                    fallback_used="no_filter",
+                    fallback_used="rejected",
                 )
             except Exception:
                 pass
-            return dict(filters or {})
+            raise TenantFilterViolation(
+                f"tenant_id is required for {caller}() when tenant isolation is enabled. "
+                "Pass tenant_id=storage_uuid_str_for_vectordb_metadata(client_id) explicitly."
+            )
 
         # ── Rule 2: reject empty / whitespace-only ────────────────────
         stripped = tenant_id.strip()

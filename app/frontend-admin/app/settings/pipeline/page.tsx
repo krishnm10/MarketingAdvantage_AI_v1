@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useMemo } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import {
   Wand2, ChevronRight, ChevronLeft, CheckCircle2, Circle,
   Database, Brain, Zap, Server, AlertTriangle, Info,
@@ -13,12 +14,41 @@ import {
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { useTenant } from "@/contexts/TenantContext";
+import type { EffectiveTenantRuntime } from "@/lib/effectiveTenantRuntime";
+import {
+  libraryIdForPromptPreset,
+  previewTemplateRerankerCoercion,
+} from "@/lib/effectiveTenantRuntime";
+import { RuntimeWarningBanner } from "@/components/runtime/RuntimeWarningBanner";
+import {
+  TenantProcessingSettingsBlock,
+  mergeTokenizationFromApi,
+  mergeCeleryDispatchFromApi,
+  DEFAULT_TOKENIZATION_DRAFT,
+  DEFAULT_CELERY_DISPATCH_DRAFT,
+  type TenantTokenizationDraft,
+  type TenantCeleryDispatchDraft,
+} from "./components/TenantProcessingSettingsBlock";
+import { TenantVectorDbConnectionFields } from "./components/TenantVectorDbConnectionFields";
+import {
+  type VectorDbConnectionDraft,
+  type VectorDbProvider,
+  emptyVectordbDraft,
+  hydrateVectordbDraft,
+  validateVectordbDraft,
+  buildTopologyPatch,
+  reviewRowsForDraft,
+  isKnownVectorDbProvider,
+} from "@/lib/vectorDbConnectionConfig";
 
 /* ─── Types ─── */
 interface ModelEntry {
   model_id: string;
   provider: string;
   tokenizer_family: string;
+  /** Human-readable label when API/catalog provides it (optional). */
+  tokenizer_label?: string | null;
   tokenizer_encoding: string | null;
   dimension: number;
   distance_metric: string;
@@ -62,9 +92,22 @@ interface Recommendation {
   llm: LLMDetail;
 }
 
+interface PipelinePluggablePatch {
+  vectordb_type?: string;
+  embedder_type?: string;
+  llm_provider?: string;
+  collection?: string;
+  search_mode?: string;
+  chroma_persist_directory?: string;
+}
+
 interface EnvDeltas {
-  global_updates: Record<string, string>;
-  tenant_updates: Record<string, string>;
+  pipeline_pluggable_patch?: PipelinePluggablePatch;
+  infra_env_hints?: Record<string, string>;
+  tenant_json_hints?: Record<string, string | number | boolean>;
+  /** @deprecated Prefer pipeline_pluggable_patch + infra_env_hints */
+  global_updates?: Record<string, string>;
+  tenant_updates?: Record<string, string>;
   client_id: string;
 }
 
@@ -123,6 +166,30 @@ interface TemplateSummary {
   recommended_default: boolean;
   version: string;
   created_by: string;
+}
+
+interface TemplateConfigPatch {
+  reranker?: {
+    type?: string;
+    model?: string;
+    top_k?: number;
+    device?: string;
+  };
+  prompt?: {
+    enabled?: boolean;
+    prompt_type?: string;
+    max_tokens_warning?: number;
+  };
+  security?: {
+    pii_middleware?: Partial<PIIConfig>;
+  };
+  formatter?: Partial<FormatterConfig>;
+  context_window?: Partial<ContextWindowConfig>;
+}
+
+interface TemplateDetailResponse {
+  template_id: string;
+  config_patch?: TemplateConfigPatch;
 }
 
 const DEFAULT_ADVANCED_CONFIG: AdvancedConfig = {
@@ -506,10 +573,10 @@ function DiffRow({
 
 export default function PipelineBuilderPage() {
   const router = useRouter();
+  const { clientId, clientIdInput, setClientId } = useTenant();
 
   /* ── State ── */
   const [step, setStep] = useState(1);
-  const [clientId, setClientId] = useState("default");
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null);
   const [previewResult, setPreviewResult] = useState<PreviewResult | null>(null);
   const [selectedVectorDB, setSelectedVectorDB] = useState<string | null>(null);
@@ -522,10 +589,28 @@ export default function PipelineBuilderPage() {
   const [modelsLoading, setModelsLoading] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [currentConfig, setCurrentConfig] = useState<Record<string, string>>({});
+  /** Resolved topology for Step 7 diff (Client JSON + resolver), keyed like pipeline patch fields. */
+  const [pipelineIdentitySnap, setPipelineIdentitySnap] = useState<{
+    vectordb: string;
+    embedder: string;
+    llm: string;
+    collection?: string;
+    chroma_persist_directory?: string;
+    vectordb_subconfig?: Record<string, unknown>;
+    client_name?: string;
+  } | null>(null);
   const [applying, setApplying] = useState(false);
   const [applyResult, setApplyResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [searchQuery, setSearchQuery] = useState("");
   const [providerFilter, setProviderFilter] = useState<string | null>(null);
+  const [tenantTemplate, setTenantTemplate] = useState<unknown>(null);
+  const [tenantTemplateLoad, setTenantTemplateLoad] = useState<"loading" | "ok" | "error">("loading");
+  const [tokenizationDraft, setTokenizationDraft] = useState<TenantTokenizationDraft>(() => ({
+    ...DEFAULT_TOKENIZATION_DRAFT,
+  }));
+  const [celeryDispatchDraft, setCeleryDispatchDraft] = useState<TenantCeleryDispatchDraft>(() => ({
+    ...DEFAULT_CELERY_DISPATCH_DRAFT,
+  }));
 
   /* ── Advanced node config state ── */
   const [advancedConfig, setAdvancedConfig] = useState<AdvancedConfig>(
@@ -535,7 +620,19 @@ export default function PipelineBuilderPage() {
   const [templatesLoading, setTemplatesLoading] = useState(false);
   const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
   const [templateApplied, setTemplateApplied] = useState<string | null>(null);
+  const [templatePreview, setTemplatePreview] = useState<{
+    templateId: string;
+    name: string;
+    coercionMessage: string | null;
+    promptLibraryId: string | null;
+  } | null>(null);
+  const [templatePreviewLoading, setTemplatePreviewLoading] = useState(false);
+  const [tenantRuntime, setTenantRuntime] = useState<EffectiveTenantRuntime | null>(null);
   const [advancedSaveResult, setAdvancedSaveResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [vectordbDraft, setVectordbDraft] = useState<VectorDbConnectionDraft>(() =>
+    emptyVectordbDraft("chroma", clientId)
+  );
+  const [vdbApplyError, setVdbApplyError] = useState<string | null>(null);
 
   /* Deep link: ?client=<tenant> from Customers & RAG dashboard */
   useEffect(() => {
@@ -562,17 +659,95 @@ export default function PipelineBuilderPage() {
     }
   }, []);
 
-  /* ── Fetch current config for diff ── */
+  /* ── Fetch current .env snapshot + merged pipeline identity for review diffs ── */
   const fetchCurrentConfig = useCallback(async () => {
     try {
-      const res = await apiClient.get(API.CONFIG.GET());
-      // Config API returns { config: { KEY: "value", ... } }
-      const flat: Record<string, string> = res.data?.config ?? {};
+      const [cfgRes, plugRes] = await Promise.all([
+        apiClient.get(API.CONFIG.GET()),
+        apiClient.get(API.RAG_CONFIG.PIPELINE_PLUGGABLE_GET(clientId)).catch(() => null),
+      ]);
+      const flat: Record<string, string> = cfgRes.data?.config ?? {};
       setCurrentConfig(flat);
+      const p = plugRes?.data as {
+        vectordb?: string;
+        embedder?: string;
+        llm?: string;
+        collection?: string;
+        chroma_persist_directory?: string;
+        vectordb_subconfig?: Record<string, unknown>;
+        client_name?: string;
+        ingestion?: {
+          chunking?: { strategy?: string; chunk_size?: number; chunk_overlap?: number };
+        };
+        tokenization?: Record<string, unknown>;
+        celery_dispatch?: Record<string, unknown>;
+      } | undefined;
+      if (p) {
+        setTokenizationDraft(mergeTokenizationFromApi(p.tokenization));
+        setCeleryDispatchDraft(mergeCeleryDispatchFromApi(p.celery_dispatch));
+      } else {
+        setTokenizationDraft({ ...DEFAULT_TOKENIZATION_DRAFT });
+        setCeleryDispatchDraft({ ...DEFAULT_CELERY_DISPATCH_DRAFT });
+      }
+      if (p && (p.vectordb != null || p.embedder != null || p.llm != null)) {
+        setPipelineIdentitySnap({
+          vectordb: String(p.vectordb ?? ""),
+          embedder: String(p.embedder ?? ""),
+          llm: String(p.llm ?? ""),
+          collection: p.collection != null ? String(p.collection) : "",
+          chroma_persist_directory:
+            p.chroma_persist_directory != null ? String(p.chroma_persist_directory) : "",
+          vectordb_subconfig:
+            p.vectordb_subconfig != null && typeof p.vectordb_subconfig === "object"
+              ? (p.vectordb_subconfig as Record<string, unknown>)
+              : undefined,
+          client_name: p.client_name != null ? String(p.client_name) : "",
+        });
+        const ch = p.ingestion?.chunking;
+        if (ch?.chunk_size != null && Number.isFinite(Number(ch.chunk_size))) {
+          setChunkSize(Number(ch.chunk_size));
+        }
+        if (ch?.chunk_overlap != null && Number.isFinite(Number(ch.chunk_overlap))) {
+          setChunkOverlap(Number(ch.chunk_overlap));
+        }
+        if (ch?.strategy && typeof ch.strategy === "string") {
+          setChunkingStrategy(ch.strategy);
+        }
+      } else {
+        setPipelineIdentitySnap(null);
+      }
     } catch {
       // non-critical — diff shows "not set" for unknown keys
     }
-  }, []);
+  }, [clientId]);
+
+  const hydrateDraftForProvider = useCallback(
+    (provider: VectorDbProvider) => {
+      setVectordbDraft(
+        hydrateVectordbDraft(provider, clientId, {
+          vectordb: pipelineIdentitySnap?.vectordb,
+          collection: pipelineIdentitySnap?.collection,
+          chroma_persist_directory: pipelineIdentitySnap?.chroma_persist_directory,
+          vectordb_subconfig: pipelineIdentitySnap?.vectordb_subconfig,
+        })
+      );
+    },
+    [clientId, pipelineIdentitySnap]
+  );
+
+  useEffect(() => {
+    const vdb = (selectedVectorDB || "").trim().toLowerCase();
+    if (!isKnownVectorDbProvider(vdb)) return;
+    hydrateDraftForProvider(vdb);
+  }, [selectedVectorDB, clientId, pipelineIdentitySnap, hydrateDraftForProvider]);
+
+  const vectordbValidation = useMemo(() => {
+    if (!isKnownVectorDbProvider(selectedVectorDB)) return null;
+    return validateVectordbDraft(vectordbDraft, {
+      defaultChromaPath: pipelineIdentitySnap?.chroma_persist_directory,
+      isNewTenantOverlay: pipelineIdentitySnap == null,
+    });
+  }, [selectedVectorDB, vectordbDraft, pipelineIdentitySnap]);
 
   const fetchTemplates = useCallback(async () => {
     setTemplatesLoading(true);
@@ -586,57 +761,158 @@ export default function PipelineBuilderPage() {
     }
   }, []);
 
-  const applyTemplate = useCallback(async (templateId: string) => {
-    try {
-      const res = await apiClient.get(API.PIPELINE_TEMPLATES.GET(templateId));
-      const patch = res.data?.config_patch;
-      if (!patch) return;
-      setAdvancedConfig(prev => {
-        const next = structuredClone(prev);
-        if (patch.security?.pii_middleware) {
-          const p = patch.security.pii_middleware;
-          next.pii = {
-            enabled:              p.enabled ?? next.pii.enabled,
-            positions:            p.positions ?? next.pii.positions,
-            action:               p.action ?? next.pii.action,
-            block_on_severity:    p.block_on_severity ?? next.pii.block_on_severity,
-            trust_score_penalty:  p.trust_score_penalty ?? next.pii.trust_score_penalty,
-            audit_log_enabled:    p.audit_log_enabled ?? next.pii.audit_log_enabled,
-          };
-        }
-        if (patch.prompt) {
-          next.prompt = {
-            enabled:            patch.prompt.enabled ?? next.prompt.enabled,
-            prompt_type:        patch.prompt.prompt_type ?? next.prompt.prompt_type,
-            custom_template:    next.prompt.custom_template,
-            max_tokens_warning: patch.prompt.max_tokens_warning ?? next.prompt.max_tokens_warning,
-          };
-        }
-        if (patch.formatter) {
-          next.formatter = {
-            enabled:           patch.formatter.enabled ?? next.formatter.enabled,
-            response_format:   patch.formatter.response_format ?? next.formatter.response_format,
-            min_trust_score:   patch.formatter.min_trust_score ?? next.formatter.min_trust_score,
-            block_on_low_trust: patch.formatter.block_on_low_trust ?? next.formatter.block_on_low_trust,
-          };
-        }
-        if (patch.context_window) {
-          next.context_window = {
-            enabled:                 patch.context_window.enabled ?? next.context_window.enabled,
-            truncation_strategy:     patch.context_window.truncation_strategy ?? next.context_window.truncation_strategy,
-            response_reserve_tokens: patch.context_window.response_reserve_tokens ?? next.context_window.response_reserve_tokens,
-          };
-        }
-        return next;
-      });
-      setTemplateApplied(templateId);
-      setSelectedTemplate(templateId);
-    } catch (e) {
-      console.error("Failed to apply template", e);
-    }
+  const mergeTemplatePatch = useCallback((patch: TemplateConfigPatch) => {
+    setAdvancedConfig((prev) => {
+      const next = structuredClone(prev);
+      if (patch.security?.pii_middleware) {
+        const p = patch.security.pii_middleware;
+        next.pii = {
+          enabled: p.enabled ?? next.pii.enabled,
+          positions: p.positions ?? next.pii.positions,
+          action: p.action ?? next.pii.action,
+          block_on_severity: p.block_on_severity ?? next.pii.block_on_severity,
+          trust_score_penalty: p.trust_score_penalty ?? next.pii.trust_score_penalty,
+          audit_log_enabled: p.audit_log_enabled ?? next.pii.audit_log_enabled,
+        };
+      }
+      if (patch.prompt) {
+        next.prompt = {
+          enabled: patch.prompt.enabled ?? next.prompt.enabled,
+          prompt_type: patch.prompt.prompt_type ?? next.prompt.prompt_type,
+          custom_template: next.prompt.custom_template,
+          max_tokens_warning:
+            patch.prompt.max_tokens_warning ?? next.prompt.max_tokens_warning,
+        };
+      }
+      if (patch.formatter) {
+        next.formatter = {
+          enabled: patch.formatter.enabled ?? next.formatter.enabled,
+          response_format: patch.formatter.response_format ?? next.formatter.response_format,
+          min_trust_score: patch.formatter.min_trust_score ?? next.formatter.min_trust_score,
+          block_on_low_trust:
+            patch.formatter.block_on_low_trust ?? next.formatter.block_on_low_trust,
+        };
+      }
+      if (patch.context_window) {
+        next.context_window = {
+          enabled: patch.context_window.enabled ?? next.context_window.enabled,
+          truncation_strategy:
+            patch.context_window.truncation_strategy ?? next.context_window.truncation_strategy,
+          response_reserve_tokens:
+            patch.context_window.response_reserve_tokens ??
+            next.context_window.response_reserve_tokens,
+        };
+      }
+      return next;
+    });
   }, []);
 
-  useEffect(() => { fetchModels(); fetchCurrentConfig(); fetchTemplates(); }, [fetchModels, fetchCurrentConfig, fetchTemplates]);
+  const previewTemplate = useCallback(
+    async (templateId: string) => {
+      setTemplatePreviewLoading(true);
+      setTemplatePreview(null);
+      setSelectedTemplate(templateId);
+      try {
+        const res = await apiClient.get<TemplateDetailResponse>(
+          API.PIPELINE_TEMPLATES.GET(templateId)
+        );
+        const patch = res.data?.config_patch;
+        const summary = templates.find((t) => t.template_id === templateId);
+        const coercionMessage =
+          tenantRuntime && patch?.reranker?.type
+            ? previewTemplateRerankerCoercion(tenantRuntime, patch.reranker.type)
+            : null;
+        const presetKey = patch?.prompt?.prompt_type;
+        const promptLibraryId = presetKey
+          ? libraryIdForPromptPreset(presetKey)
+          : null;
+        setTemplatePreview({
+          templateId,
+          name: summary?.name ?? templateId,
+          coercionMessage,
+          promptLibraryId,
+        });
+      } catch (e) {
+        console.error("Failed to preview template", e);
+      } finally {
+        setTemplatePreviewLoading(false);
+      }
+    },
+    [tenantRuntime, templates]
+  );
+
+  const applyTemplate = useCallback(
+    async (templateId: string) => {
+      try {
+        const res = await apiClient.get<TemplateDetailResponse>(
+          API.PIPELINE_TEMPLATES.GET(templateId)
+        );
+        const patch = res.data?.config_patch;
+        if (!patch) return;
+        mergeTemplatePatch(patch);
+        setTemplateApplied(templateId);
+        setSelectedTemplate(templateId);
+        setTemplatePreview(null);
+      } catch (e) {
+        console.error("Failed to apply template", e);
+      }
+    },
+    [mergeTemplatePatch]
+  );
+
+  useEffect(() => {
+    fetchModels();
+    fetchTemplates();
+  }, [fetchModels, fetchTemplates]);
+
+  useEffect(() => {
+    void fetchCurrentConfig();
+  }, [clientId, fetchCurrentConfig]);
+
+  useEffect(() => {
+    if (!clientId) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    apiClient
+      .get<EffectiveTenantRuntime>(API.MODELS.RUNTIME(clientId), {
+        signal: controller.signal,
+      })
+      .then((res) => {
+        if (!cancelled) setTenantRuntime(res.data);
+      })
+      .catch((err: unknown) => {
+        const canceled =
+          (err as { code?: string; name?: string })?.code === "ERR_CANCELED" ||
+          (err as { name?: string })?.name === "CanceledError";
+        if (!canceled && !cancelled) setTenantRuntime(null);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [clientId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setTenantTemplateLoad("loading");
+      try {
+        const res = await apiClient.get(API.RAG_CONFIG.TENANT_CONFIG_TEMPLATE());
+        if (!cancelled) {
+          setTenantTemplate(res.data);
+          setTenantTemplateLoad("ok");
+        }
+      } catch {
+        if (!cancelled) {
+          setTenantTemplate(null);
+          setTenantTemplateLoad("error");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   /* ── Fetch recommendation preview when model selected ── */
   const fetchPreview = useCallback(async (modelId: string) => {
@@ -690,43 +966,103 @@ export default function PipelineBuilderPage() {
 
   const providers = useMemo(() => [...new Set(models.map(m => m.provider))].sort(), [models]);
 
-  /* ── Build env deltas to apply ── */
-  const buildFinalDeltas = useCallback((): Record<string, string> => {
-    if (!previewResult?.env_deltas) return {};
-    const base = { ...previewResult.env_deltas.global_updates };
-    // Override with user-selected VectorDB and LLM
-    if (selectedVectorDB) base["MAI_VECTORDB"] = selectedVectorDB;
-    if (selectedLLM) base["MAI_LLM"] = selectedLLM;
-    base["CHUNK_SIZE"] = String(chunkSize);
-    base["CHUNK_OVERLAP"] = String(chunkOverlap);
-    base["CHUNKING_STRATEGY"] = chunkingStrategy;
-    if (!rerankerEnabled) {
-      delete base["RERANKER_ENABLED"];
-    }
-    return base;
-  }, [previewResult, selectedVectorDB, selectedLLM, chunkSize, chunkOverlap, chunkingStrategy, rerankerEnabled]);
+  /* ── Build tenant Client JSON patch (chunking + tokenization + celery_dispatch from drafts) ── */
+  const buildTenantLogicPatch = useCallback((): Record<string, unknown> => {
+    const ingestion: Record<string, unknown> = {
+      chunking: {
+        strategy: chunkingStrategy,
+        chunk_size: chunkSize,
+        chunk_overlap: chunkOverlap,
+      },
+    };
+    const iq = celeryDispatchDraft.ingestion_queue.trim() || DEFAULT_CELERY_DISPATCH_DRAFT.ingestion_queue;
+    const vq = celeryDispatchDraft.validation_queue.trim() || DEFAULT_CELERY_DISPATCH_DRAFT.validation_queue;
+    const celery_dispatch = {
+      ingestion_queue: iq,
+      validation_queue: vq,
+      max_retries: celeryDispatchDraft.max_retries,
+      retry_delay_seconds: celeryDispatchDraft.retry_delay_seconds,
+      soft_time_limit: celeryDispatchDraft.soft_time_limit,
+      hard_time_limit: celeryDispatchDraft.hard_time_limit,
+    };
+    return {
+      ingestion,
+      tokenization: { ...tokenizationDraft },
+      celery_dispatch,
+    };
+  }, [
+    chunkingStrategy,
+    chunkSize,
+    chunkOverlap,
+    tokenizationDraft,
+    celeryDispatchDraft,
+  ]);
 
-  const buildTenantDeltas = useCallback((): Record<string, string> => {
-    if (!previewResult?.env_deltas?.tenant_updates) return {};
-    const base = { ...previewResult.env_deltas.tenant_updates };
-    if (selectedVectorDB) {
-      const pfx = clientId.toUpperCase().replace(/-/g, "_").replace(/ /g, "_");
-      if (pfx !== "DEFAULT") base[`MAI_${pfx}_VECTORDB`] = selectedVectorDB;
+  const buildPipelinePatchPayload = useCallback((): Record<string, unknown> => {
+    const hinted = previewResult?.env_deltas?.pipeline_pluggable_patch;
+    const cat = previewResult?.catalog_entry;
+    const vdb = (selectedVectorDB || hinted?.vectordb_type || "").trim().toLowerCase();
+    let emb = (hinted?.embedder_type || "").trim().toLowerCase();
+    if (!emb && cat?.provider === "google") emb = "gemini";
+    else if (!emb && cat?.provider) emb = String(cat.provider).trim().toLowerCase();
+    const llmProv = (selectedLLM || hinted?.llm_provider || "").trim().toLowerCase();
+    if (!isKnownVectorDbProvider(vdb)) {
+      const out: Record<string, unknown> = {};
+      if (vdb) out.vectordb_type = vdb;
+      if (emb) out.embedder_type = emb;
+      if (llmProv) out.llm_provider = llmProv;
+      return out;
     }
-    return base;
-  }, [previewResult, selectedVectorDB, clientId]);
+    return buildTopologyPatch(vectordbDraft, {
+      vectordbType: vdb,
+      embedderType: emb || undefined,
+      llmProvider: llmProv || undefined,
+    });
+  }, [previewResult, selectedVectorDB, selectedLLM, vectordbDraft]);
 
   /* ── Apply configuration ── */
   const applyConfig = useCallback(async () => {
     setApplying(true);
     setApplyResult(null);
     setAdvancedSaveResult(null);
+    setVdbApplyError(null);
+    if (isKnownVectorDbProvider(selectedVectorDB)) {
+      const vdbErr = validateVectordbDraft(vectordbDraft, {
+        defaultChromaPath: pipelineIdentitySnap?.chroma_persist_directory,
+        isNewTenantOverlay: pipelineIdentitySnap == null,
+      });
+      if (vdbErr) {
+        setVdbApplyError(vdbErr);
+        setApplyResult({ ok: false, msg: vdbErr });
+        setApplying(false);
+        return;
+      }
+    }
     try {
-      // 1) Save base .env deltas
-      const updates = { ...buildFinalDeltas(), ...buildTenantDeltas() };
-      await apiClient.put(API.CONFIG.PUT(), { updates });
+      const topology = buildPipelinePatchPayload();
+      const tenantLogic = buildTenantLogicPatch();
+      const mergedPatch: Record<string, unknown> = { ...topology };
+      if (tenantLogic.ingestion && typeof tenantLogic.ingestion === "object") {
+        mergedPatch.ingestion = tenantLogic.ingestion;
+      }
+      if (tenantLogic.tokenization && typeof tenantLogic.tokenization === "object") {
+        mergedPatch.tokenization = tenantLogic.tokenization;
+      }
+      if (tenantLogic.celery_dispatch && typeof tenantLogic.celery_dispatch === "object") {
+        mergedPatch.celery_dispatch = tenantLogic.celery_dispatch;
+      }
 
-      // 2) Save advanced node config via RAG_CONFIG API
+      const hasPipelinePluggablePatch =
+        Object.keys(topology).length > 0 ||
+        (tenantLogic.ingestion != null && typeof tenantLogic.ingestion === "object") ||
+        (tenantLogic.tokenization != null && typeof tenantLogic.tokenization === "object") ||
+        (tenantLogic.celery_dispatch != null && typeof tenantLogic.celery_dispatch === "object");
+
+      if (hasPipelinePluggablePatch) {
+        await apiClient.patch(API.RAG_CONFIG.PIPELINE_PLUGGABLE_PATCH(clientId), mergedPatch);
+      }
+
+      // Save advanced node config via RAG_CONFIG API
       const advPayload: Record<string, any> = {};
       advPayload.security = {
         pii_middleware: {
@@ -742,10 +1078,13 @@ export default function PipelineBuilderPage() {
         enabled: advancedConfig.prompt.enabled,
         prompt_type: advancedConfig.prompt.prompt_type,
         max_tokens_warning: advancedConfig.prompt.max_tokens_warning,
-        ...(advancedConfig.prompt.custom_template
-          ? { template: advancedConfig.prompt.custom_template }
-          : {}),
       };
+      const presetLibraryId = libraryIdForPromptPreset(
+        advancedConfig.prompt.prompt_type
+      );
+      if (presetLibraryId) {
+        advPayload.prompt_template_id = presetLibraryId;
+      }
       advPayload.formatter = {
         enabled: advancedConfig.formatter.enabled,
         response_format: advancedConfig.formatter.response_format,
@@ -764,11 +1103,14 @@ export default function PipelineBuilderPage() {
         } catch (advErr: any) {
           const advMsg = advErr?.response?.data?.detail ?? advErr?.message ?? "Failed to save advanced config.";
           setAdvancedSaveResult({ ok: false, msg: advMsg });
-          throw new Error(`Base config saved, but advanced pipeline nodes failed: ${advMsg}`);
+          throw new Error(`Infra / Client JSON saved, but advanced pipeline nodes failed: ${advMsg}`);
         }
       }
 
-      setApplyResult({ ok: true, msg: "Configuration applied successfully! The pipeline is now updated." });
+      setApplyResult({
+        ok: true,
+        msg: "Applied: merged Client JSON (topology, ingestion.chunking, tokenization, celery_dispatch) via pipeline-pluggable PATCH. No .env writes for migrated keys.",
+      });
       await fetchCurrentConfig();
     } catch (err: any) {
       const msg = err?.response?.data?.detail ?? err?.message ?? "Failed to apply configuration.";
@@ -776,18 +1118,43 @@ export default function PipelineBuilderPage() {
     } finally {
       setApplying(false);
     }
-  }, [buildFinalDeltas, buildTenantDeltas, fetchCurrentConfig, advancedConfig, clientId]);
+  }, [
+    buildTenantLogicPatch,
+    buildPipelinePatchPayload,
+    fetchCurrentConfig,
+    advancedConfig,
+    clientId,
+    selectedVectorDB,
+    vectordbDraft,
+    pipelineIdentitySnap,
+  ]);
 
   /* ── Can advance ── */
   const canAdvance = useMemo(() => {
     if (step === 1) return !!selectedModelId && !previewLoading;
     if (step === 2) return chunkSize > 0 && chunkOverlap >= 0 && !!chunkingStrategy;
-    if (step === 3) return !!selectedVectorDB;
+    if (step === 3) {
+      if (!selectedVectorDB) return false;
+      if (isKnownVectorDbProvider(selectedVectorDB)) {
+        if (vectordbValidation) return false;
+      }
+      return true;
+    }
     if (step === 4) return !!selectedLLM;
     if (step === 5) return true; // advanced nodes are optional
     if (step === 6) return true; // template selection is optional
     return true;
-  }, [step, selectedModelId, previewLoading, chunkSize, chunkOverlap, chunkingStrategy, selectedVectorDB, selectedLLM]);
+  }, [
+    step,
+    selectedModelId,
+    previewLoading,
+    chunkSize,
+    chunkOverlap,
+    chunkingStrategy,
+    selectedVectorDB,
+    selectedLLM,
+    vectordbValidation,
+  ]);
 
   /* ── Current model entry ── */
   const selectedModel = useMemo(
@@ -797,6 +1164,8 @@ export default function PipelineBuilderPage() {
 
   const rec = previewResult?.recommendation ?? null;
   const cat = previewResult?.catalog_entry ?? null;
+
+  const tenantLogicPreview = useMemo(() => buildTenantLogicPatch(), [buildTenantLogicPatch]);
 
   /* ─────────────────────────── RENDER ─────────────────────────────── */
   return (
@@ -816,12 +1185,59 @@ export default function PipelineBuilderPage() {
           onClick={() => router.push("/settings")}
           className="text-xs text-slate-500 hover:text-primary-600 flex items-center gap-1 transition-colors"
         >
-          ⚙ Advanced (.env editor)
+          ⚙ Secrets & infra (.env)
           <ChevronRight className="h-3.5 w-3.5" />
         </button>
       </div>
 
       <StepIndicator current={step} />
+
+      <details className="mb-5 rounded-xl border border-slate-200 bg-white shadow-sm">
+        <summary className="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-slate-800 hover:bg-slate-50 rounded-xl flex items-center justify-between gap-2">
+          <span>Tenant JSON template (reference)</span>
+          {tenantTemplateLoad === "loading" && (
+            <Loader2 className="h-4 w-4 animate-spin text-slate-400 shrink-0" aria-hidden />
+          )}
+        </summary>
+        <div className="border-t border-slate-100 px-4 py-3">
+          {tenantTemplateLoad === "loading" && (
+            <p className="text-xs text-slate-500">Loading canonical overlay from the server…</p>
+          )}
+          {tenantTemplateLoad === "error" && (
+            <p className="text-xs text-red-600">
+              Could not load the template endpoint. Check that you are signed in as admin and the API is reachable.
+            </p>
+          )}
+          {tenantTemplateLoad === "ok" && tenantTemplate != null && (
+            <>
+              <p className="mb-2 text-xs text-slate-500">
+                Canonical overlay shape from the server — merge with{" "}
+                <code className="rounded bg-slate-100 px-1">default.json</code> for new tenants.
+              </p>
+              <pre className="max-h-64 overflow-auto rounded-lg bg-slate-900 p-3 text-[10px] leading-relaxed text-emerald-100">
+                {JSON.stringify(tenantTemplate, null, 2)}
+              </pre>
+            </>
+          )}
+          {tenantTemplateLoad === "ok" && tenantTemplate == null && (
+            <p className="text-xs text-amber-700">Template endpoint returned no body.</p>
+          )}
+        </div>
+      </details>
+
+      <TenantProcessingSettingsBlock
+        clientId={clientId}
+        tokenization={tokenizationDraft}
+        onTokenizationChange={(patch) =>
+          setTokenizationDraft((prev) => ({ ...prev, ...patch }))
+        }
+        celeryDispatch={celeryDispatchDraft}
+        onCeleryDispatchChange={(patch) =>
+          setCeleryDispatchDraft((prev) => ({ ...prev, ...patch }))
+        }
+        tenantLogicPreview={tenantLogicPreview}
+        disabled={applying}
+      />
 
       {/* ─── STEP 1: Choose Model ─── */}
       {step === 1 && (
@@ -835,19 +1251,52 @@ export default function PipelineBuilderPage() {
             </p>
 
             {/* Tenant selector */}
-            <div className="mb-4 flex items-center gap-3">
+            <div className="mb-4 flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
               <label className="text-xs font-semibold text-slate-600 min-w-[80px]">Tenant / Client</label>
               <input
                 type="text"
-                value={clientId}
+                value={clientIdInput}
                 onChange={e => setClientId(e.target.value || "default")}
                 placeholder="default"
                 className="h-8 rounded-lg border border-slate-200 bg-slate-50 px-3 text-sm text-slate-700 focus:border-primary-400 focus:outline-none focus:ring-1 focus:ring-primary-200 w-48"
               />
               <span className="text-[11px] text-slate-400">
-                {clientId === "default" ? "Applies global defaults" : `Per-tenant overrides for: ${clientId}`}
+                Apply writes <code className="text-[10px]">pipeline-pluggable</code> for{" "}
+                <strong>{clientIdInput}</strong> (topology, ingestion.chunking, tokenization, and{" "}
+                <code className="text-[10px]">celery_dispatch</code> in merged Client JSON). Use{" "}
+                <strong>Apply Configuration</strong> on the last step to persist.
               </span>
             </div>
+            {pipelineIdentitySnap && (
+              <div className="mb-4 rounded-lg border border-violet-100 bg-violet-50/60 px-3 py-2 text-[11px] text-slate-700 leading-relaxed">
+                <span className="font-semibold text-violet-900">Merged Client JSON</span>
+                {" — "}
+                VectorDB <code className="rounded bg-white/80 px-1 text-[10px]">{pipelineIdentitySnap.vectordb}</code>
+                {pipelineIdentitySnap.collection ? (
+                  <>
+                    {" "}
+                    · collection <code className="rounded bg-white/80 px-1 text-[10px]">{pipelineIdentitySnap.collection}</code>
+                  </>
+                ) : null}
+                {pipelineIdentitySnap.chroma_persist_directory ? (
+                  <>
+                    {" "}
+                    · Chroma persist{" "}
+                    <code className="rounded bg-white/80 px-1 text-[10px]">{pipelineIdentitySnap.chroma_persist_directory}</code>
+                  </>
+                ) : null}
+                {pipelineIdentitySnap.client_name ? (
+                  <>
+                    {" "}
+                    · display name <span className="font-medium">{pipelineIdentitySnap.client_name}</span>
+                  </>
+                ) : null}
+                . Set Chroma path in Step 3 when using local Chroma, or edit later on{" "}
+                <Link href="/settings" className="font-medium text-primary-700 underline-offset-2 hover:underline">
+                  Settings → Configuration
+                </Link>.
+              </div>
+            )}
 
             {/* Quick presets */}
             <div className="mb-5">
@@ -1086,6 +1535,13 @@ export default function PipelineBuilderPage() {
                       </button>
                     ))}
                   </div>
+                  <p className="mt-3 border-t border-slate-200 pt-3 text-[11px] text-slate-500 leading-relaxed">
+                    <strong className="text-slate-600">Persistence:</strong> Apply writes{" "}
+                    <code className="rounded bg-white px-1 py-0.5 text-[10px] font-mono border border-slate-200">CHUNK_SIZE</code> /{" "}
+                    <code className="rounded bg-white px-1 py-0.5 text-[10px] font-mono border border-slate-200">CHUNK_OVERLAP</code>{" "}
+                    to <code className="text-[10px]">.env</code> (token paths still read them). The live chunking{" "}
+                    <em>strategy</em> is <code className="text-[10px]">ingestion.chunking.strategy</code> in merged Client JSON—edit the tenant file or use a future API; this selector drives recommendations and your review only until that is wired.
+                  </p>
                 </div>
               </div>
             </div>
@@ -1115,9 +1571,27 @@ export default function PipelineBuilderPage() {
             <h2 className="text-base font-semibold text-slate-800 mb-1">
               Step 3 — Storage & Search
             </h2>
-            <p className="text-sm text-slate-500 mb-4">
-              Choose where your vectors are stored. The recommended option is pre-selected based on your model's distance metric (<strong>{cat?.distance_metric ?? "cosine"}</strong>).
+            <p className="text-sm text-slate-500 mb-1">
+              Storage is where embeddings live for <strong>this tenant only</strong> ({clientId}).
             </p>
+            <p className="text-sm text-slate-500 mb-4">
+              Choose a vector database. Recommended option uses your model&apos;s distance metric (
+              <strong>{cat?.distance_metric ?? "cosine"}</strong>).
+            </p>
+            {tenantRuntime || pipelineIdentitySnap ? (
+              <p className="text-[11px] text-slate-500 mb-3 rounded-lg border border-slate-100 bg-slate-50 px-2 py-1.5">
+                Effective stack:{" "}
+                <span className="font-medium">
+                  {pipelineIdentitySnap?.vectordb || selectedVectorDB || "—"}
+                </span>
+                {" · "}
+                <span className="font-medium">{tenantRuntime?.embedder.type ?? pipelineIdentitySnap?.embedder ?? "—"}</span>
+                {" · "}
+                <span className="font-medium">
+                  {tenantRuntime?.llm.effective_provider ?? pipelineIdentitySnap?.llm ?? "—"}
+                </span>
+              </p>
+            ) : null}
 
             <p className="text-xs font-semibold uppercase tracking-wide text-slate-500 mb-3">Vector Database</p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 mb-6">
@@ -1127,10 +1601,30 @@ export default function PipelineBuilderPage() {
                   option={opt}
                   selected={selectedVectorDB === opt.provider}
                   recommended={i === 0}
-                  onSelect={() => setSelectedVectorDB(opt.provider)}
+                  onSelect={() => {
+                    setSelectedVectorDB(opt.provider);
+                    if (isKnownVectorDbProvider(opt.provider)) {
+                      hydrateDraftForProvider(opt.provider);
+                    }
+                  }}
                 />
               ))}
             </div>
+
+            {selectedVectorDB && isKnownVectorDbProvider(selectedVectorDB) ? (
+              <TenantVectorDbConnectionFields
+                clientId={clientId}
+                draft={vectordbDraft}
+                onChange={setVectordbDraft}
+                validationError={vectordbValidation}
+                isNewTenantOverlay={pipelineIdentitySnap == null}
+              />
+            ) : selectedVectorDB ? (
+              <p className="text-xs text-amber-700 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2">
+                Connection fields for <strong>{selectedVectorDB}</strong> are not configured in the
+                wizard yet. Use Settings → Configuration for this provider.
+              </p>
+            ) : null}
 
             {/* Reranker */}
             <div className="border-t border-slate-100 pt-4">
@@ -1380,15 +1874,34 @@ export default function PipelineBuilderPage() {
 
             {advancedConfig.prompt.enabled && (
               <div className="space-y-3 border-t border-slate-100 pt-3">
+                {tenantRuntime && (
+                  <div className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                    <span className="font-semibold">Effective template (SSOT):</span>{" "}
+                    <code className="font-mono text-[11px] bg-blue-100/80 px-1 rounded">
+                      {tenantRuntime.retrieval.prompt_ssot.effective_template_id ??
+                        tenantRuntime.retrieval.prompt_template_id ??
+                        "—"}
+                    </code>
+                    <span className="text-blue-700/80 ml-1">
+                      ({tenantRuntime.retrieval.prompt_ssot.source})
+                    </span>
+                  </div>
+                )}
+                <RuntimeWarningBanner warnings={tenantRuntime?.warnings ?? []} />
                 <div>
                   <label className="text-xs font-semibold text-slate-600 mb-1 block">Prompt Strategy</label>
+                  <p className="text-[10px] text-slate-500 mb-2">
+                    Presets map to Prompt Library ids on save (library-first). Custom uses inline text only when no library id is set.
+                  </p>
                   <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                     {[
                       { value: "rag_context", label: "RAG Context", desc: "Standard grounded Q&A" },
                       { value: "cot",         label: "Chain of Thought", desc: "Step-by-step reasoning" },
                       { value: "refine",      label: "Refine",       desc: "Iterative refinement" },
                       { value: "custom",      label: "Custom",       desc: "Your own template" },
-                    ].map(opt => (
+                    ].map(opt => {
+                      const libId = libraryIdForPromptPreset(opt.value);
+                      return (
                       <button
                         key={opt.value}
                         onClick={() => setAdvancedConfig(c => ({ ...c, prompt: { ...c.prompt, prompt_type: opt.value } }))}
@@ -1401,24 +1914,30 @@ export default function PipelineBuilderPage() {
                       >
                         <span className="text-xs font-semibold text-slate-800">{opt.label}</span>
                         <p className="text-[10px] text-slate-400 mt-0.5">{opt.desc}</p>
+                        {libId && (
+                          <p className="text-[9px] font-mono text-violet-600 mt-1 truncate" title={libId}>
+                            → {libId}
+                          </p>
+                        )}
                       </button>
-                    ))}
+                    );})}
                   </div>
+                  {libraryIdForPromptPreset(advancedConfig.prompt.prompt_type) && (
+                    <p className="text-[10px] text-slate-500 mt-2">
+                      Selected preset saves as{" "}
+                      <code className="font-mono bg-slate-100 px-1 rounded">
+                        retrieval.prompt_template_id = {libraryIdForPromptPreset(advancedConfig.prompt.prompt_type)}
+                      </code>
+                    </p>
+                  )}
                 </div>
 
                 {advancedConfig.prompt.prompt_type === "custom" && (
-                  <div>
-                    <label className="text-xs font-semibold text-slate-600 mb-1 block">
-                      Custom Template
-                      <span className="ml-1 font-normal text-slate-400">Use {"{{context}}"}, {"{{query}}"} as placeholders</span>
-                    </label>
-                    <textarea
-                      value={advancedConfig.prompt.custom_template}
-                      onChange={e => setAdvancedConfig(c => ({ ...c, prompt: { ...c.prompt, custom_template: e.target.value } }))}
-                      rows={4}
-                      placeholder="You are a helpful assistant. Use the following context:\n\n{{context}}\n\nQuestion: {{query}}"
-                      className="w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-700 font-mono focus:border-violet-400 focus:outline-none resize-none"
-                    />
+                  <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+                    Inline <code className="text-[10px]">prompt.template</code> is no longer saved to tenant JSON.
+                    Create or select a template in{" "}
+                    <strong>Settings → Reranking → Prompt Library</strong> and set{" "}
+                    <code className="text-[10px]">retrieval.prompt_template_id</code>.
                   </div>
                 )}
 
@@ -1606,7 +2125,8 @@ export default function PipelineBuilderPage() {
                 {templates.map(t => (
                   <button
                     key={t.template_id}
-                    onClick={() => applyTemplate(t.template_id)}
+                    type="button"
+                    onClick={() => void previewTemplate(t.template_id)}
                     className={cn(
                       "rounded-xl border-2 p-4 text-left transition-all duration-200 relative",
                       selectedTemplate === t.template_id
@@ -1651,6 +2171,58 @@ export default function PipelineBuilderPage() {
               </div>
             )}
 
+            {(templatePreviewLoading || templatePreview) && (
+              <div className="mt-4 space-y-3 rounded-xl border border-slate-200 bg-slate-50 p-4">
+                {templatePreviewLoading && (
+                  <p className="text-xs text-slate-500 flex items-center gap-2">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Loading template preview…
+                  </p>
+                )}
+                {templatePreview && !templatePreviewLoading && (
+                  <>
+                    <p className="text-sm font-semibold text-slate-800">
+                      Preview: {templatePreview.name}
+                    </p>
+                    {templatePreview.coercionMessage && (
+                      <div className="flex gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-950">
+                        <AlertTriangle className="h-4 w-4 flex-shrink-0 text-amber-600 mt-0.5" />
+                        <p>
+                          <span className="font-semibold">Coercion preview: </span>
+                          {templatePreview.coercionMessage}
+                        </p>
+                      </div>
+                    )}
+                    {templatePreview.promptLibraryId && (
+                      <p className="text-xs text-blue-800 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2">
+                        Prompt preset maps to library id{" "}
+                        <code className="font-mono">{templatePreview.promptLibraryId}</code> on pipeline save.
+                      </p>
+                    )}
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void applyTemplate(templatePreview.templateId)}
+                        className="rounded-lg bg-primary-600 px-4 py-2 text-xs font-medium text-white hover:bg-primary-700"
+                      >
+                        Apply template to Step 5 settings
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTemplatePreview(null);
+                          setSelectedTemplate(null);
+                        }}
+                        className="rounded-lg border border-slate-300 bg-white px-4 py-2 text-xs text-slate-600 hover:bg-slate-100"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
             {templateApplied && (
               <div className="mt-4 flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-xs text-emerald-800">
                 <CheckCheck className="h-4 w-4 flex-shrink-0" />
@@ -1672,54 +2244,64 @@ export default function PipelineBuilderPage() {
               Review the changes below before applying. Only the settings shown here will be updated — all other values remain unchanged.
             </p>
 
-            {/* Global updates */}
+            {vdbApplyError ? (
+              <div className="mb-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+                <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0" />
+                {vdbApplyError}
+              </div>
+            ) : null}
+
+            {/* Review: .env token limits + Client JSON patch (no deprecated MAI_* tenant keys) */}
             {(() => {
-              const globalDeltas = buildFinalDeltas();
-              const tenantDeltas = buildTenantDeltas();
-              const hasGlobal = Object.keys(globalDeltas).length > 0;
-              const hasTenant = Object.keys(tenantDeltas).length > 0;
+              const tenantTopology = buildPipelinePatchPayload();
+              const tenantLogic = buildTenantLogicPatch();
+              const patchCurrentLabels: Record<string, string> = pipelineIdentitySnap
+                ? {
+                    vectordb_type: pipelineIdentitySnap.vectordb,
+                    embedder_type: pipelineIdentitySnap.embedder,
+                    llm_provider: pipelineIdentitySnap.llm,
+                    collection: pipelineIdentitySnap.collection ?? "",
+                    chroma_persist_directory: pipelineIdentitySnap.chroma_persist_directory ?? "",
+                    client_name: pipelineIdentitySnap.client_name ?? "",
+                  }
+                : {};
+
+              const topologyFlat: Record<string, string> = {};
+              for (const [k, v] of Object.entries(tenantTopology)) {
+                if (k === "vectordb_config" && v && typeof v === "object") {
+                  for (const [sk, sv] of Object.entries(v as Record<string, unknown>)) {
+                    topologyFlat[`vectordb.${sk}`] =
+                      sv === null || sv === undefined ? "" : String(sv);
+                  }
+                } else if (v !== undefined && v !== null) {
+                  topologyFlat[k] = String(v);
+                }
+              }
+              if (
+                isKnownVectorDbProvider(selectedVectorDB) &&
+                Object.keys(topologyFlat).length === 0
+              ) {
+                for (const row of reviewRowsForDraft(vectordbDraft)) {
+                  topologyFlat[row.key] = row.value;
+                }
+              }
+
+              const hasTopology = Object.keys(topologyFlat).length > 0;
+              const hasChunkLogic = Boolean(tenantLogic.ingestion);
 
               return (
                 <div className="space-y-4">
-                  {hasGlobal && (
-                    <div>
-                      <div className="flex items-center gap-2 mb-2">
-                        <Globe className="h-4 w-4 text-slate-500" />
-                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Global Defaults (all tenants)</p>
-                      </div>
-                      <div className="overflow-x-auto rounded-lg border border-slate-200">
-                        <table className="w-full text-xs">
-                          <thead>
-                            <tr className="border-b border-slate-200 bg-slate-50">
-                              <th className="py-2 pl-2 pr-3 text-left font-semibold text-slate-600">Setting</th>
-                              <th className="py-2 pr-3 text-left font-semibold text-slate-500">Current</th>
-                              <th className="py-2 pr-3 text-left font-semibold text-primary-700">Proposed</th>
-                              <th className="py-2 text-left font-semibold text-slate-500">Scope</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {Object.entries(globalDeltas).map(([k, v]) => (
-                              <DiffRow
-                                key={k}
-                                setting={k}
-                                current={currentConfig[k] ?? ""}
-                                proposed={v}
-                                scope="global"
-                                changed={(currentConfig[k] ?? "") !== v}
-                              />
-                            ))}
-                          </tbody>
-                        </table>
-                      </div>
-                    </div>
-                  )}
+                  <div className="rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-2 text-[11px] text-slate-600">
+                    <strong>Slim .env:</strong> tokenizer and chunk limits are no longer written via the Config API. They are merged into{" "}
+                    <code className="rounded bg-white px-1">ClientConfig</code> below.
+                  </div>
 
-                  {hasTenant && (
+                  {hasTopology && (
                     <div>
                       <div className="flex items-center gap-2 mb-2">
                         <User className="h-4 w-4 text-violet-600" />
                         <p className="text-xs font-semibold uppercase tracking-wide text-violet-600">
-                          Tenant Overrides: {clientId}
+                          Topology ({clientId}) — pipeline-pluggable PATCH
                         </p>
                       </div>
                       <div className="overflow-x-auto rounded-lg border border-violet-200 bg-violet-50/30">
@@ -1733,19 +2315,42 @@ export default function PipelineBuilderPage() {
                             </tr>
                           </thead>
                           <tbody>
-                            {Object.entries(tenantDeltas).map(([k, v]) => (
-                              <DiffRow
-                                key={k}
-                                setting={k}
-                                current={currentConfig[k] ?? ""}
-                                proposed={v}
-                                scope="tenant"
-                                changed={(currentConfig[k] ?? "") !== v}
-                              />
-                            ))}
+                            {Object.entries(topologyFlat).map(([k, v]) => {
+                              const proposed = String(v);
+                              const current = String(patchCurrentLabels[k] ?? "");
+                              const norm = (s: string) => s.trim().toLowerCase();
+                              return (
+                                <DiffRow
+                                  key={k}
+                                  setting={k}
+                                  current={current}
+                                  proposed={proposed}
+                                  scope="tenant"
+                                  changed={norm(current) !== norm(proposed)}
+                                />
+                              );
+                            })}
                           </tbody>
                         </table>
                       </div>
+                    </div>
+                  )}
+
+                  {hasChunkLogic && (
+                    <div>
+                      <div className="flex items-center gap-2 mb-2">
+                        <Hash className="h-4 w-4 text-slate-600" />
+                        <p className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                          Ingestion / chunking (Client JSON deep-merge)
+                        </p>
+                      </div>
+                      <p className="mb-2 text-[11px] text-slate-500">
+                        Tokenization and Celery dispatch are edited in{" "}
+                        <strong>Tenant processing &amp; routing</strong> above; see <strong>Raw merge preview</strong> there for the full PATCH payload.
+                      </p>
+                      <pre className="max-h-48 overflow-auto rounded-lg border border-slate-200 bg-slate-900 p-3 text-[10px] leading-relaxed text-emerald-100">
+                        {JSON.stringify({ ingestion: tenantLogic.ingestion }, null, 2)}
+                      </pre>
                     </div>
                   )}
                 </div>

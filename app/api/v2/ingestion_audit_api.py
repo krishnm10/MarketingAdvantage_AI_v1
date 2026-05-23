@@ -128,17 +128,54 @@ async def ingestion_audit(
     Ingestion Component Audit — returns a bounded per-stage snapshot.
 
     All DB queries are bounded (LIMIT applied) to avoid full table scans.
-    Component status is derived from active environment configuration.
+    Component status is derived from merged Client JSON for the default tenant
+    when the resolver succeeds; otherwise from environment fallbacks only.
     """
     captured_at = datetime.now(timezone.utc).isoformat()
     warnings: List[str] = []
+    _audit_cfg = None
 
-    # ── 1. Active pipeline config from env ──────────────────────────────────
-    active_embedder = _env("MAI_EMBEDDER", "huggingface").lower()
-    active_llm      = _env("MAI_LLM", "ollama").lower()
-    active_vectordb = _env("MAI_VECTORDB", "qdrant").lower()
-    chunking_strategy = _env("CHUNKING_STRATEGY", "semantic")
-    collection      = _env("MAI_COLLECTION", "ingested_content")
+    # ── 1. Active pipeline components from merged Client JSON (preferred) ──
+    try:
+        from app.core.config.client_config_resolver import get_client_config
+        from app.middleware.security_middleware import validate_business_id
+
+        _acid = validate_business_id(os.getenv("MAI_DEFAULT_BUSINESS_ID"))
+        _acfg = get_client_config(_acid)
+        _audit_cfg = _acfg
+        active_embedder = _acfg.embedder.type.value.lower()
+        active_llm = (
+            _acfg.llm.single.type.value.lower()
+            if _acfg.llm and _acfg.llm.single
+            else "ollama"
+        )
+        active_vectordb = _acfg.vectordb.type.value.lower()
+        chunking_strategy = _acfg.ingestion.chunking.strategy.value
+        collection = _acfg.vectordb.collection
+        _audit_config_source = f"client_json:{_acid}"
+    except Exception:
+        try:
+            from app.core.config.client_config_resolver import get_client_config
+
+            _acfg = get_client_config("default")
+            _audit_cfg = _acfg
+            active_embedder = _acfg.embedder.type.value.lower()
+            active_llm = (
+                _acfg.llm.single.type.value.lower()
+                if _acfg.llm and _acfg.llm.single
+                else "ollama"
+            )
+            active_vectordb = _acfg.vectordb.type.value.lower()
+            chunking_strategy = _acfg.ingestion.chunking.strategy.value
+            collection = _acfg.vectordb.collection
+            _audit_config_source = "client_json:default_fallback"
+        except Exception:
+            active_embedder = _env("MAI_EMBEDDER", "huggingface").lower()
+            active_llm = _env("MAI_LLM", "ollama").lower()
+            active_vectordb = _env("MAI_VECTORDB", "qdrant").lower()
+            chunking_strategy = "semantic"
+            collection = _env("MAI_COLLECTION", "ingested_content")
+            _audit_config_source = "env_fallback"
     tokenizer_native = _bool_env("USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING")
     default_tok_backend = _env("DEFAULT_TOKENIZER_BACKEND", "tiktoken")
 
@@ -184,30 +221,49 @@ async def ingestion_audit(
     ))
 
     # Chunking strategy
+    chunking_notes = (
+        f"Merged client_json chunking.strategy={chunking_strategy}"
+        if str(_audit_config_source).startswith("client_json:")
+        else "Chunking strategy unavailable — set ingestion.chunking in Client JSON."
+    )
     components.append(_component(
         "Chunking Strategy",
         "chunker",
         provider=chunking_strategy,
-        notes=f"Configured via CHUNKING_STRATEGY={chunking_strategy}",
+        notes=chunking_notes,
         active=True,
     ))
 
     # Embedder
     embedder_model = ""
-    if active_embedder in ("google", "gemini"):
-        embedder_model = _env("GEMINI_EMBED_MODEL", "gemini-embedding-001")
-        embedder_configured = bool(os.getenv("GEMINI_API_KEY"))
+    embedder_configured = True
+    if _audit_cfg is not None:
+        emb = _audit_cfg.embedder
+        et = emb.type.value.lower()
+        if et == "google":
+            et = "gemini"
+        sub = getattr(emb, et, None)
+        if sub is not None and hasattr(sub, "model"):
+            embedder_model = str(getattr(sub, "model", "") or "")
+        envn = getattr(sub, "api_key_env", None) if sub is not None else None
+        if envn:
+            embedder_configured = bool(os.getenv(str(envn), "").strip())
+        else:
+            embedder_configured = True
+    elif active_embedder in ("google", "gemini"):
+        embedder_model = "gemini-embedding-001"
+        embedder_configured = bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"))
     elif active_embedder == "openai":
-        embedder_model = _env("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+        embedder_model = "text-embedding-3-small"
         embedder_configured = bool(os.getenv("OPENAI_API_KEY"))
     elif active_embedder == "cohere":
-        embedder_model = _env("COHERE_EMBED_MODEL", "embed-english-v3.0")
+        embedder_model = "embed-english-v3.0"
         embedder_configured = bool(os.getenv("COHERE_API_KEY"))
     elif active_embedder == "ollama":
-        embedder_model = _env("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+        embedder_model = "nomic-embed-text"
         embedder_configured = True
     else:
-        embedder_model = _env("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+        embedder_model = "BAAI/bge-large-en-v1.5"
         embedder_configured = True
 
     if not embedder_configured:
@@ -221,23 +277,27 @@ async def ingestion_audit(
         model=embedder_model,
         active=True,
         configured=embedder_configured,
-        notes=f"MAI_EMBEDDER={active_embedder}",
+        notes=f"{_audit_config_source} embedder={active_embedder}",
     ))
 
     # VectorDB upsert
-    vectordb_notes_map = {
-        "qdrant":   f"host={_env('QDRANT_HOST','localhost')}:{_env('QDRANT_PORT','6333')}",
-        "chroma":   f"path={_env('CHROMA_PATH','./chroma_db')}",
-        "milvus":   f"uri={_env('MILVUS_URI', _env('MILVUS_HOST','localhost'))}",
-        "pinecone": f"index={_env('PINECONE_INDEX_NAME','ingested-content')}",
-        "weaviate": f"url={_env('WEAVIATE_URL','http://localhost:8080')}",
-        "redis":    f"host={_env('REDIS_HOST','localhost')}:{_env('REDIS_PORT','6379')}",
-    }
+    if _audit_cfg is not None:
+        vdb_notes = f"collection={collection} | backend={active_vectordb}"
+    else:
+        vectordb_notes_map = {
+            "qdrant":   f"host={_env('QDRANT_HOST','localhost')}:{_env('QDRANT_PORT','6333')}",
+            "chroma":   f"path={_env('CHROMA_PATH','./chroma_db')}",
+            "milvus":   f"uri={_env('MILVUS_URI', _env('MILVUS_HOST','localhost'))}",
+            "pinecone": f"index={_env('PINECONE_INDEX_NAME','ingested-content')}",
+            "weaviate": f"url={_env('WEAVIATE_URL','http://localhost:8080')}",
+            "redis":    f"host={_env('REDIS_HOST','localhost')}:{_env('REDIS_PORT','6379')}",
+        }
+        vdb_notes = vectordb_notes_map.get(active_vectordb, active_vectordb)
     components.append(_component(
         "VectorDB Upsert",
         "vectordb",
         provider=active_vectordb,
-        notes=vectordb_notes_map.get(active_vectordb, active_vectordb),
+        notes=vdb_notes,
         active=True,
     ))
 
@@ -274,36 +334,48 @@ async def ingestion_audit(
     ))
 
     # LLM (for HyDE / answer generation — not part of ingestion but shown for completeness)
-    llm_key_set = {
-        "openai": bool(os.getenv("OPENAI_API_KEY")),
-        "groq":   bool(os.getenv("GROQ_API_KEY")),
-        "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "gemini": bool(os.getenv("GEMINI_API_KEY")),
-        "google": bool(os.getenv("GEMINI_API_KEY")),
-        "ollama": True,
-    }
-    llm_configured = llm_key_set.get(active_llm, False)
+    llm_model_disp = ""
+    llm_configured = True
+    if _audit_cfg is not None and _audit_cfg.llm and _audit_cfg.llm.single:
+        ll = _audit_cfg.llm.single
+        llm_model_disp = ll.model or ""
+        envn = ll.api_key_env
+        if envn:
+            llm_configured = bool(os.getenv(str(envn), "").strip())
+        else:
+            llm_configured = True
+    else:
+        llm_key_set = {
+            "openai": bool(os.getenv("OPENAI_API_KEY")),
+            "groq":   bool(os.getenv("GROQ_API_KEY")),
+            "anthropic": bool(os.getenv("ANTHROPIC_API_KEY")),
+            "gemini": bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+            "google": bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+            "ollama": True,
+        }
+        llm_configured = llm_key_set.get(active_llm, False)
+        llm_model_map = {
+            "openai":    "gpt-4o-mini",
+            "groq":      "llama-3.1-8b-instant",
+            "anthropic": "claude-3-5-sonnet-20241022",
+            "gemini":    "gemini-1.5-flash",
+            "google":    "gemini-1.5-flash",
+            "ollama":    "llama3.2",
+        }
+        llm_model_disp = llm_model_map.get(active_llm, "")
     if not llm_configured:
         warnings.append(
             f"LLM '{active_llm}' requires an API key that is not set. "
             "Answer generation (Generate LLM Answer) will fail."
         )
-    llm_model_map = {
-        "openai":    _env("OPENAI_LLM_MODEL", "gpt-4o-mini"),
-        "groq":      _env("GROQ_LLM_MODEL", "llama-3.1-8b-instant"),
-        "anthropic": _env("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
-        "gemini":    _env("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-        "google":    _env("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-        "ollama":    _env("OLLAMA_LLM_MODEL", "llama3.1:8b"),
-    }
     components.append(_component(
         "LLM Generator",
         "llm",
         provider=active_llm,
-        model=llm_model_map.get(active_llm, ""),
+        model=llm_model_disp,
         active=True,
         configured=llm_configured,
-        notes=f"MAI_LLM={active_llm} | used for answer generation and HyDE",
+        notes=f"{_audit_config_source} llm={active_llm} | answer generation / HyDE",
     ))
 
     # ── 3. Bounded DB queries ────────────────────────────────────────────────

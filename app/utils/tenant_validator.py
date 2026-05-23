@@ -14,16 +14,82 @@ Security guarantees:
   - IDs are normalized to lowercase alphanumeric + underscore/hyphen
   - Max length enforced (64 chars)
   - Immutable TenantContext prevents post-validation mutation
+
+Tenant Identity Model:
+======================
+This system uses a two-key tenant identity model:
+
+1. **Tenant Slug** (e.g. "acme_corp", "default")
+   - Human-readable identifier used in APIs, configs, and UI
+   - Validated and normalized by validate_tenant_id()
+   - Used for: config resolution, pipeline building, logging
+
+2. **Storage UUID** (derived from slug via uuid5)
+   - Deterministic UUID derived from tenant slug
+   - Stored in: IngestedFileV2.business_id, IngestedContentV2.business_id,
+     vector metadata "business_id" field
+   - Used for: DB filtering, vector search tenant isolation
+   - Derived via: storage_business_uuid_for_tenant(slug)
+
+Canonical key for filtering:
+  - VectorDB searches filter on "business_id" = str(storage_uuid)
+  - SQL queries filter on business_id = storage_uuid (UUID column)
+  - Always derive storage_uuid from validated tenant slug using get_storage_uuid()
+
+Enforcement Modes:
+==================
+Controlled by TENANT_ENFORCEMENT_MODE env var:
+  - "off"    : Legacy behavior, allow missing tenant_id (dev only)
+  - "warn"   : Log warnings for missing/invalid tenant but continue
+  - "strict" : Reject requests without valid tenant_id (production)
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import uuid
 from dataclasses import dataclass
-from typing import Optional
+from enum import Enum
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.auth.deps import UserPayload
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Enforcement Mode Configuration
+# =============================================================================
+
+class TenantEnforcementMode(str, Enum):
+    """Controls strictness of tenant validation."""
+    OFF = "off"       # Legacy: allow missing tenant, default to "default"
+    WARN = "warn"     # Log warnings but allow operation to continue
+    STRICT = "strict" # Reject requests without valid tenant
+
+
+def get_enforcement_mode() -> TenantEnforcementMode:
+    """
+    Get current tenant enforcement mode from environment.
+    
+    Set via TENANT_ENFORCEMENT_MODE env var.
+    Default: "strict" (production-safe; rejects missing tenant_id).
+    """
+    raw = os.getenv("TENANT_ENFORCEMENT_MODE", "strict").strip().lower()
+    try:
+        return TenantEnforcementMode(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid TENANT_ENFORCEMENT_MODE '%s', defaulting to 'strict'", raw
+        )
+        return TenantEnforcementMode.STRICT
+
+
+# Fixed namespace UUID for tenant → storage UUID derivation (RFC 4122 uuid5)
+MAI_TENANT_NAMESPACE = uuid.UUID("321e4567-e89b-12d3-a456-426614174001")
 
 _SAFE_TENANT_RE = re.compile(r"^[a-z0-9][a-z0-9_\-]{0,62}[a-z0-9]$|^[a-z0-9]$")
 _STRIP_CHARS_RE = re.compile(r"[^a-z0-9_\-]")
@@ -244,4 +310,213 @@ def _reject(
         pass
     raise TenantValidationError(
         detail, raw_value=raw_value, endpoint=endpoint,
+    )
+
+
+# =============================================================================
+# Strict Validation (Phase 1: Mandatory tenant enforcement)
+# =============================================================================
+
+def validate_tenant_id_strict(
+    raw_id: Optional[str],
+    *,
+    source: str = "body",
+    endpoint: str = "unknown",
+) -> TenantContext:
+    """
+    Validate tenant ID with strict enforcement - NEVER allows default fallback.
+    
+    Use this for all tenant-scoped operations where a specific tenant is required:
+    - Retrieval queries
+    - Chat endpoints
+    - File uploads
+    - Ingestion admin operations
+    
+    Behavior depends on TENANT_ENFORCEMENT_MODE:
+    - "strict": Raises TenantValidationError if tenant_id is missing/invalid
+    - "warn": Logs warning, falls back to "default" (allows operation to continue)
+    - "off": Falls back to "default" silently (legacy compatibility)
+    
+    Args:
+        raw_id:   The raw tenant/client/business ID from the request.
+        source:   Where the ID came from: "body", "path", "query", "header".
+        endpoint: The API endpoint name (for telemetry).
+    
+    Returns:
+        TenantContext with the validated, normalized tenant_id.
+    
+    Raises:
+        TenantValidationError if tenant_id is missing/invalid and mode is "strict".
+    """
+    mode = get_enforcement_mode()
+    
+    # Check if tenant_id is missing/empty
+    if raw_id is None or not str(raw_id).strip():
+        if mode == TenantEnforcementMode.STRICT:
+            _reject(
+                reason="missing_tenant_id_strict",
+                detail=(
+                    "Tenant ID (client_id) is required for this operation. "
+                    "Please provide a valid client_id in your request."
+                ),
+                raw_value="None",
+                endpoint=endpoint,
+            )
+        elif mode == TenantEnforcementMode.WARN:
+            logger.warning(
+                '{"event":"TENANT_MISSING_WARN",'
+                '"endpoint":"%s","source":"%s",'
+                '"message":"tenant_id missing, falling back to default"}',
+                endpoint, source,
+            )
+        # For WARN and OFF modes, fall through to allow_default=True
+        return validate_tenant_id(
+            raw_id,
+            source=source,
+            endpoint=endpoint,
+            allow_default=True,
+        )
+    
+    # Tenant was provided, validate normally (no default fallback)
+    return validate_tenant_id(
+        raw_id,
+        source=source,
+        endpoint=endpoint,
+        allow_default=False,
+    )
+
+
+# =============================================================================
+# Storage UUID Derivation (for DB and vector filtering)
+# =============================================================================
+
+def get_storage_uuid(tenant_ctx: TenantContext) -> uuid.UUID:
+    """
+    Derive the deterministic storage UUID for a validated tenant.
+    
+    This UUID is used for:
+    - IngestedFileV2.business_id (UUID column)
+    - IngestedContentV2.business_id (stored as string)
+    - Vector metadata "business_id" field
+    - All tenant-scoped DB and vector search filters
+    
+    Args:
+        tenant_ctx: Validated TenantContext from validate_tenant_id*()
+    
+    Returns:
+        UUID derived from the tenant slug via uuid5.
+    """
+    slug = (tenant_ctx.tenant_id or "default").strip().lower()
+    if not slug:
+        slug = "default"
+    return uuid.uuid5(MAI_TENANT_NAMESPACE, f"mai:tenant:{slug}")
+
+
+def get_storage_uuid_str(tenant_ctx: TenantContext) -> str:
+    """
+    Get the storage UUID as a string for use in vector metadata filters.
+    
+    Args:
+        tenant_ctx: Validated TenantContext from validate_tenant_id*()
+    
+    Returns:
+        String representation of the storage UUID (e.g. for Chroma where clause).
+    """
+    return str(get_storage_uuid(tenant_ctx))
+
+
+# =============================================================================
+# Tenant Access Authorization (Phase 1.3: User ↔ Tenant binding)
+# =============================================================================
+
+class TenantAccessDeniedError(Exception):
+    """Raised when a user attempts to access a tenant they are not authorized for."""
+    
+    def __init__(self, user_id: str, tenant_id: str, reason: str = ""):
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        self.reason = reason
+        super().__init__(
+            f"User '{user_id}' is not authorized to access tenant '{tenant_id}'"
+            + (f": {reason}" if reason else "")
+        )
+
+
+def enforce_tenant_access(
+    user: "UserPayload",
+    tenant_ctx: TenantContext,
+    *,
+    endpoint: str = "unknown",
+) -> None:
+    """
+    Verify that a user is authorized to access the requested tenant.
+    
+    Current implementation:
+    - Admin users can access all tenants
+    - Non-admin users can only access tenants they are explicitly assigned to
+      (via user.allowed_tenants list, if present)
+    
+    Future enhancements:
+    - Add tenant ↔ user mapping table in DB
+    - Support team/org-based tenant access
+    - Add audit logging for access attempts
+    
+    Args:
+        user:       The authenticated user (from require_role dependency).
+        tenant_ctx: The validated tenant context from the request.
+        endpoint:   API endpoint name for logging.
+    
+    Raises:
+        TenantAccessDeniedError if user cannot access the tenant.
+    """
+    # Admin users can access all tenants (current behavior)
+    if hasattr(user, "role") and user.role == "admin":
+        logger.debug(
+            '{"event":"TENANT_ACCESS_GRANTED",'
+            '"user":"%s","tenant":"%s","reason":"admin_role","endpoint":"%s"}',
+            getattr(user, "sub", "unknown"),
+            tenant_ctx.tenant_id,
+            endpoint,
+        )
+        return
+    
+    # Check if user has explicit tenant access list
+    allowed_tenants = getattr(user, "allowed_tenants", None)
+    
+    if allowed_tenants is None:
+        # No tenant restriction configured - allow access (backward compatibility)
+        logger.debug(
+            '{"event":"TENANT_ACCESS_GRANTED",'
+            '"user":"%s","tenant":"%s","reason":"no_tenant_restrictions","endpoint":"%s"}',
+            getattr(user, "sub", "unknown"),
+            tenant_ctx.tenant_id,
+            endpoint,
+        )
+        return
+    
+    # Check if requested tenant is in user's allowed list
+    if tenant_ctx.tenant_id in allowed_tenants:
+        logger.debug(
+            '{"event":"TENANT_ACCESS_GRANTED",'
+            '"user":"%s","tenant":"%s","reason":"in_allowed_list","endpoint":"%s"}',
+            getattr(user, "sub", "unknown"),
+            tenant_ctx.tenant_id,
+            endpoint,
+        )
+        return
+    
+    # Access denied - log and raise
+    logger.warning(
+        '{"event":"TENANT_ACCESS_DENIED",'
+        '"user":"%s","tenant":"%s","allowed_tenants":%s,"endpoint":"%s"}',
+        getattr(user, "sub", "unknown"),
+        tenant_ctx.tenant_id,
+        list(allowed_tenants)[:5],  # Log first 5 for debugging
+        endpoint,
+    )
+    
+    raise TenantAccessDeniedError(
+        user_id=getattr(user, "sub", "unknown"),
+        tenant_id=tenant_ctx.tenant_id,
+        reason="Tenant not in user's allowed tenant list",
     )

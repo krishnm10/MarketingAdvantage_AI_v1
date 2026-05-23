@@ -17,6 +17,7 @@ import {
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { useTenant } from "@/contexts/TenantContext";
 
 interface PipelineBlock {
   cached: boolean;
@@ -93,9 +94,14 @@ function ScoreBadge({
 }
 
 export default function MultiCustomerRagDashboardPage() {
+  const { setClientId } = useTenant();
   const [data, setData] = useState<DashboardPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [archiveFlash, setArchiveFlash] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -190,6 +196,26 @@ export default function MultiCustomerRagDashboardPage() {
         </div>
       )}
 
+      {archiveFlash && (
+        <div
+          className={cn(
+            "flex items-start justify-between gap-3 rounded-xl border px-4 py-3",
+            archiveFlash.ok
+              ? "border-emerald-200 bg-emerald-50/90 text-emerald-900"
+              : "border-red-200 bg-red-50 text-red-900"
+          )}
+        >
+          <p className="text-sm">{archiveFlash.text}</p>
+          <button
+            type="button"
+            onClick={() => setArchiveFlash(null)}
+            className="shrink-0 text-xs font-medium underline opacity-80 hover:opacity-100"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
+
       {error && (
         <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-4 text-red-900">
           <div className="flex items-start gap-2">
@@ -276,6 +302,7 @@ export default function MultiCustomerRagDashboardPage() {
                         ) : (
                           <Link
                             href={`/dashboard/multi-customer-rag/${encodeURIComponent(row.client_id)}`}
+                            onClick={() => setClientId(row.client_id)}
                             className="text-primary-700 hover:text-primary-900 hover:underline font-semibold"
                           >
                             {row.client_id}
@@ -305,7 +332,12 @@ export default function MultiCustomerRagDashboardPage() {
                         ) : null}
                       </td>
                       <td className="px-4 py-3">
-                        <LinksCell clientId={row.client_id} />
+                        <LinksCell
+                          clientId={row.client_id}
+                          canArchive={row.client_id !== "default"}
+                          onReload={load}
+                          onArchiveResult={(ok, text) => setArchiveFlash({ ok, text })}
+                        />
                       </td>
                     </tr>
                   ))}
@@ -432,10 +464,55 @@ function AlignmentCells({ row }: { row: CustomerRow }) {
   );
 }
 
-function LinksCell({ clientId }: { clientId: string }) {
+function LinksCell({
+  clientId,
+  canArchive,
+  onReload,
+  onArchiveResult,
+}: {
+  clientId: string;
+  canArchive: boolean;
+  onReload: () => Promise<void>;
+  onArchiveResult: (ok: boolean, text: string) => void;
+}) {
+  const [archiving, setArchiving] = useState(false);
   const alignment = `${API.EMBEDDING_ALIGNMENT(clientId)}`;
+
+  const handleArchive = async () => {
+    if (!canArchive || archiving) return;
+    if (
+      !window.confirm(
+        `Archive client configuration for "${clientId}"?\n\n` +
+          "The overlay file will be moved to the server's _archived folder (recoverable). " +
+          "This tenant will resolve like a fresh install (default overlay) until a new config file is saved."
+      )
+    ) {
+      return;
+    }
+    setArchiving(true);
+    try {
+      await apiClient.delete(API.ADMIN.ARCHIVE_CLIENT_CONFIG(clientId));
+      onArchiveResult(true, `Configuration for "${clientId}" was moved to _archived.`);
+      await onReload();
+    } catch (e: unknown) {
+      const raw = (e as { response?: { data?: { detail?: unknown } } }).response?.data
+        ?.detail;
+      const msg =
+        typeof raw === "string"
+          ? raw
+          : Array.isArray(raw)
+            ? raw.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join("; ")
+            : e instanceof Error
+              ? e.message
+              : String(e);
+      onArchiveResult(false, msg || "Could not archive configuration.");
+    } finally {
+      setArchiving(false);
+    }
+  };
+
   return (
-    <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs">
+    <div className="flex flex-wrap gap-x-4 gap-y-2 text-xs items-center">
       <a
         className="inline-flex items-center gap-1 text-primary-600 hover:underline font-medium"
         href={alignment}
@@ -450,6 +527,17 @@ function LinksCell({ clientId }: { clientId: string }) {
       >
         Pipeline config
       </Link>
+      {canArchive ? (
+        <button
+          type="button"
+          disabled={archiving}
+          onClick={() => void handleArchive()}
+          className="text-red-700 hover:text-red-900 hover:underline font-medium disabled:opacity-50 inline-flex items-center gap-1"
+        >
+          {archiving ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+          Delete
+        </button>
+      ) : null}
     </div>
   );
 }

@@ -70,8 +70,6 @@ from app.core.config.client_config_schema import (
     DeduplicationConfig,
     VectorDBType,
     EmbedderType,
-    ChromaConfig,
-    OllamaEmbedderConfig,
 )
 
 # =============================================
@@ -187,13 +185,26 @@ async_session = async_sessionmaker(
 # =============================================
 
 async def _check_existing_file_by_hash(
-    db: AsyncSession, file_hash: str
+    db: AsyncSession,
+    file_hash: str,
+    business_id: Optional[str] = None,
 ) -> Optional[str]:
-    result = await db.execute(
-        select(IngestedFileV2.id).where(
-            IngestedFileV2.meta_data["file_hash"].astext == file_hash
-        )
+    """
+    Check if a file with the given hash already exists.
+    
+    Tenant Isolation: When business_id is provided, only checks
+    within that tenant's files - same hash in different tenants 
+    are considered unique files.
+    """
+    stmt = select(IngestedFileV2.id).where(
+        IngestedFileV2.meta_data["file_hash"].astext == file_hash
     )
+    # Add tenant filter if provided
+    if business_id:
+        from app.utils.tenant_storage_uuid import storage_business_uuid_for_tenant
+        storage_uuid = storage_business_uuid_for_tenant(business_id, None)
+        stmt = stmt.where(IngestedFileV2.business_id == storage_uuid)
+    result = await db.execute(stmt)
     return result.scalar_one_or_none()
 
 
@@ -443,23 +454,39 @@ def _business_env_prefix(client_id: str) -> str:
     return client_id.lower().replace("-", "_")
 
 
-def clear_ingestion_pipeline_cache() -> None:
+def clear_ingestion_pipeline_cache(client_id: Optional[str] = None) -> None:
     """
-    Clear ingestion-side pipeline resolver cache.
+    Clear ingestion-side pipeline resolver caches.
     Call this after config/env updates to avoid stale pipeline instances.
+    
+    Args:
+        client_id: If provided, only clear cache for this specific tenant.
+                   If None, clear all cached pipelines.
     """
     if _HAS_CACHETOOLS:
-        with _pipeline_cache_lock:
-            _pipeline_cache.clear()
+        with _query_pipeline_lock:
+            if client_id:
+                _query_pipeline_cache.pop(client_id, None)
+            else:
+                _query_pipeline_cache.clear()
+        with _ingestion_pipeline_lock:
+            if client_id:
+                _ingestion_pipeline_cache.pop(client_id, None)
+            else:
+                _ingestion_pipeline_cache.clear()
     else:
         _get_pipeline_for_client.cache_clear()
+        _get_ingestion_pipeline_for_client.cache_clear()
     clear_chunker_cache()
-    log_info("[IngestionV2] Cleared ingestion pipeline resolver cache")
+    log_info(
+        f"[IngestionV2] Cleared pipeline caches" + 
+        (f" for tenant={client_id}" if client_id else " (all tenants)")
+    )
 
 
 def _resolve_chunking_strategy(pipeline: Any = None) -> str:
     """
-    Resolve active chunking strategy from pipeline config first, then env.
+    Resolve active chunking strategy from pipeline ClientConfig (JSON).
     """
     strategy: Optional[str] = None
     try:
@@ -477,7 +504,7 @@ def _resolve_chunking_strategy(pipeline: Any = None) -> str:
         strategy = None
 
     if not strategy:
-        strategy = os.getenv("CHUNKING_STRATEGY", "semantic")
+        strategy = "semantic"
 
     normalized = str(strategy).strip().lower()
     valid = set(list_chunking_strategies())
@@ -529,37 +556,62 @@ async def _chunk_text_with_strategy(
 
     strategy = (strategy_override or _resolve_chunking_strategy(pipeline)).lower()
     bundle = getattr(pipeline, "embedder_bundle", None)
+    _cfg = getattr(pipeline, "config", None)
+    _tok = getattr(_cfg, "tokenization", None) if _cfg is not None else None
+    _chunk_cfg = getattr(_cfg, "ingestion", None).chunking if _cfg is not None and getattr(_cfg, "ingestion", None) else None
 
     # ── Model-native tokenizer injection for ALL strategies ───────────
-    # Controlled by USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING env flag.
-    # When enabled, every call to segmenter_v2.count_tokens() (used by all
-    # chunking strategies) will use the embedding model's native tokenizer
-    # instead of the generic BERT factory backend.
     _ctx_token = None
     _counter = None
-    _use_native = os.getenv("USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING", "true").lower() != "false"
+    if _tok is not None:
+        _use_native = bool(_tok.use_model_native_tokenizer_for_chunking)
+        _cache_sz = int(_tok.chunking_token_counter_cache_size)
+    else:
+        _use_native = True
+        _cache_sz = 512
 
     if _use_native and bundle is not None:
         try:
-            from app.ai.chunking.token_counter import ChunkingTokenCounter
+            from app.ai.chunking.token_counter import ChunkingTokenCounter, soft_cap_factors_from_client
             from app.core.chunking_stratagies.segmenter_v2 import _ACTIVE_TOKEN_COUNTER
+
+            _cfg = getattr(pipeline, "config", None)
+            _cap_factors = None
+            if _cfg is not None and getattr(_cfg, "ingestion", None) is not None:
+                _cap_factors = dict(_cfg.ingestion.chunk_soft_cap_factors or {})
+
             # Try to get calibrated alignment metrics from the validator cache.
             # calibrate() is a fast no-op when the result is already cached.
             _alignment_metrics = None
-            try:
-                from app.ai.validation.tokenizer_validator import tokenizer_validator
-                _alignment_metrics = tokenizer_validator.get_alignment_metrics_for_bundle(
-                    bundle, run_calibration=True
+            with soft_cap_factors_from_client(_cap_factors if _cap_factors else None):
+                try:
+                    from app.ai.validation.tokenizer_validator import tokenizer_validator
+
+                    _fb = (
+                        str(_tok.default_tokenizer_backend).strip().lower()
+                        if _tok is not None
+                        else "huggingface"
+                    )
+                    _alignment_metrics = tokenizer_validator.get_alignment_metrics_for_bundle(
+                        bundle,
+                        run_calibration=True,
+                        factory_backend=_fb,
+                    )
+                except Exception as _cal_exc:
+                    log_warning(
+                        f"[IngestionV2] Calibration skipped for model={bundle.model_id}: {_cal_exc}. "
+                        f"Using provider defaults for soft_cap."
+                    )
+                _counter = ChunkingTokenCounter.from_bundle(
+                    bundle,
+                    alignment_metrics=_alignment_metrics,
+                    cache_size=_cache_sz,
+                    factory_backend=(
+                        str(_tok.default_tokenizer_backend).strip().lower()
+                        if _tok is not None
+                        else "huggingface"
+                    ),
                 )
-            except Exception as _cal_exc:
-                log_warning(
-                    f"[IngestionV2] Calibration skipped for model={bundle.model_id}: {_cal_exc}. "
-                    f"Using provider defaults for soft_cap."
-                )
-            _counter = ChunkingTokenCounter.from_bundle(
-                bundle, alignment_metrics=_alignment_metrics,
-                cache_size=int(os.getenv("CHUNKING_TOKEN_COUNTER_CACHE_SIZE", "512")),
-            )
             _ctx_token = _ACTIVE_TOKEN_COUNTER.set(_counter.count)
             log_info(
                 f"[IngestionV2] Model-native token counting active | "
@@ -602,14 +654,36 @@ async def _chunk_text_with_strategy(
                         source_type=source_type,
                         embedding_model=embedding_model,
                         tokenizer_contract=bundle.tokenizer,
-                        chunk_size=bundle.embed_max_tokens,
+                        chunk_size=_chunk_cfg.chunk_size if _chunk_cfg is not None else None,
+                        chunk_overlap=_chunk_cfg.chunk_overlap if _chunk_cfg is not None else None,
+                        min_chunk_tokens=_chunk_cfg.min_chunk_len if _chunk_cfg is not None else None,
                     )
                 except Exception as _phase1_exc:
                     log_info(
                         f"[IngestionV2] Phase 1 token_aware path failed "
                         f"({_phase1_exc}); falling back to generic chunker."
                     )
-                    # Fall through to generic chunker below
+            elif _tok is not None and _chunk_cfg is not None:
+                try:
+                    from app.services.ingestion.token_chunking_service import token_aware_chunk
+
+                    return await token_aware_chunk(
+                        text,
+                        db_session=db_session,
+                        file_id=file_id,
+                        business_id=business_id,
+                        source_type=source_type,
+                        embedding_model=embedding_model,
+                        client_tokenization=_tok,
+                        chunk_size=_chunk_cfg.chunk_size,
+                        chunk_overlap=_chunk_cfg.chunk_overlap,
+                        min_chunk_tokens=_chunk_cfg.min_chunk_len,
+                    )
+                except Exception as _tok_exc:
+                    log_info(
+                        f"[IngestionV2] token_aware (client JSON tokenizer) failed ({_tok_exc}); "
+                        "falling back to generic chunker."
+                    )
 
         chunker = get_chunker(strategy)
         return await chunker.chunk(
@@ -667,91 +741,97 @@ async def _chunk_text_with_strategy(
 # TTLCache (maxsize=128, ttl=600s) avoids pipeline rebuild storms when
 # >16 tenants hit concurrently, while still expiring stale entries.
 # Falls back to functools.lru_cache if cachetools is not installed.
+#
+# ARCHITECTURE NOTE (production-grade separation):
+#   - _query_pipeline_cache: FULL pipeline (embedder + vectordb + LLM + reranker)
+#     Used by RAG chat, retrieve endpoints. Reranker failures are fatal here.
+#   - _ingestion_pipeline_cache: MINIMAL pipeline (embedder + vectordb only)
+#     Used by file upload, sync, integrity. Reranker/LLM not needed, not built.
+#
+# This separation ensures ingestion never fails due to missing query-time
+# dependencies (e.g., OpenAI key for LLM-Judge reranker).
+
 if _HAS_CACHETOOLS:
-    _pipeline_cache: TTLCache = TTLCache(maxsize=128, ttl=600)
-    _pipeline_cache_lock = _threading_lock()
+    _query_pipeline_cache: TTLCache = TTLCache(maxsize=128, ttl=600)
+    _query_pipeline_lock = _threading_lock()
+    _ingestion_pipeline_cache: TTLCache = TTLCache(maxsize=128, ttl=600)
+    _ingestion_pipeline_lock = _threading_lock()
 
     def _get_pipeline_for_client(client_id: str):
         """
-        Resolve a live AssembledPipeline for normalized client_id.
-        Config is read purely from environment variables — no JSON files.
-        Works identically in dev, staging, and production.
-
-        Cached via TTLCache(maxsize=128, ttl=600).
-        Previously used @lru_cache(maxsize=16) which caused pipeline
-        rebuild storms with >16 concurrent tenants.
+        Resolve a FULL AssembledPipeline for normalized client_id.
+        Includes LLM and reranker if configured. For QUERY-TIME use only.
         """
-        with _pipeline_cache_lock:
-            if client_id in _pipeline_cache:
-                return _pipeline_cache[client_id]
+        from app.core.config.client_config_resolver import get_client_config
 
-        b = _business_env_prefix(client_id)
+        with _query_pipeline_lock:
+            if client_id in _query_pipeline_cache:
+                return _query_pipeline_cache[client_id]
 
-        vectordb_type = os.getenv(
-            f"MAI_{b.upper()}_VECTORDB",
-            os.getenv("MAI_VECTORDB", "chroma"),
-        ).lower()
+        cfg = get_client_config(client_id)
+        result = pipeline_factory.build(cfg)
+        with _query_pipeline_lock:
+            _query_pipeline_cache[client_id] = result
+        return result
 
-        embedder_type = os.getenv(
-            f"MAI_{b.upper()}_EMBEDDER",
-            os.getenv("MAI_EMBEDDER", "ollama"),
-        ).lower()
+    def _get_ingestion_pipeline_for_client(client_id: str):
+        """
+        Resolve an INGESTION-ONLY AssembledPipeline (embedder + vectordb).
+        Strips reranker and LLM — ingestion does not need them.
+        Cached separately from query pipelines.
+        """
+        from app.core.config.client_config_resolver import get_client_config_for_ingestion
 
-        llm_type = os.getenv(
-            f"MAI_{b.upper()}_LLM",
-            os.getenv("MAI_LLM", "ollama"),
-        ).lower()
+        with _ingestion_pipeline_lock:
+            if client_id in _ingestion_pipeline_cache:
+                return _ingestion_pipeline_cache[client_id]
 
-        config = _build_config_from_env(
-            client_id=client_id,
-            vectordb_type=vectordb_type,
-            embedder_type=embedder_type,
-            llm_type=llm_type,
-        )
-        result = pipeline_factory.build(config)
-        with _pipeline_cache_lock:
-            _pipeline_cache[client_id] = result
+        cfg = get_client_config_for_ingestion(client_id)
+        cfg_ingestion = cfg.model_copy(update={"reranker": None, "llm": None})
+        result = pipeline_factory.build(cfg_ingestion, skip_cache=True)
+        with _ingestion_pipeline_lock:
+            _ingestion_pipeline_cache[client_id] = result
         return result
 
 else:
     @lru_cache(maxsize=128)
     def _get_pipeline_for_client(client_id: str):  # type: ignore[no-redef]
-        """
-        Resolve a live AssembledPipeline for normalized client_id.
-        Fallback: @lru_cache(maxsize=128) when cachetools is not installed.
-        """
-        b = _business_env_prefix(client_id)
+        """Fallback cache (query pipeline) when cachetools is not installed."""
+        from app.core.config.client_config_resolver import get_client_config
 
-        vectordb_type = os.getenv(
-            f"MAI_{b.upper()}_VECTORDB",
-            os.getenv("MAI_VECTORDB", "chroma"),
-        ).lower()
+        cfg = get_client_config(client_id)
+        return pipeline_factory.build(cfg)
 
-        embedder_type = os.getenv(
-            f"MAI_{b.upper()}_EMBEDDER",
-            os.getenv("MAI_EMBEDDER", "ollama"),
-        ).lower()
+    @lru_cache(maxsize=128)
+    def _get_ingestion_pipeline_for_client(client_id: str):  # type: ignore[no-redef]
+        """Fallback cache (ingestion pipeline) when cachetools is not installed."""
+        from app.core.config.client_config_resolver import get_client_config_for_ingestion
 
-        llm_type = os.getenv(
-            f"MAI_{b.upper()}_LLM",
-            os.getenv("MAI_LLM", "ollama"),
-        ).lower()
+        cfg = get_client_config_for_ingestion(client_id)
+        cfg_ingestion = cfg.model_copy(update={"reranker": None, "llm": None})
+        return pipeline_factory.build(cfg_ingestion, skip_cache=True)
 
-        config = _build_config_from_env(
-            client_id=client_id,
-            vectordb_type=vectordb_type,
-            embedder_type=embedder_type,
-            llm_type=llm_type,
-        )
-        return pipeline_factory.build(config)
+
+# Public alias — same callable and cache as _get_pipeline_for_client (full query-time pipeline).
+get_query_pipeline_for_client = _get_pipeline_for_client
 
 
 def _get_pipeline(business_id: Optional[Any] = None):
     """
-    Resolve pipeline using UUID-safe business_id normalization.
+    Resolve FULL pipeline (query-time) using UUID-safe business_id normalization.
+    Includes LLM + reranker. Use for RAG chat / retrieve endpoints.
     """
     client_id = _normalize_business_id(business_id)
     return _get_pipeline_for_client(client_id)
+
+
+def _get_ingestion_pipeline(business_id: Optional[Any] = None):
+    """
+    Resolve INGESTION-ONLY pipeline (embedder + vectordb).
+    Use for file upload, sync, integrity — no reranker/LLM needed.
+    """
+    client_id = _normalize_business_id(business_id)
+    return _get_ingestion_pipeline_for_client(client_id)
 
 
 def _build_config_from_env(
@@ -762,197 +842,38 @@ def _build_config_from_env(
 ) -> ClientConfig:
     """Build a ClientConfig purely from environment variables."""
 
-    # ── VectorDB ──────────────────────────────────────────────
-    if vectordb_type == "chroma":
-        from app.core.config.client_config_schema import ChromaConfig
-        chroma_host = os.getenv("CHROMA_HOST") or None
-        chroma_port = os.getenv("CHROMA_PORT") or "8000"
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.CHROMA,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            chroma=ChromaConfig(
-                persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db") if not chroma_host else None,
-                host=chroma_host,
-                port=int(chroma_port),
-                ssl=os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes"),
-                api_key_env="CHROMA_API_KEY" if os.getenv("CHROMA_API_KEY") else None,
-                tenant=os.getenv("CHROMA_TENANT", "default_tenant"),
-                database=os.getenv("CHROMA_DATABASE", "default_database"),
-                anonymized_telemetry=os.getenv("CHROMA_TELEMETRY", "false").lower() in ("1", "true", "yes"),
-            ),
-        )
-    elif vectordb_type == "qdrant":
-        from app.core.config.client_config_schema import QdrantConfig
-        qdrant_api_key_env = "QDRANT_API_KEY" if os.getenv("QDRANT_API_KEY") else None
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.QDRANT,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            qdrant=QdrantConfig(
-                url=os.getenv("QDRANT_URL") or None,
-                api_key_env=qdrant_api_key_env,
-                host=os.getenv("QDRANT_HOST", "localhost"),
-                port=int(os.getenv("QDRANT_PORT", "6333")),
-                transport=_vector_transport_env("QDRANT"),
-                prefer_grpc=os.getenv("QDRANT_PREFER_GRPC", "false").lower() in ("1", "true", "yes"),
-                timeout=float(os.getenv("QDRANT_TIMEOUT", "30")),
-            ),
-        )
-    elif vectordb_type == "pinecone":
-        from app.core.config.client_config_schema import PineconeConfig
-        pinecone_mode = os.getenv("PINECONE_MODE", "cloud").strip().lower()
-        pinecone_api_key_env = (
-            "PINECONE_API_KEY"
-            if pinecone_mode != "local" and os.getenv("PINECONE_API_KEY")
-            else None
-        )
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.PINECONE,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            pinecone=PineconeConfig(
-                mode="local" if pinecone_mode == "local" else "cloud",
-                api_key_env=pinecone_api_key_env,
-                index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
-                namespace=os.getenv("PINECONE_NAMESPACE", "default"),
-                embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
-                metric=os.getenv("PINECONE_METRIC", "cosine"),
-                cloud=os.getenv("PINECONE_CLOUD", "aws"),
-                region=os.getenv("PINECONE_REGION", "us-east-1"),
-                pod_type=os.getenv("PINECONE_POD_TYPE") or None,
-                local_path=os.getenv("PINECONE_LOCAL_PATH") or None,
-            ),
-        )
-    elif vectordb_type == "milvus":
-        from app.core.config.client_config_schema import MilvusConfig
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.MILVUS,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            milvus=MilvusConfig(
-                uri=os.getenv("MILVUS_URI") or None,
-                token_env="MILVUS_TOKEN" if os.getenv("MILVUS_TOKEN") else None,
-                host=os.getenv("MILVUS_HOST", "localhost"),
-                port=int(os.getenv("MILVUS_PORT", "19530")),
-                db_name=os.getenv("MILVUS_DB_NAME", "default"),
-                alias=os.getenv("MILVUS_ALIAS", "default"),
-                transport="grpc",
-            ),
-        )
-    elif vectordb_type == "weaviate":
-        from app.core.config.client_config_schema import WeaviateConfig
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.WEAVIATE,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            weaviate=WeaviateConfig(
-                url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
-                api_key_env="WEAVIATE_API_KEY" if os.getenv("WEAVIATE_API_KEY") else None,
-                embedded=os.getenv("WEAVIATE_EMBEDDED", "false").lower() in ("1", "true", "yes"),
-                transport=_vector_transport_env("WEAVIATE"),
-                grpc_host=os.getenv("WEAVIATE_GRPC_HOST") or None,
-                grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
-                skip_init_checks=os.getenv("WEAVIATE_SKIP_INIT_CHECKS", "false").lower() in ("1", "true", "yes"),
-                additional_headers=(
-                    __import__("json").loads(os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON", "{}") or "{}")
-                    if (os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON") or "").strip()
-                    else {}
-                ),
-            ),
-        )
-    elif vectordb_type == "redis":
-        from app.core.config.client_config_schema import RedisConfig
-        vdb_cfg = VectorDBConfig(
-            type=VectorDBType.REDIS,
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            redis=RedisConfig(
-                url=os.getenv("REDIS_URL") or None,
-                host=os.getenv("REDIS_HOST", "localhost"),
-                port=int(os.getenv("REDIS_PORT", "6379")),
-                password_env="REDIS_PASSWORD" if os.getenv("REDIS_PASSWORD") else None,
-                username=os.getenv("REDIS_USERNAME") or None,
-                db=int(os.getenv("REDIS_DB", "0")),
-                ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
-                ssl_ca_certs=os.getenv("REDIS_SSL_CA_CERTS") or None,
-                prefix=os.getenv("REDIS_PREFIX", "vec:"),
-            ),
-        )
-    else:
-        raise ValueError(
-            f"[Pipeline] Unknown MAI_VECTORDB='{vectordb_type}'. "
-            f"Supported: chroma, qdrant, pinecone, milvus, weaviate, redis"
-        )
-
-        # ── Embedder ──────────────────────────────────────────────
-    if embedder_type == "ollama":
-        from app.core.config.client_config_schema import OllamaEmbedderConfig
-        emb_cfg = EmbedderConfig(
-            type=EmbedderType.OLLAMA,
-            ollama=OllamaEmbedderConfig(
-                model=os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
-                base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-            ),
-        )
-    elif embedder_type == "openai":
-        from app.core.config.client_config_schema import OpenAIEmbedderConfig
-        emb_cfg = EmbedderConfig(
-            type=EmbedderType.OPENAI,
-            openai=OpenAIEmbedderConfig(
-                model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-                api_key_env="OPENAI_API_KEY",
-            ),
-        )
-    elif embedder_type == "huggingface":
-        from app.core.config.client_config_schema import HuggingFaceEmbedderConfig
-        emb_cfg = EmbedderConfig(
-            type=EmbedderType.HUGGINGFACE,
-            huggingface=HuggingFaceEmbedderConfig(
-                model=os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5"),
-                device=os.getenv("HF_EMBED_DEVICE", "auto"),
-                batch_size=int(os.getenv("HF_BATCH_SIZE", "32")),
-                normalize=os.getenv("HF_NORMALIZE_EMBEDDINGS", "true").lower() == "true",
-            ),
-            query_prefix=os.getenv("HF_EMBED_QUERY_PREFIX", ""),
-        )
-    elif embedder_type == "cohere":
-        from app.core.config.client_config_schema import CohereEmbedderConfig
-        emb_cfg = EmbedderConfig(
-            type=EmbedderType.COHERE,
-            cohere=CohereEmbedderConfig(
-                model=os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0"),
-                api_key_env="COHERE_API_KEY",
-            ),
-        )
-    elif embedder_type in ("gemini", "google"):
-        # "google" is accepted as an alias for the "gemini" enum value
-        from app.core.config.client_config_schema import GeminiEmbedderConfig
-        emb_cfg = EmbedderConfig(
-            type=EmbedderType.GEMINI,
-            gemini=GeminiEmbedderConfig(
-                model=os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001"),
-                api_key_env="GOOGLE_API_KEY",
-            ),
-        )
-    else:
-        raise ValueError(
-            f"[Pipeline] Unknown MAI_EMBEDDER='{embedder_type}'. "
-            f"Supported: ollama, openai, huggingface, cohere, gemini"
-        )
-
-    return ClientConfig(
-        client_id=client_id,
-        vectordb=vdb_cfg,
-        embedder=emb_cfg,
-        ingestion=IngestionConfig(
-            batch_size=_safe_env_int("INGEST_BATCH_SIZE", 256),
-            deduplication=DeduplicationConfig(
-                enable_hash_dedup=_safe_env_bool("MAI_DEDUP_L1_ENABLED", True),
-                enable_gci_dedup=_safe_env_bool("MAI_DEDUP_L2_ENABLED", True),
-                enable_embedding_dedup=_safe_env_bool("MAI_DEDUP_L3_ENABLED", True),
-                similarity_threshold=float(os.getenv("MAI_DEDUP_SIMILARITY_THRESHOLD", "0.95")),
-            ),
-            enable_visual_llm_explanation=_safe_env_bool(
-                "MAI_ENABLE_VISUAL_LLM_EXPLANATION",
-                True,
-            ),
-        ),
+    allow_bootstrap = os.getenv("ALLOW_ENV_PIPELINE_BOOTSTRAP", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
+    if client_id != "default" and not allow_bootstrap:
+        raise ValueError(
+            "_build_config_from_env is disabled for non-default tenants unless "
+            "ALLOW_ENV_PIPELINE_BOOTSTRAP=true. Use merged ClientConfig JSON and "
+            "get_client_config instead."
+        )
+    log_warning(
+        "[IngestionV2] _build_config_from_env used | client_id=%s — prefer merged JSON configs",
+        client_id,
+    )
+
+    from copy import deepcopy
+
+    from app.core.config.client_config_resolver import load_default_client_raw_dict
+    from app.core.config.default_config_templates import (
+        default_embedder_dict_for_type,
+        default_llm_root_dict_for_provider,
+        default_vectordb_dict_for_type,
+    )
+
+    raw = deepcopy(load_default_client_raw_dict())
+    raw["client_id"] = client_id
+    raw["vectordb"] = default_vectordb_dict_for_type(vectordb_type, raw.get("vectordb") or {})
+    raw["embedder"] = default_embedder_dict_for_type(embedder_type, raw.get("embedder") or {})
+    raw["llm"] = default_llm_root_dict_for_provider(llm_type, raw.get("llm"))
+
+    return ClientConfig.from_dict(raw)
 
 
 
@@ -1105,9 +1026,16 @@ class _CollectionAdapter:
       4. Safe empty {}               — never crashes callers
     """
 
-    def __init__(self, vectordb, collection_name: str = None):
+    def __init__(self, vectordb, collection_name: str, *, client_id: str = ""):
+        coll = (collection_name or "").strip()
+        if not coll:
+            ctx = f" (client_id={client_id!r})" if client_id else ""
+            raise ValueError(
+                f"collection_name is required for _CollectionAdapter{ctx}. "
+                "Set vectordb.collection in tenant Client JSON."
+            )
         self._vdb = vectordb
-        self._col = collection_name or os.getenv("MAI_COLLECTION", "ingested_content")
+        self._col = coll
 
     @property
     def name(self) -> str:
@@ -1370,9 +1298,23 @@ def get_chroma_collection(
       .name / .count() / .upsert() / .delete() / .get() / .query()
 
     Backend: MAI_VECTORDB=chroma|qdrant in .env
+
+    Implementation note:
+        Uses ``_get_ingestion_pipeline()`` (embedder + vectordb only, cached separately).
+        Sync/integrity paths never initialize query-time components (reranker, LLM).
     """
-    pipeline = _get_pipeline(business_id)
-    return None, _CollectionAdapter(pipeline.vectordb)
+    client_id = _normalize_business_id(business_id)
+    pipeline = _get_ingestion_pipeline(business_id)
+    from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+    cfg = get_client_config_for_ingestion(client_id)
+    coll = (cfg.vectordb.collection or "").strip()
+    if not coll:
+        raise ValueError(
+            f"vectordb.collection is required for client_id={client_id!r}; "
+            "set it via pipeline-pluggable PATCH or Client JSON."
+        )
+    return None, _CollectionAdapter(pipeline.vectordb, coll, client_id=client_id)
 
 
 def get_embedder(business_id: Optional[str] = None) -> _EmbedderAdapter:
@@ -1384,8 +1326,10 @@ def get_embedder(business_id: Optional[str] = None) -> _EmbedderAdapter:
       vector   = embedder.encode(text, normalize_embeddings=True).tolist()
 
     Backend: MAI_EMBEDDER=ollama|openai|huggingface in .env
+
+    Uses the same ingestion pipeline as ``get_chroma_collection`` (embedder + vectordb only).
     """
-    pipeline = _get_pipeline(business_id)
+    pipeline = _get_ingestion_pipeline(business_id)
     return _EmbedderAdapter(pipeline.embedder)
 
 
@@ -1525,6 +1469,7 @@ class IngestionServiceV2:
 
                 # ==========================================================
                 # MEDIA-LEVEL HARD DEDUP (AUTHORITATIVE — API + WATCHER)
+                # Tenant-scoped: same file in different tenants is allowed
                 # ==========================================================
                 if file_record and file_record.file_path:
                     loop = asyncio.get_running_loop()
@@ -1533,17 +1478,25 @@ class IngestionServiceV2:
                             None, compute_file_hash, file_record.file_path
                         )
 
-                        result = await db.execute(
+                        # Build dedup query with tenant isolation
+                        dedup_stmt = (
                             select(IngestedFileV2)
                             .where(IngestedFileV2.meta_data["file_hash"].astext == incoming_hash)
                             .where(IngestedFileV2.status == "processed")
                         )
+                        # Add tenant filter using file_record.business_id
+                        if file_record.business_id:
+                            dedup_stmt = dedup_stmt.where(
+                                IngestedFileV2.business_id == file_record.business_id
+                            )
+                        
+                        result = await db.execute(dedup_stmt)
                         existing = result.scalar_one_or_none()
 
                         if existing and existing.id != file_record.id:
                             log_info(
                                 f"[IngestionV2] ⛔ MEDIA DUPLICATE — "
-                                f"already ingested as {existing.id}"
+                                f"already ingested as {existing.id} (tenant={file_record.business_id})"
                             )
                             await IngestionServiceV2._update_file_status(
                                 db,
@@ -1731,7 +1684,7 @@ class IngestionServiceV2:
         # _extract_chunks and _dedup_chunks now accept an optional `pipeline`
         # argument and skip _get_pipeline() when it is provided.
         # ──────────────────────────────────────────────────────────────────────
-        pipeline        = _get_pipeline(business_id)
+        pipeline        = _get_ingestion_pipeline(business_id)
         embedding_model = pipeline.embedder.info.model
         _plog = PipelineLogger(
             request_path="ingestion",
@@ -1991,7 +1944,7 @@ class IngestionServiceV2:
         try:
             # FIX-D (carried forward): resolve pipeline once, never re-resolve
             if pipeline is None:
-                pipeline = _get_pipeline(business_id)
+                pipeline = _get_ingestion_pipeline(business_id)
             embedding_model = pipeline.embedder.info.model
             active_chunking_strategy = _resolve_chunking_strategy(pipeline)
 
@@ -2116,7 +2069,12 @@ class IngestionServiceV2:
                     # _VISUAL_LLM_SEMAPHORE to prevent rate-limit exhaustion.
                     # return_exceptions=True: one LLM failure does not crash the batch.
                     if visual_texts:
-                        _vis_sem = _get_visual_llm_semaphore()
+                        _vis_lim = max(1, int(getattr(
+                            getattr(pipeline.config, "ingestion", None),
+                            "visual_llm_concurrency",
+                            _VISUAL_LLM_CONCURRENCY,
+                        )))
+                        _vis_sem = asyncio.Semaphore(_vis_lim)
 
                         async def _process_visual(vtext: str) -> List[Dict]:
                             async with _vis_sem:
@@ -2283,7 +2241,7 @@ class IngestionServiceV2:
 
         # FIX-D: Only resolve pipeline if not passed in from _run_pipeline.
         if pipeline is None:
-            pipeline = _get_pipeline(business_id)
+            pipeline = _get_ingestion_pipeline(business_id)
 
         dedup_cfg = pipeline.config.ingestion.deduplication
 
@@ -2338,6 +2296,9 @@ class IngestionServiceV2:
             enable_embedding_dedup=enable_embedding_dedup,
             similarity_threshold=dedup_cfg.similarity_threshold,
             collection_name=collection_name or pipeline.config.vectordb.collection,  # B10: pass resolved name
+            l3_redis_threshold=int(dedup_cfg.l3_redis_threshold),
+            l3_embed_batch_size=int(dedup_cfg.l3_embed_batch_size),
+            l3_search_concurrency=int(dedup_cfg.l3_search_concurrency),
         )
         # FIXED - matches B5-FIX-4 key names exactly
         log_info(
@@ -2657,7 +2618,21 @@ class IngestionServiceV2:
             file_id=file_id,
             chunk_count=len(chunks) if chunks else 0,
         )
+        _phantom_cm = None
         try:
+            from app.services.ingestion.phantom_config_bridge import phantom_runtime_from_client
+
+            if pipeline is not None and getattr(pipeline, "config", None) is not None:
+                _ing_cfg = pipeline.config.ingestion
+            else:
+                from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+                _ing_cfg = get_client_config_for_ingestion(str(business_id)).ingestion
+            _phantom_cm = phantom_runtime_from_client(
+                _ing_cfg.phantom,
+                allow_legacy_env_overrides=bool(_ing_cfg.allow_legacy_env_overrides),
+            )
+            _phantom_cm.__enter__()
             loop = asyncio.get_running_loop()
     
             # ── STEP 1: Build hash → chunk map ─────────────────────────────
@@ -2723,7 +2698,7 @@ class IngestionServiceV2:
             # variables here, then explicitly capture them in every lambda
             # default arg. Zero reference captures from enclosing scope.
             if pipeline is None:
-                pipeline = _get_pipeline(business_id)
+                pipeline = _get_ingestion_pipeline(business_id)
     
             embedder:        Any = pipeline.embedder
             vectordb:        Any = pipeline.vectordb
@@ -2817,7 +2792,14 @@ class IngestionServiceV2:
             # never reaches "processed". Keep batch processing serial for HF.
             # Keep this semaphore local to the active coroutine so it is scoped
             # to the current running event loop and cannot leak across reloads/tests.
-            batch_parallelism = _resolve_embed_parallelism(embedder_kind)
+            icfg = getattr(pipeline.config, "ingestion", None)
+            if "huggingface" in (embedder_kind or ""):
+                batch_parallelism = 1
+            else:
+                batch_parallelism = max(
+                    1,
+                    int(getattr(icfg, "embed_parallelism", 4) or 4),
+                )
             batch_semaphore = asyncio.Semaphore(max(1, int(batch_parallelism)))
             log_info(
                 f"[IngestionV2] Embedding runtime: kind={embedder_kind or 'unknown'}, "
@@ -2974,6 +2956,9 @@ class IngestionServiceV2:
                     f"[IngestionV2] Also failed to write error status: {db_err}"
                 )
             raise
+        finally:
+            if _phantom_cm is not None:
+                _phantom_cm.__exit__(None, None, None)
 
 
 
@@ -3031,7 +3016,7 @@ class IngestionServiceV2:
         # Best-effort cleanup for partially written vectors.
         if semantic_hashes:
             try:
-                pipeline = _get_pipeline(business_id)
+                pipeline = _get_ingestion_pipeline(business_id)
                 pipeline.vectordb.delete_many(
                     collection=pipeline.config.vectordb.collection,
                     doc_ids=semantic_hashes,

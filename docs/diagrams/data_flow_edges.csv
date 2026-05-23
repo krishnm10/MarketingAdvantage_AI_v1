@@ -1,0 +1,17 @@
+FromNode,ToNode,ProtocolOrPayload,PrimaryFilesOnPath,Description
+UI,MW,In-app navigation + cookies,frontend-admin app router + middleware.ts,User hits protected routes
+UI,APIhelper,React state + fetch(),page.tsx components → hooks → apiClient,UI triggers HTTPS calls
+APIhelper,API,HTTPS JSON; Authorization: Bearer,lib/apiRoutes.ts; lib/apiClient.ts; app/api/v2/*.py,Browser/Next calls backend API
+MAIN,API,Internal dispatch,app/main.py includes_router → app/api/v2/*,All requests enter through mounted routers
+API,AUTH,Depends() JWT,deps.py used by *api.py,Verify token / roles
+API,SVC,function calls,ingestion_api_v2.py → ingestion_service_v2.py; retrieve_api.py → retrieval/*,HTTP handlers call services
+API,CORE,direct calls,rag_api.py → rag_pipeline.py / pipeline_factory.py; config paths → core/config/*,RAG and pipeline wiring
+SVC,CORE,embed/retrieve/build pipeline,ingestion_service_v2.py → embedders + vectordb adapters,Ingestion uses core engines
+SVC,DBORM,SQLAlchemy session,services/* → session_v2.py; models,Persist ingested rows audits etc
+CORE,DBORM,optional metadata IO,pipeline components reading/writing via ORM,Sometimes core touches DB for policy metadata
+DBORM,PG,SQL + connection pool,session_v2.py → async/sync engine,ORM talks to PostgreSQL
+CORE,VDB,Provider SDK HTTP/gRPC,app/core/vectordb/* (chroma_v1 pinecone_v1 etc),Upsert/query vectors
+CORE,LLM,HTTP to providers,app/core/llms/*; app/core/embedders/*,Generation and embeddings
+API,WORKER,.delay() / apply_async,ingestion_api_v2.py (or related) → app/worker/tasks.py,Queue long ingestion jobs when Celery on
+WORKER,BROKER,AMQP/Redis protocol,celery_app.py; broker_config.py,Task transport
+WORKER,SVC,Python call in worker process,tasks.py → ingestion_service_v2.py / orchestrators,Worker runs same services as API

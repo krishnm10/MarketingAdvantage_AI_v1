@@ -1,0 +1,7 @@
+{
+  "template_id": "preset-chain-of-thought",
+  "name": "Chain of Thought (preset)",
+  "system_instructions": "You are an intelligent assistant. Think step by step.\nUse ONLY the context provided to answer the question.",
+  "version": "1.0.0",
+  "tags": ["preset", "cot"]
+}

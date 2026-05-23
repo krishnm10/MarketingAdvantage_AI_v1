@@ -49,9 +49,6 @@ _DIM_MAP: dict = {
 }
 
 # Google API hard-limit per batch embed call
-_MAX_BATCH_SIZE = 100
-
-
 class GeminiEmbedder(BaseEmbedder):
     """
     Google Gemini embedding connector using the google-genai SDK (v1 API).
@@ -110,6 +107,18 @@ class GeminiEmbedder(BaseEmbedder):
             self._dim = len(vec)
         return _l2_normalize(vec) if self._normalize else vec
 
+    def _embed_one_document(self, text: str) -> List[float]:
+        """Single-chunk RETRIEVAL_DOCUMENT embedding (reliable shape vs batched calls)."""
+        result = self._client.models.embed_content(
+            model=self._model,
+            contents=text,
+            config=self._types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+        )
+        vec = [float(v) for v in result.embeddings[0].values]
+        if self._dim <= 0:
+            self._dim = len(vec)
+        return _l2_normalize(vec) if self._normalize else vec
+
     def embed_documents(self, texts: List[str]) -> List[List[float]]:
         """
         Embed a list of document chunks for indexing.
@@ -129,11 +138,22 @@ class GeminiEmbedder(BaseEmbedder):
             )
             batch_vecs = [[float(v) for v in emb.values] for emb in result.embeddings]
 
-            if self._dim <= 0 and batch_vecs:
-                self._dim = len(batch_vecs[0])
-
-            if self._normalize:
-                batch_vecs = [_l2_normalize(v) for v in batch_vecs]
+            # google-genai may return fewer embeddings than inputs for multi-item
+            # `contents`; Chroma upsert requires 1:1 lengths — fall back per text.
+            if len(batch_vecs) != len(batch):
+                logger.warning(
+                    "[GeminiEmbedder] embed_content returned %d embeddings for %d texts "
+                    "(model=%s); embedding sequentially.",
+                    len(batch_vecs),
+                    len(batch),
+                    self._model,
+                )
+                batch_vecs = [self._embed_one_document(t) for t in batch]
+            else:
+                if self._dim <= 0 and batch_vecs:
+                    self._dim = len(batch_vecs[0])
+                if self._normalize:
+                    batch_vecs = [_l2_normalize(v) for v in batch_vecs]
             all_vecs.extend(batch_vecs)
 
         logger.debug(

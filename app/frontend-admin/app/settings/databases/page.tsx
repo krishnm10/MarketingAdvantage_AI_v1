@@ -180,7 +180,9 @@ export default function DatabasesPage() {
       <div className="rounded-xl border border-slate-200/60 bg-white p-6 shadow-card">
         <h3 className="text-sm font-semibold text-slate-900 mb-3">Optional Databases (Not Active)</h3>
         <p className="text-sm text-slate-500 mb-4">
-          Configure these in <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono">.env</code> and set <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono">MAI_VECTORDB</code> to activate.
+          Set <strong>vectordb_type</strong> (and credential env vars per backend) in the merged Client JSON or <strong>Settings → Pipeline</strong>. Use{" "}
+          <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono">MAI_VECTOR_TRANSPORT</code> in{" "}
+          <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono">.env</code> only for client transport overrides (gRPC vs HTTP); pipeline topology stays in JSON.
         </p>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
           {["Pinecone", "Milvus", "Weaviate", "Redis"].map((name) => (

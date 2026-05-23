@@ -27,6 +27,24 @@ def _parse_literal_uuid(raw: Optional[str]) -> Optional[uuid.UUID]:
         return None
 
 
+def storage_uuid_str_for_vectordb_metadata(client_id: Optional[str]) -> str:
+    """
+    String to pass as BaseVectorDB ``tenant_id`` (metadata ``business_id`` filter).
+
+    Ingestion writes ``business_id`` on each vector as ``str(IngestedFileV2.business_id)``:
+    either a literal UUID from the client request, or uuid5(MAI_TENANT_NAMESPACE,
+    "mai:tenant:<slug>"). Slugs like ``default`` must not be passed directly to
+    vector search when metadata stores the derived UUID.
+    """
+    lit = _parse_literal_uuid(client_id)
+    if lit is not None:
+        return str(lit)
+    slug = (client_id or "default").strip().lower()
+    if not slug:
+        slug = "default"
+    return str(uuid.uuid5(MAI_TENANT_NAMESPACE, f"mai:tenant:{slug}"))
+
+
 def storage_business_uuid_for_tenant(
     validated_tenant_id: str,
     raw_request_business_id: Optional[str] = None,

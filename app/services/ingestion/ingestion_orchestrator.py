@@ -4,13 +4,13 @@ Ingestion Orchestrator — Single entry point for all ingestion operations.
 
 ARCHITECTURE:
     External callers (API, worker, connectors) → IngestionOrchestrator
-        → get_client_config       (authoritative config resolution)
+        → get_client_config_for_ingestion       (authoritative config resolution)
         → _enforce_embedding_policy  (sensitivity gate — fail fast)
         → sanitize_ingestion_chunks  (PII gate)
         → IngestionServiceV2         (chunking, dedup, storage, embedding)
 
 NON-NEGOTIABLES:
-    1. ClientConfig is resolved via get_client_config() at the START of
+    1. ClientConfig is resolved via get_client_config_for_ingestion() at the START of
        every entry point. No env-driven fallback. No optional configs.
     2. Embedding policy is enforced from the resolved config ONLY.
     3. PII sanitization runs on EVERY ingestion path.
@@ -90,8 +90,8 @@ def _resolve_config(client_id: str) -> ClientConfig:
 
     Raises ConfigValidationError or FileNotFoundError on bad config.
     """
-    from app.core.config.client_config_resolver import get_client_config
-    return get_client_config(client_id)
+    from app.core.config.client_config_resolver import get_client_config_for_ingestion
+    return get_client_config_for_ingestion(client_id)
 
 
 def _log_resolved_config(
@@ -146,7 +146,7 @@ class IngestionOrchestrator:
 
     Every ingestion path — file upload, pre-parsed RSS/API, connector
     output — MUST go through this class to guarantee:
-        1. Authoritative ClientConfig resolution via get_client_config().
+        1. Authoritative ClientConfig resolution via get_client_config_for_ingestion().
         2. Embedding policy enforcement from the resolved config.
         3. PII redaction before data leaves the service boundary.
     """

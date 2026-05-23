@@ -1,9 +1,22 @@
 "use client";
-import { useState, useEffect } from "react";
+
+import { useState, useEffect, useRef } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { LogOut, Bell, Search, User, ChevronRight } from "lucide-react";
+import {
+  LogOut,
+  Bell,
+  Search,
+  User,
+  ChevronRight,
+  Building2,
+  ChevronDown,
+  Check,
+  Loader2,
+  AlertCircle,
+} from "lucide-react";
 import { clearAuthToken, getAuthToken } from "@/lib/authToken";
 import { cn } from "@/lib/utils";
+import { useTenantOptional } from "@/contexts/TenantContext";
 
 function getBreadcrumbs(pathname: string) {
   const parts = pathname.split("/").filter(Boolean);
@@ -12,6 +25,140 @@ function getBreadcrumbs(pathname: string) {
     href: "/" + parts.slice(0, i + 1).join("/"),
     isLast: i === parts.length - 1,
   }));
+}
+
+function TenantSelector() {
+  const tenant = useTenantOptional();
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    function handleClickOutside(event: MouseEvent) {
+      if (
+        dropdownRef.current &&
+        !dropdownRef.current.contains(event.target as Node)
+      ) {
+        setOpen(false);
+        setFilter("");
+      }
+    }
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
+
+  if (!tenant) {
+    return null;
+  }
+
+  const { clientId, setClientId, tenants, loadingTenants, tenantError } = tenant;
+
+  const filteredTenants = tenants.filter((t) =>
+    t.label.toLowerCase().includes(filter.toLowerCase())
+  );
+
+  const isInList = tenants.some((t) => t.id === clientId);
+
+  return (
+    <div className="relative" ref={dropdownRef}>
+      {/* Trigger button */}
+      <button
+        onClick={() => setOpen(!open)}
+        className={cn(
+          "flex items-center gap-2 rounded-lg border px-3 py-1.5 text-sm transition-colors",
+          open
+            ? "border-primary-300 bg-primary-50 text-primary-700"
+            : "border-slate-200 bg-slate-50 text-slate-600 hover:border-slate-300 hover:bg-white"
+        )}
+      >
+        <Building2 className="h-3.5 w-3.5" />
+        {loadingTenants ? (
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        ) : (
+          <span className="max-w-[120px] truncate font-medium">{clientId}</span>
+        )}
+        {tenantError && (
+          <span title={tenantError}>
+            <AlertCircle className="h-3.5 w-3.5 text-amber-500" />
+          </span>
+        )}
+        {!isInList && !loadingTenants && (
+          <span className="text-[10px] text-amber-600 bg-amber-100 px-1 rounded">
+            custom
+          </span>
+        )}
+        <ChevronDown
+          className={cn(
+            "h-3.5 w-3.5 transition-transform",
+            open && "rotate-180"
+          )}
+        />
+      </button>
+
+      {/* Dropdown */}
+      {open && (
+        <div className="absolute right-0 top-full mt-1 w-64 rounded-lg border border-slate-200 bg-white shadow-lg z-50 overflow-hidden">
+          {/* Search */}
+          <div className="p-2 border-b border-slate-100">
+            <div className="relative">
+              <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-slate-400" />
+              <input
+                type="text"
+                placeholder="Search tenants..."
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                className="w-full pl-8 pr-3 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent"
+                autoFocus
+              />
+            </div>
+          </div>
+
+          {/* Tenant list */}
+          <div className="max-h-64 overflow-y-auto p-1">
+            {loadingTenants ? (
+              <div className="flex items-center justify-center py-4 text-sm text-slate-400">
+                <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                Loading tenants...
+              </div>
+            ) : filteredTenants.length === 0 ? (
+              <div className="py-4 text-center text-sm text-slate-400">
+                No tenants found
+              </div>
+            ) : (
+              filteredTenants.map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => {
+                    setClientId(t.id);
+                    setOpen(false);
+                    setFilter("");
+                  }}
+                  className={cn(
+                    "w-full flex items-center gap-2 px-3 py-2 text-sm rounded-md transition-colors",
+                    t.id === clientId
+                      ? "bg-primary-50 text-primary-700"
+                      : "text-slate-600 hover:bg-slate-50"
+                  )}
+                >
+                  <Building2 className="h-3.5 w-3.5 flex-shrink-0" />
+                  <span className="flex-1 text-left truncate">{t.label}</span>
+                  {t.id === clientId && (
+                    <Check className="h-3.5 w-3.5 text-primary-600" />
+                  )}
+                </button>
+              ))
+            )}
+          </div>
+
+          {/* Footer with count */}
+          <div className="px-3 py-2 bg-slate-50 border-t border-slate-100 text-[11px] text-slate-400">
+            {tenants.length} tenant{tenants.length !== 1 ? "s" : ""} available
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 export default function Navbar() {
@@ -50,6 +197,9 @@ export default function Navbar() {
 
       {/* Right side */}
       <div className="flex items-center gap-3">
+        {/* Tenant Selector */}
+        <TenantSelector />
+
         {/* Search */}
         <button className="flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-sm text-slate-400 hover:border-slate-300 hover:bg-white transition-colors">
           <Search className="h-3.5 w-3.5" />

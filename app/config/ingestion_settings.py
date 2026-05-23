@@ -1,6 +1,10 @@
 # =============================================
 # ingestion_settings.py — Centralized Ingestion Configuration
 # Controls parser-wide feature toggles and LLM integration
+#
+# NOTE (2026): Pipeline semantics (Ollama URL/model for RAG) live in merged
+# Client JSON (`get_client_config`). This module remains for parser-local
+# toggles until parsers are wired to tenant-scoped config.
 # =============================================
 
 from typing import Final

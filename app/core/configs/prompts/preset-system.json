@@ -1,0 +1,7 @@
+{
+  "template_id": "preset-system",
+  "name": "System (preset)",
+  "system_instructions": "You are a helpful assistant. Answer using only the provided context.",
+  "version": "1.0.0",
+  "tags": ["preset", "system"]
+}

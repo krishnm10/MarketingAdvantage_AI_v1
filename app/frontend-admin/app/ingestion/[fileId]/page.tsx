@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useState, type ComponentType } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import Button from "@/components/ui/Button";
 import Modal from "@/components/ui/Modal";
@@ -9,7 +9,8 @@ import { API } from "@/lib/apiRoutes";
 import { cn } from "@/lib/utils";
 import { useFormatDate } from "@/lib/useHydrated";
 import { useAuth } from "@/lib/useAuth";
-import { AlertTriangle, ArrowLeft, FileText, Hash, Info, Layers3, Link2, Loader2, Pencil, Save, SearchCheck, Sparkles } from "lucide-react";
+import { AlertTriangle, ArrowLeft, FileText, Hash, Info, Layers3, Link2, Loader2, Pencil, Save, SearchCheck, Sparkles, Building2 } from "lucide-react";
+import { useTenant } from "@/contexts/TenantContext";
 
 interface Chunk {
   id: string;
@@ -100,7 +101,8 @@ function matchingSemanticsText(layer: DisplayRow["layer"], reference: string, du
 export default function FileDetailPage() {
   const { fileId } = useParams<{ fileId: string }>();
   const searchParams = useSearchParams();
-  const tenantScope = searchParams.get("tenant");
+  const urlTenant = searchParams.get("tenant");
+  const { clientId, setClientId } = useTenant();
   const { role } = useAuth();
   const canEditChunks = role === "admin" || role === "editor";
   const [file, setFile] = useState<FileDetails | null>(null);
@@ -113,23 +115,41 @@ export default function FileDetailPage() {
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const { formatDateTime } = useFormatDate();
 
+  // Prefer explicit ?tenant= on the URL so the first request matches the deep link
+  // (TenantContext may still be "default" on the first effect pass; parent provider
+  // init also runs after child effects).
+  const tenantForApi = useMemo(() => {
+    const u = urlTenant?.trim();
+    return u && u.length > 0 ? u : clientId;
+  }, [urlTenant, clientId]);
+
+  // Sync URL tenant to context on mount (respect deep links)
+  useEffect(() => {
+    if (urlTenant && urlTenant !== clientId) {
+      setClientId(urlTenant);
+    }
+  }, [urlTenant, clientId, setClientId]);
+
   useEffect(() => {
     if (!fileId) return;
+    setLoading(true);
     (async () => {
       try {
         const [fRes, cRes] = await Promise.all([
-          apiClient.get(API.INGESTION_ADMIN.FILE_DETAIL(String(fileId), tenantScope || undefined)),
-          apiClient.get(API.INGESTION_ADMIN.FILE_CHUNKS(String(fileId), tenantScope || undefined)),
+          apiClient.get(API.INGESTION_ADMIN.FILE_DETAIL(String(fileId), tenantForApi)),
+          apiClient.get(API.INGESTION_ADMIN.FILE_CHUNKS(String(fileId), tenantForApi)),
         ]);
         setFile(fRes.data);
         setChunks(cRes.data ?? []);
       } catch (err) {
         console.error("Failed to fetch file details:", err);
+        setFile(null);
+        setChunks([]);
       } finally {
         setLoading(false);
       }
     })();
-  }, [fileId, tenantScope]);
+  }, [fileId, tenantForApi]);
 
   function openEditor(chunk: Chunk) {
     setEditingChunk(chunk);
@@ -160,6 +180,7 @@ export default function FileDetailPage() {
       await apiClient.put(API.INGESTION_ADMIN.CHUNK_UPDATE(editingChunk.id), {
         cleaned_text: nextText,
         llm_mode: llmMode || null,
+        tenant_id: tenantForApi,
       });
 
       setChunks((prev) =>

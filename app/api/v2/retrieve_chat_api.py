@@ -16,19 +16,29 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
 import logging
-import os
+import re
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.observability.rag_chat_trace import (
+    chunk_text_digest,
+    llm_usage_payload,
+    maybe_start_rag_chat_trace,
+    rag_chat_trace_include_prompt_hash,
+    text_digest_utf8,
+    vector_l2_norm,
+)
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
 from app.services.ingestion.ingestion_service_v2 import get_embedder
+from app.retrieval.types_retrieve import RankedResult
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +51,326 @@ router = APIRouter(prefix="/api/v2/retrieve")
 _SUPPORTED_LLM_PROVIDERS = ("openai", "ollama", "groq", "gemini", "anthropic", "google")
 _MAX_HISTORY_TURNS = 20
 _QUERY_REWRITE_MAX_TOKENS = 200
+
+# Must match wording in rag_prompt Rule 3 (used to detect contradictory model hedges).
+_GROUNDING_REFUSAL_PHRASE = (
+    "I could not find a reliable answer in the available documents."
+)
+
+
+def _chat_rag_compliance_block() -> str:
+    """
+    Default enterprise RAG instructions and citation rules (unchanged when no Prompt Library prefix).
+    Tenant `system_instructions` from the library are prepended before this block when configured.
+    """
+    return (
+        "You are a precise, grounded enterprise assistant.\n"
+        "Answer using ONLY the retrieved passages below.\n\n"
+        "Rules:\n"
+        "  1. Cite every factual claim using [Source 1], [Source 2], etc.\n"
+        "  2. If the passages clearly contain facts that answer the user message "
+        "(including partial lists — e.g. some order IDs when the user asks for orders), "
+        "summarize those facts with citations. Do not refuse when relevant text exists.\n"
+        "  3. If NONE of the passages are relevant or they contain zero usable facts "
+        "for the user message, respond EXACTLY with ONE line ONLY: "
+        f"'{_GROUNDING_REFUSAL_PHRASE}'\n"
+        "  4. NEVER output both extracted facts/table AND the refusal from rule 3. "
+        "Choose one: grounded answer OR refusal — never both in the same response.\n"
+        "  5. When the user asks for multiple identifiers (order numbers, invoice numbers, IDs), "
+        "quote them exactly as shown in passages (preserve INV-..., ABC-NNNN patterns).\n"
+        "  6. Never invent facts not present in the passages.\n"
+        "  7. When listing many identifiers, use a Markdown bullet list.\n"
+        "  8. Deduplicate identifiers: include each unique order/invoice/token string at most ONCE "
+        "(the same ID may appear in multiple [Source] blocks — merge repeats; "
+        'do NOT add labels like "(again)". For one merged line cite every source that '
+        "contained it, e.g. `MME-0099 — [Source 1], [Source 3]`).\n"
+        "  9. Do not use outside knowledge, public anecdotes, companies, dates, products, "
+        "or scenarios that are NOT literally supported by the passages. "
+        "If the passages do not name it, omit it entirely.\n\n"
+    )
+
+
+# #region agent log
+def _agent_debug_ndjson(
+    *,
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: Optional[Dict[str, Any]] = None,
+    run_id: str = "retrieve_chat",
+) -> None:
+    try:
+        payload: Dict[str, Any] = {
+            "sessionId": "e855ab",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with open("debug-e855ab.log", "a", encoding="utf-8") as _f:
+            _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# #endregion
+
+
+def _chat_llm_transport_exc(exc: BaseException) -> bool:
+    """True when the sync LLM HTTP client hit timeout or connection-layer failure."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    try:
+        import httpx
+
+        return isinstance(exc, (httpx.TimeoutException, httpx.ConnectError))
+    except ImportError:
+        return False
+
+
+def _normalize_line_for_refusal_compare(line: str) -> str:
+    return (
+        line.strip()
+        .strip('"')
+        .strip("'")
+        .rstrip(".")
+        .lower()
+    )
+
+
+def _strip_contradictory_refusal(answer: str) -> tuple[str, bool]:
+    """
+    Small local LLMs sometimes emit the exact refusal sentence after a good partial answer.
+    When we see grounded signals (citations / invoice-style ids), drop refusal-only lines.
+    """
+    refusal = _GROUNDING_REFUSAL_PHRASE
+    if not answer or refusal not in answer:
+        return answer, False
+    lo = answer.lower()
+    hyphen_id = bool(re.search(r"[a-z]{2,}-[a-z0-9]{3,}", lo))
+    grounded = (
+        "[source " in lo
+        or "inv-" in lo
+        or "invoice number" in lo
+        or "order number" in lo
+        or hyphen_id
+    )
+    if not grounded:
+        return answer, False
+    lines_out: List[str] = []
+    for line in answer.splitlines():
+        norm = _normalize_line_for_refusal_compare(line)
+        if norm == refusal.lower():
+            continue
+        if refusal.lower() in line.lower() and len(line.strip()) <= len(refusal) + 8:
+            continue
+        lines_out.append(line)
+    cleaned = "\n".join(lines_out).strip()
+    while "\n\n\n" in cleaned:
+        cleaned = cleaned.replace("\n\n\n", "\n\n")
+    if not cleaned:
+        return answer, False
+    return cleaned, cleaned != answer
+
+
+# ── P2/P3 production helpers — structured identifiers & detail-query grounding ──
+
+# Invoice / order style tokens (INV-6640, MME-0099, SRG-1144, PCR-7723, RG-2024, …)
+_STRUCTURED_ID_RE = re.compile(r"\b[A-Z]{2,}-[A-Z0-9]{3,}\b")
+_DETAIL_QUERY_HINT_RE = re.compile(
+    r"(?is)\b(?:give|show)\s+me\s+(?:the\s+)?details?\s+(?:of|for|about)\b|\bdetails?\s+(?:of|for|about)\b|\bwhat\s+(?:are\s+)?the\s+details?\s+(?:of|for)\b"
+)
+# "Order Number 67890", "invoice # 12345", short "order 67890"
+_ORDER_NUMBER_DIGITS_RE = re.compile(
+    r"(?i)\b(?:order|invoice)\s*(?:number|no\.?|#)?\s*[:#\s]*(\d{4,})\b|\border\s+#?\s*(\d{4,})\b"
+)
+
+
+def _all_structured_ids_upper(blob: str) -> List[str]:
+    """All ABC-XYZ style tokens (deduped, stable order)."""
+    if not blob:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+    for m in _STRUCTURED_ID_RE.findall(blob.upper()):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _extract_numeric_order_focus_token(*query_parts: str) -> Optional[str]:
+    """
+    Explicit numeric order / invoice refs (e.g. 67890) when user pins a detail/order query.
+    """
+    blob = " ".join(p for p in query_parts if p).strip()
+    if not blob:
+        return None
+    m = _ORDER_NUMBER_DIGITS_RE.search(blob)
+    if m:
+        return (m.group(1) or m.group(2) or "").strip() or None
+    low = blob.lower()
+    if _DETAIL_QUERY_HINT_RE.search(low):
+        long_nums = re.findall(r"\b(\d{5,})\b", blob)
+        if len(long_nums) == 1:
+            return long_nums[0]
+    return None
+
+
+def _strict_identifier_grounding_query(raw: str, rewritten: str) -> bool:
+    blob = f"{raw} {rewritten}".strip()
+    if not blob:
+        return False
+    if _DETAIL_QUERY_HINT_RE.search(blob.lower()):
+        return True
+    if _ORDER_NUMBER_DIGITS_RE.search(blob):
+        return True
+    return False
+
+
+def _strict_detail_grounding_keys(raw: str, rewritten: str) -> List[str]:
+    """
+    Tokens the user explicitly asked about in a detail/order query; all must appear in passages
+    or we refuse (prevents small-LLM hallucinations when retrieval misses).
+    """
+    if not _strict_identifier_grounding_query(raw, rewritten):
+        return []
+    blob = f"{raw} {rewritten}".strip()
+    keys: List[str] = []
+    seen: set[str] = set()
+    for sid in _all_structured_ids_upper(blob):
+        if sid not in seen:
+            keys.append(sid)
+            seen.add(sid)
+    num = _extract_numeric_order_focus_token(raw, rewritten)
+    if num and num not in seen:
+        keys.append(num)
+        seen.add(num)
+    return keys
+
+
+def _token_appears_in_passages(passages: str, token: str) -> bool:
+    if not token or not passages:
+        return False
+    if token.isdigit():
+        return re.search(rf"(?<!\d){re.escape(token)}(?!\d)", passages) is not None
+    return token.upper() in passages.upper()
+
+
+def _extract_detail_focus_token(*query_parts: str) -> Optional[str]:
+    """Pick a canonical focus token: structured ID (MME-0099) or explicit numeric order ref."""
+    blob = " ".join(p for p in query_parts if p).strip()
+    if not blob:
+        return None
+    matches = _STRUCTURED_ID_RE.findall(blob.upper())
+    best: Optional[str] = None
+    if matches:
+        uniq = sorted(set(matches), key=len, reverse=True)
+        low_join = blob.lower()
+        best_pri = -1
+        for m in uniq:
+            pri = len(m)
+            if _DETAIL_QUERY_HINT_RE.search(low_join) and m.lower() in low_join:
+                pri += 50
+            pri += low_join.count(m.lower())
+            if pri > best_pri:
+                best_pri = pri
+                best = m
+    if best:
+        return best
+    return _extract_numeric_order_focus_token(*query_parts)
+
+
+def _prioritize_ranked_for_identifier(
+    ranked: List[RankedResult],
+    token: Optional[str],
+) -> List[RankedResult]:
+    """Boost chunks whose text mentions the identifier (P3 detail queries)."""
+    if not ranked or not token:
+        return ranked
+    needle = token.strip().upper()
+    if len(needle) < 4:
+        return ranked
+    if not any(needle in r.text.upper() for r in ranked):
+        return ranked
+    return sorted(ranked, key=lambda r: (needle not in r.text.upper(), -float(r.score)))
+
+
+def _dedupe_identifier_lines(answer: str) -> Tuple[str, bool]:
+    """
+    Collapse duplicate list lines keyed by structured IDs (P2).
+    Removes trivial '(again)' hedges from small LLMs.
+    """
+    if not answer:
+        return answer, False
+    lines = answer.splitlines()
+    seen_keys: set[Tuple[str, ...]] = set()
+    changed = False
+    out: List[str] = []
+    for line in lines:
+        stripped = re.sub(r"\s*\(?again\)?\.?$", "", line, flags=re.IGNORECASE).strip()
+        ids = tuple(sorted(set(_STRUCTURED_ID_RE.findall(stripped.upper()))))
+        if ids:
+            if ids in seen_keys:
+                changed = True
+                continue
+            seen_keys.add(ids)
+            cleaned = re.sub(r"\(?again\)?", "", stripped, flags=re.IGNORECASE).strip()
+            if cleaned != line.strip():
+                changed = True
+            out.append(cleaned)
+        else:
+            out.append(line)
+    merged = "\n".join(out).strip()
+    return merged, changed or merged != answer.strip()
+
+
+def _build_focus_fallback_answer(context_str: str, token: str) -> Optional[str]:
+    """Deterministic excerpts when the LLM refuses but passages contain the token (P3)."""
+    if not token or not context_str:
+        return None
+    if token.upper() not in context_str.upper():
+        return None
+    blocks = re.split(r"\n-{3,}\n", context_str)
+    kept: List[str] = []
+    for b in blocks:
+        chunk = b.strip()
+        if token.upper() not in chunk.upper():
+            continue
+        if len(chunk) > 1400:
+            chunk = chunk[:1400].rsplit(" ", 1)[0] + " …"
+        kept.append(chunk)
+    if not kept:
+        return None
+    header = (
+        f"Here is what the retrieved passages say about **{token}** "
+        "(verbatim excerpts; cite sources by section header):\n\n"
+    )
+    return header + "\n\n".join(kept)
+
+
+def _maybe_focus_fallback_answer(
+    answer: Optional[str],
+    context_str: str,
+    token: Optional[str],
+) -> Tuple[Optional[str], bool]:
+    """Replace bare refusal with deterministic excerpts when grounded text exists."""
+    if not token:
+        return answer, False
+    fb = _build_focus_fallback_answer(context_str, token)
+    if not fb:
+        return answer, False
+    if not answer or not answer.strip():
+        return fb, True
+    low = answer.strip().lower()
+    refusal = _GROUNDING_REFUSAL_PHRASE.lower()
+    if refusal == low:
+        return fb, True
+    if refusal in low and "[source" not in low:
+        return fb, True
+    return answer, False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,6 +385,12 @@ class ChatMessage(BaseModel):
 class ChatRetrieveRequest(BaseModel):
     session_id: str = Field(default_factory=lambda: str(uuid.uuid4()), description="Session UUID for grouping turns")
     messages: List[ChatMessage] = Field(..., min_length=1, description="Full conversation history for this session")
+    client_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant / client identifier for tenant-scoped retrieval.",
+    )
     # Per-request model overrides (None → use .env defaults)
     llm_provider: Optional[str] = Field(None, description="Override LLM provider")
     llm_model: Optional[str] = Field(None, description="Override LLM model name")
@@ -99,45 +435,36 @@ class ChatRetrieveResponse(BaseModel):
 # LLM Resolver (shared by rewrite + answer generation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_llm(provider: str, model: Optional[str] = None):
+def _resolve_llm(
+    provider: str,
+    model: Optional[str],
+    *,
+    api_key_env: Optional[str] = None,
+    base_url: Optional[str] = None,
+):
     """
     Resolve an LLM connector instance for the given provider/model.
     Returns (llm_instance, resolved_model_name) or raises HTTPException.
     """
+    from app.retrieval.components import instantiate_llm
+
     provider = provider.lower()
+    if provider == "google":
+        provider = "gemini"
+    if provider == "grok":
+        provider = "groq"
 
-    if provider == "openai":
-        from app.core.llms.openai_v1 import OpenAILLM
-        m = model or os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
-        return OpenAILLM(), m
-
-    if provider == "ollama":
-        from app.core.llms.ollama_v1 import OllamaLLM
-        m = model or os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
-        return OllamaLLM(model=m), m
-
-    if provider in ("groq", "grok"):
-        from app.core.llms.groq_v1 import GroqLLM
-        m = model or os.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile")
-        return GroqLLM(), m
-
-    if provider in ("gemini", "google"):
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise HTTPException(400, "GEMINI_API_KEY is not set.")
-        from app.core.llms.gemini_v1 import GeminiLLM
-        m = model or os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash")
-        return GeminiLLM(model=m, api_key=api_key), m
-
-    if provider == "anthropic":
-        api_key = os.getenv("ANTHROPIC_API_KEY", "")
-        if not api_key:
-            raise HTTPException(400, "ANTHROPIC_API_KEY is not set.")
-        from app.core.llms.anthropic_v1 import AnthropicLLM
-        m = model or os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022")
-        return AnthropicLLM(model=m, api_key=api_key), m
-
-    raise HTTPException(400, f"Unsupported LLM provider: '{provider}'. Supported: {', '.join(_SUPPORTED_LLM_PROVIDERS)}")
+    try:
+        eff_model = model or ""
+        llm, resolved = instantiate_llm(
+            provider,
+            eff_model,
+            api_key_env=api_key_env,
+            base_url=base_url,
+        )
+        return llm, resolved
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -182,15 +509,15 @@ def _rewrite_query(messages: List[ChatMessage], llm, llm_model: str) -> str:
 # Embedding helper
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _embed_query(query: str) -> List[float]:
-    embedder = get_embedder()
+def _embed_query(query: str, business_id: Optional[str] = None) -> List[float]:
+    embedder = get_embedder(business_id)
     result = embedder.encode(query, normalize_embeddings=True)
     return result.tolist()
 
 
-async def _embed_in_thread(query: str) -> List[float]:
+async def _embed_in_thread(query: str, business_id: Optional[str] = None) -> List[float]:
     import asyncio
-    return await asyncio.to_thread(_embed_query, query)
+    return await asyncio.to_thread(_embed_query, query, business_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -207,9 +534,20 @@ async def chat_retrieve(
     Multi-turn RAG chat: rewrite query → embed → retrieve → (optional rerank)
     → generate LLM answer from grounded context.
 
-    Embedder is always the ingestion-pipeline embedder (MAI_EMBEDDER).
+    Embedder and defaults follow merged Client JSON for the resolved tenant.
     LLM and reranker can be overridden per request.
     """
+    from app.utils.tenant_validator import (
+        validate_tenant_id_strict,
+        get_storage_uuid_str,
+        TenantValidationError,
+    )
+    from app.retrieval.components import (
+        log_runtime_telemetry,
+        resolve_config_or_fail,
+        resolve_runtime_components,
+        resolve_runtime_components_legacy,
+    )
     from app.retrieval.runtime import RetrievalRuntime
     from app.retrieval.repository import RetrievalRepository
     from app.retrieval.types_retrieve import QueryContext, RetrievalIntent
@@ -228,257 +566,717 @@ async def chat_retrieve(
     if not intent_enum:
         raise HTTPException(400, f"Invalid intent '{req.intent}'")
 
-    # ── Resolve LLM (for rewrite + answer) ───────────────────────────────────
-    llm_provider = (req.llm_provider or os.getenv("MAI_LLM", "openai")).lower()
-    llm_model_name: Optional[str] = req.llm_model
+    # Validate tenant with strict enforcement (uses TENANT_ENFORCEMENT_MODE)
     try:
-        llm, llm_model_name = _resolve_llm(llm_provider, llm_model_name)
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(400, f"Failed to initialize LLM ({llm_provider}): {e}")
-
-    # ── Security scan on last user message ───────────────────────────────────
-    last_user_msg = req.messages[-1].content
-    scan_result = _security_scan_text(last_user_msg, context="chat_retrieve")
-    if scan_result.injection_detected:
-        raise HTTPException(400, "Query rejected: potential prompt injection detected.")
-
-    # ── Query rewrite (multi-turn → standalone) ──────────────────────────────
-    raw_query = scan_result.redacted_text
-    rewritten_query: Optional[str] = None
-    if len(req.messages) > 1:
-        rewritten_query = _rewrite_query(req.messages, llm, llm_model_name)
-        # Security scan on rewritten query too
-        rw_scan = _security_scan_text(rewritten_query, context="chat_rewrite")
-        if rw_scan.injection_detected:
-            rewritten_query = raw_query
-        else:
-            rewritten_query = rw_scan.redacted_text
-
-    embed_text = rewritten_query or raw_query
-
-    # ── Optional HyDE ────────────────────────────────────────────────────────
-    if req.enable_hyde:
-        try:
-            hyde_prompt = (
-                "Write a short factual paragraph that would answer this question. "
-                "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
-                f"Question: {embed_text}\n\nAnswer:"
-            )
-            resp = llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
-            text = (resp.text or "").strip()
-            if len(text) > 20:
-                embed_text = text
-                logger.info("[ChatRetrieve] HyDE expansion applied (%d chars)", len(text))
-        except Exception as e:
-            logger.warning("[ChatRetrieve] HyDE failed: %s", e)
-
-    # ── Embed ────────────────────────────────────────────────────────────────
-    try:
-        query_embedding = await _embed_in_thread(embed_text)
-    except Exception as e:
-        raise HTTPException(500, f"Embedding failed: {e}")
-
-    # ── Retrieve ─────────────────────────────────────────────────────────────
-    repository = RetrievalRepository(db_session=db)
-    runtime = RetrievalRuntime(repository=repository, policy_registry=DEFAULT_POLICY_REGISTRY)
-
-    ctx = QueryContext(
-        query=raw_query,
-        intent=intent_enum,
-        requested_at=int(time.time()),
-    )
-
-    try:
-        ranked_results, dropped = await runtime.retrieve(
-            ctx=ctx, query_embedding=query_embedding, max_results_override=req.top_k,
+        tenant_ctx = validate_tenant_id_strict(
+            req.client_id,
+            source="body",
+            endpoint="chat_retrieve",
         )
-    except Exception as e:
-        raise HTTPException(500, f"Retrieval failed: {e}")
-    finally:
-        repository.close()
+    except TenantValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    retrieve_cid = tenant_ctx.tenant_id
+    # Storage UUID for vector/SQL filtering (Phase 2 will use this)
+    _storage_uuid_str = get_storage_uuid_str(tenant_ctx)
 
-    # ── Optional reranker ────────────────────────────────────────────────────
-    reranker_name = (req.reranker or os.getenv("MAI_RERANKER", "none")).strip().lower()
-    reranker_used = "none"
+    trace = maybe_start_rag_chat_trace(req.session_id, retrieve_cid)
+    _trace_prev = time.perf_counter()
 
-    if reranker_name not in ("none", "", "disabled") and ranked_results:
-        try:
-            import app.core.rerankers.register as _rr_reg  # noqa: F401
-            from app.core.plugin_registry import reranker_registry
-            from app.core.rerankers.base import RerankCandidate
+    def _trace_lap() -> float:
+        nonlocal _trace_prev
+        now = time.perf_counter()
+        delta_ms = round((now - _trace_prev) * 1000, 3)
+        _trace_prev = now
+        return delta_ms
 
-            rr_model = os.getenv("MAI_RERANKER_MODEL", "").strip()
-            build_kw: Dict[str, Any] = {}
-            if rr_model:
-                build_kw["model_name"] = rr_model
+    try:
+        _trace_prev = time.perf_counter()
 
-            reranker = reranker_registry.build(reranker_name, **build_kw)
-            candidates = [
-                RerankCandidate(id=r.chunk_id, text=r.text, vector_score=r.score, metadata={})
-                for r in ranked_results
-            ]
-            rr_top_k = req.top_k or 10
-            scored = reranker.rerank(raw_query, candidates, top_k=rr_top_k)
-            score_map = {c.id: (c.rerank_score or 0.0) for c in scored}
-            ranked_results = [r for r in ranked_results if r.chunk_id in score_map]
-            ranked_results.sort(key=lambda r: score_map.get(r.chunk_id, 0.0), reverse=True)
-            reranker_used = reranker_name
-            logger.info("[ChatRetrieve] Reranker '%s' applied | %d candidates", reranker_name, len(scored))
-        except Exception as e:
-            logger.warning("[ChatRetrieve] Reranker '%s' failed: %s", reranker_name, e)
-
-    # ── BM25 / Hybrid re-ranking ────────────────────────────────────────────
-    search_mode = req.search_mode.lower()
-    if search_mode in ("hybrid", "keyword") and ranked_results:
-        try:
-            from app.core.search.bm25_index import BM25Index
-            from app.core.search.rrf_fusion import reciprocal_rank_fusion
-
-            chunk_dicts = [{"id": r.chunk_id, "text": r.text, "score": r.score, "metadata": {}} for r in ranked_results]
-            bm25 = BM25Index()
-            bm25.build(chunk_dicts)
-            kw_hits = bm25.search(raw_query, k=len(ranked_results))
-            kw_dicts = [{"id": h.id, "text": h.text, "score": h.score, "metadata": h.metadata} for h in kw_hits]
-
-            if search_mode == "hybrid":
-                fused = reciprocal_rank_fusion(vector_hits=chunk_dicts, keyword_hits=kw_dicts, alpha=0.7, top_k=len(ranked_results))
-                fused_order = {f.id: i for i, f in enumerate(fused)}
-                ranked_results.sort(key=lambda r: fused_order.get(r.chunk_id, 999))
-            else:
-                bm25_order = {h.id: i for i, h in enumerate(kw_hits)}
-                ranked_results.sort(key=lambda r: bm25_order.get(r.chunk_id, 999))
-        except Exception as e:
-            logger.warning("[ChatRetrieve] Hybrid/keyword search failed: %s", e)
-
-    # ── Threshold filter ─────────────────────────────────────────────────────
-    if req.similarity_threshold > 0:
-        ranked_results = [r for r in ranked_results if r.score >= req.similarity_threshold]
-
-    # ── Build results ────────────────────────────────────────────────────────
-    results: List[ChatResultItem] = []
-    for idx, r in enumerate(ranked_results, start=1):
-        trust_state = None
-        sig = r.explanation.get("interpretation", {})
-        trust_state = sig.get("trust_state", "validated")
-
-        results.append(ChatResultItem(
-            rank=idx,
-            chunk_id=r.chunk_id,
-            text=r.text,
-            score=round(r.score, 6),
-            trust_decision=r.trust_decision.value if hasattr(r.trust_decision, "value") else (r.trust_decision if isinstance(r.trust_decision, str) else None),
-            trust_state=trust_state,
-        ))
-
-    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
-
-    # ── LLM answer generation ────────────────────────────────────────────────
-    answer: Optional[str] = None
-    answer_model: Optional[str] = llm_model_name
-    answer_latency_ms: Optional[float] = None
-    answer_error: Optional[str] = None
-
-    rag_min_score = float(os.getenv("RAG_ANSWER_MIN_SCORE", "0.25"))
-
-    if req.generate_answer:
-        if not results:
-            answer_error = "No results retrieved — cannot generate a grounded answer."
+        _cfg_chat, runtime_mode_chat = resolve_config_or_fail(retrieve_cid)
+        if _cfg_chat is not None:
+            rc = resolve_runtime_components(_cfg_chat)
         else:
-            max_score = max(r.score for r in results)
-            if max_score < rag_min_score:
-                answer_error = (
-                    f"Retrieved context confidence too low (best={max_score:.3f} < threshold={rag_min_score:.2f}). "
-                    "Try a more specific query."
+            rc = resolve_runtime_components_legacy()
+
+        try:
+            log_runtime_telemetry(rc, "/api/v2/retrieve/chat")
+        except Exception:
+            logger.debug("[ChatRetrieve] log_runtime_telemetry failed", exc_info=True)
+
+        cfg_llm = (rc.llm_provider or "openai").lower()
+        if cfg_llm == "google":
+            cfg_llm = "gemini"
+    
+        # ── Resolve LLM (for rewrite + answer) ───────────────────────────────────
+        llm_provider = (req.llm_provider or cfg_llm).lower()
+        llm_model_name: Optional[str] = req.llm_model or rc.llm_model
+        try:
+            llm, llm_model_name = _resolve_llm(
+                llm_provider,
+                llm_model_name,
+                api_key_env=rc.llm_api_key_env,
+                base_url=rc.llm_base_url,
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(400, f"Failed to initialize LLM ({llm_provider}): {e}")
+    
+        # ── Security scan on last user message ───────────────────────────────────
+        last_user_msg = req.messages[-1].content
+        scan_result = _security_scan_text(last_user_msg, context="chat_retrieve")
+        if scan_result.injection_detected:
+            raise HTTPException(400, "Query rejected: potential prompt injection detected.")
+    
+        # ── Query rewrite (multi-turn → standalone) ──────────────────────────────
+        raw_query = scan_result.redacted_text
+        rewritten_query: Optional[str] = None
+        if len(req.messages) > 1:
+            rewritten_query = _rewrite_query(req.messages, llm, llm_model_name)
+            # Security scan on rewritten query too
+            rw_scan = _security_scan_text(rewritten_query, context="chat_rewrite")
+            if rw_scan.injection_detected:
+                rewritten_query = raw_query
+            else:
+                rewritten_query = rw_scan.redacted_text
+    
+        embed_text = rewritten_query or raw_query
+        detail_focus_token = _extract_detail_focus_token(raw_query, rewritten_query or "")
+        strict_detail_grounding_keys = _strict_detail_grounding_keys(raw_query, rewritten_query or "")
+        hyde_skipped_for_identifier = False
+    
+        # ── Optional HyDE ────────────────────────────────────────────────────────
+        if req.enable_hyde:
+            if detail_focus_token:
+                hyde_skipped_for_identifier = True
+                logger.info(
+                    "[ChatRetrieve] HyDE skipped — explicit identifier / order pin in query (retrieval-aligned embed)",
                 )
             else:
                 try:
-                    gen_start = time.perf_counter()
-                    top_chunks = results[:req.max_context_chunks]
-                    context_parts = [
-                        f"[Source {i}] (score={c.score:.3f})\n{c.text.strip()}"
-                        for i, c in enumerate(top_chunks, 1)
-                    ]
-                    context_str = "\n\n---\n\n".join(context_parts)
-
-                    # ── Context sanitization: PII redaction on retrieved text ─
-                    _ctx_scan = _security_scan_text(
-                        context_str, context="retrieved_context",
+                    hyde_prompt = (
+                        "Write a short factual paragraph that would answer this question. "
+                        "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
+                        f"Question: {embed_text}\n\nAnswer:"
                     )
-                    _sanitized_context = _ctx_scan.redacted_text
-                    if _sanitized_context != context_str:
-                        logger.info(
-                            "[ChatRetrieve] Context sanitized before LLM — "
-                            "PII redacted from retrieved chunks"
-                        )
-                        context_str = _sanitized_context
-
-                    rag_prompt = (
-                        "You are a precise, grounded enterprise assistant.\n"
-                        "Answer the user's question using ONLY the retrieved passages below.\n\n"
-                        "Rules:\n"
-                        "  1. Cite every source: [Source 1], [Source 2], etc.\n"
-                        "  2. If the passages lack sufficient information, respond EXACTLY with: "
-                        "'I could not find a reliable answer in the available documents.'\n"
-                        "  3. Never invent facts.\n"
-                        "  4. Be factual, concise, and professional.\n\n"
-                        f"QUESTION: {raw_query}\n\n"
-                        f"RETRIEVED PASSAGES:\n{context_str}\n\n"
-                        "ANSWER (grounded, with citations):"
-                    )
-
-                    resp = llm.generate(rag_prompt, temperature=0.0, max_tokens=700)
-                    raw_answer = (resp.text or "").strip()
-                    if raw_answer:
-                        answer = raw_answer
-                    else:
-                        answer_error = "LLM returned an empty response."
-
-                    answer_latency_ms = round((time.perf_counter() - gen_start) * 1000, 2)
+                    resp = llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
+                    text = (resp.text or "").strip()
+                    if len(text) > 20:
+                        embed_text = text
+                        logger.info("[ChatRetrieve] HyDE expansion applied (%d chars)", len(text))
                 except Exception as e:
-                    logger.warning("[ChatRetrieve] LLM answer failed: %s", e, exc_info=True)
-                    answer_error = f"LLM generation error: {str(e)[:300]}"
+                    logger.warning("[ChatRetrieve] HyDE failed: %s", e)
+    
+        if trace:
+            trace.add_event(
+                "L1",
+                "preprocess",
+                _trace_lap(),
+                {
+                    "hash_raw_query": text_digest_utf8(raw_query),
+                    "hash_embed_text": text_digest_utf8(embed_text),
+                    "raw_query_chars": len(raw_query),
+                    "embed_text_chars": len(embed_text),
+                    "query_rewritten": rewritten_query is not None,
+                    "hyde_requested": bool(req.enable_hyde),
+                    "hyde_skipped_for_identifier": hyde_skipped_for_identifier,
+                    "detail_focus_token": detail_focus_token,
+                    "strict_detail_grounding_keys": strict_detail_grounding_keys,
+                    "embed_focus_differs_from_raw": embed_text.strip() != raw_query.strip(),
+                },
+            )
+    
+        # ── Embed ────────────────────────────────────────────────────────────────
+        try:
+            query_embedding = await _embed_in_thread(embed_text, retrieve_cid)
+        except Exception as e:
+            raise HTTPException(500, f"Embedding failed: {e}")
+    
+        if trace:
+            _vn = vector_l2_norm(query_embedding)
+            trace.add_event(
+                "L1",
+                "embed_query",
+                _trace_lap(),
+                {
+                    "embedding_model_id": f"{rc.embedder_type}:{rc.embedder_model}",
+                    "vector_dimension": len(query_embedding),
+                    "vector_l2_norm": round(float(_vn), 8) if _vn == _vn else None,
+                },
+            )
+    
+        # ── Retrieve ─────────────────────────────────────────────────────────────
+        if runtime_mode_chat == "authoritative_config" and _cfg_chat is not None:
+            from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
+    
+            _pipe_c = get_query_pipeline_for_client(retrieve_cid)
+            repository = RetrievalRepository(
+                db_session=db,
+                vectordb=_pipe_c.vectordb,
+                collection=rc.collection,
+            )
+        else:
+            repository = RetrievalRepository(db_session=db)
+        runtime = RetrievalRuntime(repository=repository, policy_registry=DEFAULT_POLICY_REGISTRY)
+    
+        ctx = QueryContext(
+            query=raw_query,
+            intent=intent_enum,
+            requested_at=int(time.time()),
+        )
+    
+        try:
+            ranked_results, dropped = await runtime.retrieve(
+                ctx=ctx,
+                query_embedding=query_embedding,
+                max_results_override=req.top_k,
+                tenant_id=retrieve_cid,           # Tenant slug for logging
+                storage_uuid=_storage_uuid_str,   # Storage UUID for filtering
+            )
+        except Exception as e:
+            raise HTTPException(500, f"Retrieval failed: {e}")
+        finally:
+            repository.close()
+    
+        # ── Optional reranker (stack-aware resolver + circuit breaker) ─────────
+        _default_rr = (rc.reranker_name or "none").strip().lower()
+        reranker_name = (req.reranker or _default_rr).strip().lower()
+        reranker_used = "none"
+        reranker_fallback_applied = False
+        reranker_fallback_reason: Optional[str] = None
 
-    # ── Debug info ───────────────────────────────────────────────────────────
-    debug_info: Dict[str, Any] = {
-        "embedder": os.getenv("MAI_EMBEDDER", "unknown"),
-        "llm_provider": llm_provider,
-        "llm_model": llm_model_name,
-        "vectordb": os.getenv("MAI_VECTORDB", "unknown"),
-        "collection": os.getenv("MAI_COLLECTION", "ingested_content"),
-        "chunking_strategy": os.getenv("CHUNKING_STRATEGY", "unknown"),
-        "search_mode": search_mode,
-        "intent": req.intent,
-        "reranker_used": reranker_used,
-        "score_gate_threshold": rag_min_score,
-        "max_score": round(max(r.score for r in results), 4) if results else None,
-        "hyde_enabled": req.enable_hyde,
-        "query_rewritten": rewritten_query is not None,
-        "security_scan": {
-            "pii_detected": scan_result.has_pii,
-            "injection_detected": scan_result.injection_detected,
-        },
-    }
+        if (
+            reranker_name not in ("none", "", "disabled")
+            and ranked_results
+            and _cfg_chat is not None
+        ):
+            from app.core.rerankers.base import RerankCandidate
+            from app.retrieval.reranker_runtime import apply_reranker_with_fallback
 
-    logger.info(
-        "[ChatRetrieve] session=%s query='%s' rewritten=%s results=%d latency=%.0fms",
-        req.session_id, raw_query[:60], rewritten_query is not None, len(results), elapsed_ms,
-    )
+            rr_candidates = [
+                RerankCandidate(
+                    id=r.chunk_id,
+                    text=r.text,
+                    vector_score=r.score,
+                    metadata={},
+                )
+                for r in ranked_results
+            ]
+            rr_top_k = req.top_k or 10
+            scored, reranker_used, reranker_fallback_applied, reranker_fallback_reason = (
+                apply_reranker_with_fallback(
+                    config=_cfg_chat,
+                    query=raw_query,
+                    candidates=rr_candidates,
+                    top_k=rr_top_k,
+                    request_plugin_override=req.reranker,
+                )
+            )
+            if reranker_used != "none":
+                score_map = {c.id: (c.rerank_score or 0.0) for c in scored}
+                ranked_results = [r for r in ranked_results if r.chunk_id in score_map]
+                ranked_results.sort(
+                    key=lambda r: score_map.get(r.chunk_id, 0.0), reverse=True
+                )
+                logger.info(
+                    "[ChatRetrieve] Reranker '%s' applied | %d candidates",
+                    reranker_used,
+                    len(scored),
+                )
+    
+        # ── BM25 / Hybrid re-ranking ────────────────────────────────────────────
+        search_mode = req.search_mode.lower()
+        if search_mode in ("hybrid", "keyword") and ranked_results:
+            try:
+                from app.core.search.bm25_index import BM25Index
+                from app.core.search.rrf_fusion import reciprocal_rank_fusion
+    
+                chunk_dicts = [{"id": r.chunk_id, "text": r.text, "score": r.score, "metadata": {}} for r in ranked_results]
+                bm25 = BM25Index()
+                bm25.build(chunk_dicts)
+                kw_hits = bm25.search(raw_query, k=len(ranked_results))
+                kw_dicts = [{"id": h.id, "text": h.text, "score": h.score, "metadata": h.metadata} for h in kw_hits]
+    
+                if search_mode == "hybrid":
+                    fused = reciprocal_rank_fusion(vector_hits=chunk_dicts, keyword_hits=kw_dicts, alpha=0.7, top_k=len(ranked_results))
+                    fused_order = {f.id: i for i, f in enumerate(fused)}
+                    ranked_results.sort(key=lambda r: fused_order.get(r.chunk_id, 999))
+                else:
+                    bm25_order = {h.id: i for i, h in enumerate(kw_hits)}
+                    ranked_results.sort(key=lambda r: bm25_order.get(r.chunk_id, 999))
+            except Exception as e:
+                logger.warning("[ChatRetrieve] Hybrid/keyword search failed: %s", e)
+    
+        # ── Threshold filter ─────────────────────────────────────────────────────
+        if req.similarity_threshold > 0:
+            ranked_results = [r for r in ranked_results if r.score >= req.similarity_threshold]
+    
+        # ── P3: surface chunks that mention the explicit identifier first ─────────
+        if detail_focus_token:
+            ranked_results = _prioritize_ranked_for_identifier(ranked_results, detail_focus_token)
+            logger.info(
+                "[ChatRetrieve] Identifier-focused reorder applied | token=%s",
+                detail_focus_token,
+            )
+    
+        # ── Build results ────────────────────────────────────────────────────────
+        results: List[ChatResultItem] = []
+        for idx, r in enumerate(ranked_results, start=1):
+            trust_state = None
+            sig = r.explanation.get("interpretation", {})
+            trust_state = sig.get("trust_state", "validated")
+    
+            results.append(ChatResultItem(
+                rank=idx,
+                chunk_id=r.chunk_id,
+                text=r.text,
+                score=round(r.score, 6),
+                trust_decision=r.trust_decision.value if hasattr(r.trust_decision, "value") else (r.trust_decision if isinstance(r.trust_decision, str) else None),
+                trust_state=trust_state,
+            ))
+    
+        if trace:
+            trace.add_event(
+                "L2",
+                "retrieve_pipeline",
+                _trace_lap(),
+                {
+                    "ranked_count": len(ranked_results),
+                    "dropped_count": len(dropped),
+                    "search_mode": search_mode,
+                    "reranker_used": reranker_used,
+                    "reranker_fallback_applied": reranker_fallback_applied,
+                    "reranker_fallback_reason": reranker_fallback_reason,
+                    "similarity_threshold": req.similarity_threshold,
+                    "request_top_k": req.top_k,
+                    "results_count": len(results),
+                    "detail_focus_token": detail_focus_token,
+                },
+            )
+    
+        elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    
+        # ── LLM answer generation ────────────────────────────────────────────────
+        answer: Optional[str] = None
+        answer_model: Optional[str] = llm_model_name
+        answer_latency_ms: Optional[float] = None
+        answer_error: Optional[str] = None
+        transport_exc_name: Optional[str] = None
+        prompt_template_id_effective: Optional[str] = None
+        prompt_template_resolved: bool = False
+        prompt_template_source: str = "default"
+    
+        rag_min_score = float(rc.rag_min_score)
+    
+        identifier_dedupe_applied = False
+        focus_fallback_used = False
+        context_chunks_sent_to_llm = 0
+        skipped_llm_grounding_miss = False
+        tokens_missing_from_passages: List[str] = []
+    
+        if req.generate_answer:
+            if not results:
+                answer_error = "No results retrieved — cannot generate a grounded answer."
+            else:
+                max_score = max(r.score for r in results)
+                if max_score < rag_min_score:
+                    answer_error = (
+                        f"Retrieved context confidence too low (best={max_score:.3f} < threshold={rag_min_score:.2f}). "
+                        "Try a more specific query."
+                    )
+                else:
+                    try:
+                        gen_start = time.perf_counter()
 
-    return ChatRetrieveResponse(
-        session_id=req.session_id,
-        query=raw_query,
-        rewritten_query=rewritten_query,
-        intent=req.intent,
-        search_mode=search_mode,
-        total_results=len(results),
-        total_dropped=len(dropped),
-        latency_ms=elapsed_ms,
-        results=results,
-        answer=answer,
-        answer_model=answer_model,
-        answer_latency_ms=answer_latency_ms,
-        answer_error=answer_error,
-        debug_info=debug_info,
-    )
+                        tenant_prompt_prefix = ""
+                        if _cfg_chat is not None:
+                            from app.core.prompts.ssot import resolve_prompt_ssot
+
+                            _ps = resolve_prompt_ssot(_cfg_chat)
+                            prompt_template_id_effective = (
+                                _cfg_chat.retrieval.prompt_template_id
+                                if _cfg_chat.retrieval
+                                else None
+                            ) or _ps.effective_template_id
+                            if _ps.instructions:
+                                tenant_prompt_prefix = _ps.instructions + "\n\n---\n\n"
+                                prompt_template_resolved = _ps.library_found or _ps.source in (
+                                    "legacy_inline",
+                                    "preset_mapped",
+                                    "default_builtin",
+                                )
+                                prompt_template_source = (
+                                    "config"
+                                    if _ps.source in ("library", "preset_mapped")
+                                    else _ps.source
+                                )
+                            elif prompt_template_id_effective:
+                                logger.warning(
+                                    "[ChatRetrieve] prompt SSOT id=%r not resolved; "
+                                    "using default compliance block only.",
+                                    prompt_template_id_effective,
+                                )
+
+                        top_chunks = results[:req.max_context_chunks]
+                        context_chunks_sent_to_llm = len(top_chunks)
+                        context_parts = [
+                            f"[Source {i}] (score={c.score:.3f})\n{c.text.strip()}"
+                            for i, c in enumerate(top_chunks, 1)
+                        ]
+                        context_str = "\n\n---\n\n".join(context_parts)
+    
+                        # ── Context sanitization: PII redaction on retrieved text ─
+                        _ctx_scan = _security_scan_text(
+                            context_str, context="retrieved_context",
+                        )
+                        _sanitized_context = _ctx_scan.redacted_text
+                        _ctx_pii_redacted = _sanitized_context != context_str
+                        if _sanitized_context != context_str:
+                            logger.info(
+                                "[ChatRetrieve] Context sanitized before LLM — "
+                                "PII redacted from retrieved chunks"
+                            )
+                            context_str = _sanitized_context
+    
+                        embed_focus = embed_text.strip()
+                        raw_trim = raw_query.strip()
+    
+                        tokens_missing_from_passages = [
+                            k for k in strict_detail_grounding_keys
+                            if not _token_appears_in_passages(context_str, k)
+                        ]
+                        skipped_llm_grounding_miss = bool(
+                            strict_detail_grounding_keys and tokens_missing_from_passages,
+                        )
+    
+                        identifier_focus_block = ""
+                        if detail_focus_token:
+                            identifier_focus_block = (
+                                f"PRIMARY IDENTIFIER IN FOCUS: {detail_focus_token}\n"
+                                "Prioritize sentences that mention this exact token verbatim. "
+                                "Every factual claim about this identifier must cite [Source n]. "
+                                "Do not refuse when any passage contains this token.\n\n"
+                            )
+                        if embed_focus != raw_trim:
+                            question_block = identifier_focus_block + (
+                                f"USER MESSAGE (latest):\n{raw_trim}\n\n"
+                                f"RETRIEVAL FOCUS (embeddings keyword search targeted this):\n{embed_focus}\n"
+                                "Answer the USER MESSAGE using ONLY the passages. "
+                                "Use the retrieval focus as context for why these passages appear.\n"
+                            )
+                        else:
+                            question_block = identifier_focus_block + f"USER MESSAGE:\n{raw_trim}\n\n"
+    
+                        if trace:
+                            _chunks_meta: List[Dict[str, Any]] = [
+                                {
+                                    "rank": c.rank,
+                                    "chunk_id": c.chunk_id,
+                                    "score": c.score,
+                                    "text_chars": len(c.text or ""),
+                                    "text_digest": chunk_text_digest(c.text or ""),
+                                }
+                                for c in top_chunks
+                            ]
+                            trace.add_event(
+                                "L2",
+                                "context_injection",
+                                _trace_lap(),
+                                {
+                                    "max_context_chunks": req.max_context_chunks,
+                                    "chunks_sent": len(top_chunks),
+                                    "hash_context_post_pii": text_digest_utf8(context_str),
+                                    "pii_redacted_from_context": _ctx_pii_redacted,
+                                    "retrieval_focus_differs_from_raw": embed_focus != raw_trim,
+                                    "chunks": _chunks_meta,
+                                    "strict_detail_grounding_keys": strict_detail_grounding_keys,
+                                    "tokens_missing_from_passages": tokens_missing_from_passages,
+                                    "skipped_llm_grounding_miss": skipped_llm_grounding_miss,
+                                    "request_top_k": req.top_k,
+                                    "max_semantic_score": round(max_score, 5),
+                                },
+                            )
+    
+                        # Passages were selected using `embed_text` (rewrite / HyDE), but we used to ask
+                        # the LLM only `raw_query` — small models often refuse when those diverge.
+    
+                        refusal_scrubbed = False
+                        raw_answer = ""
+                        rag_llm_resp: Any = None
+                        rag_prompt = ""
+                        if skipped_llm_grounding_miss:
+                            answer = _GROUNDING_REFUSAL_PHRASE
+                            logger.info(
+                                "[ChatRetrieve] Grounding gate — token(s) not in retrieved passages: %s "
+                                "| top_k=%s chunks_to_llm=%d",
+                                tokens_missing_from_passages,
+                                req.top_k,
+                                len(top_chunks),
+                            )
+                        else:
+                            rag_prompt = (
+                                f"{tenant_prompt_prefix}"
+                                f"{_chat_rag_compliance_block()}"
+                                f"{question_block}\n"
+                                f"RETRIEVED PASSAGES:\n{context_str}\n\n"
+                                "ANSWER (grounded, with citations):"
+                            )
+
+                            # #region agent log
+                            _agent_debug_ndjson(
+                                hypothesis_id="H1",
+                                location="retrieve_chat_api:pre_rag_generate",
+                                message="before_llm_generate",
+                                data={
+                                    "has_focus_token": bool(detail_focus_token),
+                                    "context_chars": len(context_str or ""),
+                                },
+                            )
+                            # #endregion
+
+                            resp = None
+                            try:
+                                resp = llm.generate(rag_prompt, temperature=0.0, max_tokens=1200)
+                            except BaseException as _gen_exc:
+                                # Transport timeouts / disconnects → deterministic excerpts when possible.
+                                if (
+                                    _chat_llm_transport_exc(_gen_exc)
+                                    and detail_focus_token
+                                    and context_str.strip()
+                                ):
+                                    transport_exc_name = type(_gen_exc).__name__
+                                    logger.warning(
+                                        "[ChatRetrieve] RAG llm.generate transport failure "
+                                        "(attempting Layer 5 focus fallback): %s",
+                                        transport_exc_name,
+                                        exc_info=True,
+                                    )
+                                    # #region agent log
+                                    _agent_debug_ndjson(
+                                        hypothesis_id="H2",
+                                        location="retrieve_chat_api:ragen_transport_exc",
+                                        message="transport_failure_focus_path",
+                                        data={"exc_type": transport_exc_name},
+                                    )
+                                    # #endregion
+                                    fb_exc = _build_focus_fallback_answer(
+                                        context_str, detail_focus_token
+                                    )
+                                    if fb_exc:
+                                        answer = fb_exc
+                                        focus_fallback_used = True
+                                        raw_answer = ""
+                                        rag_llm_resp = None
+                                        answer, identifier_dedupe_applied = _dedupe_identifier_lines(answer)
+                                        # #region agent log
+                                        _agent_debug_ndjson(
+                                            hypothesis_id="H3",
+                                            location="retrieve_chat_api:after_timeout_fallback",
+                                            message="focus_fallback_answer_set",
+                                            data={
+                                                "answer_chars": len(answer or ""),
+                                                "focus_fallback_used": True,
+                                            },
+                                        )
+                                        # #endregion
+                                        logger.info(
+                                            "[ChatRetrieve] Transport failure — excerpts from "
+                                            "passages | token=%s",
+                                            detail_focus_token,
+                                        )
+                                    else:
+                                        answer_error = (
+                                            f"LLM transport failure ({transport_exc_name}); "
+                                            "could not build deterministic excerpts for focus token."
+                                        )
+                                        raw_answer = ""
+                                        rag_llm_resp = None
+                                else:
+                                    raise _gen_exc
+
+                            if transport_exc_name is None and resp is not None:
+                                rag_llm_resp = resp
+                                raw_answer = (resp.text or "").strip()
+                                if raw_answer:
+                                    sanitized, refusal_scrubbed = _strip_contradictory_refusal(raw_answer)
+                                    answer = sanitized
+                                    if refusal_scrubbed:
+                                        logger.info(
+                                            "[ChatRetrieve] Stripped contradictory refusal hedge "
+                                            "after grounded excerpts (small-LLM pattern)"
+                                        )
+                                    if answer is not None:
+                                        answer, identifier_dedupe_applied = _dedupe_identifier_lines(answer)
+                                        answer, focus_fallback_used = _maybe_focus_fallback_answer(
+                                            answer, context_str, detail_focus_token
+                                        )
+                                        if focus_fallback_used and answer:
+                                            answer, _extra_dedupe = _dedupe_identifier_lines(answer)
+                                            identifier_dedupe_applied = (
+                                                identifier_dedupe_applied or _extra_dedupe
+                                            )
+                                        if identifier_dedupe_applied:
+                                            logger.info(
+                                                "[ChatRetrieve] P2 identifier line dedupe applied"
+                                            )
+                                        if focus_fallback_used:
+                                            logger.info(
+                                                "[ChatRetrieve] P3 focus fallback applied | "
+                                                "token=%s",
+                                                detail_focus_token,
+                                            )
+                                else:
+                                    answer_error = "LLM returned an empty response."
+    
+                        if trace:
+                            if skipped_llm_grounding_miss:
+                                trace.add_event(
+                                    "L3",
+                                    "llm_skipped_grounding_gate",
+                                    _trace_lap(),
+                                    {
+                                        "tokens_missing_from_passages": tokens_missing_from_passages,
+                                        "prompt_template_source": prompt_template_source,
+                                        "prompt_template_id_effective": prompt_template_id_effective,
+                                    },
+                                )
+                            else:
+                                l3_payload: Dict[str, Any] = {
+                                    **llm_usage_payload(rag_llm_resp),
+                                    "llm_provider": llm_provider,
+                                    "llm_model": llm_model_name,
+                                    "max_tokens": 1200,
+                                    "temperature": 0.0,
+                                    "prompt_template_source": prompt_template_source,
+                                    "prompt_template_id_effective": prompt_template_id_effective,
+                                }
+                                if transport_exc_name:
+                                    l3_payload["transport_recovery"] = transport_exc_name
+                                    l3_payload["focus_fallback_after_transport"] = bool(
+                                        focus_fallback_used
+                                    )
+                                if rag_chat_trace_include_prompt_hash() and rag_prompt:
+                                    l3_payload["hash_rag_prompt"] = text_digest_utf8(rag_prompt)
+                                    l3_payload["rag_prompt_chars"] = len(rag_prompt)
+                                _ev = (
+                                    "llm_generate_transport_recovery"
+                                    if transport_exc_name
+                                    else "llm_generate"
+                                )
+                                trace.add_event(
+                                    "L3",
+                                    _ev,
+                                    _trace_lap(),
+                                    l3_payload,
+                                )
+                            trace.add_event(
+                                "L4",
+                                "post_process",
+                                _trace_lap(),
+                                {
+                                    "refusal_scrubbed": refusal_scrubbed,
+                                    "identifier_dedupe_applied": identifier_dedupe_applied,
+                                    "hash_answer": text_digest_utf8(answer or ""),
+                                    "answer_chars": len(answer or ""),
+                                },
+                            )
+                            trace.add_event(
+                                "L5",
+                                "focus_fallback",
+                                _trace_lap(),
+                                {
+                                    "focus_fallback_used": focus_fallback_used,
+                                    "detail_focus_token": detail_focus_token,
+                                },
+                            )
+    
+                        answer_latency_ms = round((time.perf_counter() - gen_start) * 1000, 2)
+                    except Exception as e:
+                        logger.warning("[ChatRetrieve] LLM answer failed: %s", e, exc_info=True)
+                        answer_error = f"LLM generation error: {str(e)[:300]}"
+    
+        # ── Debug info ───────────────────────────────────────────────────────────
+        debug_info: Dict[str, Any] = {
+            "client_id": retrieve_cid,
+            "embedder": rc.embedder_type,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model_name,
+            "vectordb": rc.vectordb_type,
+            "collection": rc.collection,
+            "chunking_strategy": rc.chunking_strategy,
+            "search_mode": search_mode,
+            "intent": req.intent,
+            "reranker_used": reranker_used,
+            "score_gate_threshold": rag_min_score,
+            "max_score": round(max(r.score for r in results), 4) if results else None,
+            "hyde_enabled": req.enable_hyde,
+            "hyde_skipped_for_identifier": hyde_skipped_for_identifier,
+            "detail_focus_token": detail_focus_token,
+            "strict_detail_grounding_keys": strict_detail_grounding_keys,
+            "request_top_k": req.top_k,
+            "max_context_chunks": req.max_context_chunks,
+            "ranked_results_count": len(results),
+            "context_chunks_sent_to_llm": context_chunks_sent_to_llm,
+            "skipped_llm_grounding_miss": skipped_llm_grounding_miss,
+            "tokens_missing_from_passages": tokens_missing_from_passages,
+            "identifier_dedupe_applied": identifier_dedupe_applied,
+            "focus_fallback_used": focus_fallback_used,
+            "llm_transport_error": transport_exc_name,
+            "prompt_template_id_effective": prompt_template_id_effective,
+            "prompt_template_resolved": prompt_template_resolved,
+            "prompt_template_source": prompt_template_source,
+            "query_rewritten": rewritten_query is not None,
+            "rag_tracing": trace is not None,
+            "rag_trace_id": trace.trace_id if trace else None,
+            "security_scan": {
+                "pii_detected": scan_result.has_pii,
+                "injection_detected": scan_result.injection_detected,
+            },
+        }
+    
+        logger.info(
+            "[ChatRetrieve] session=%s query='%s' rewritten=%s results=%d latency=%.0fms",
+            req.session_id, raw_query[:60], rewritten_query is not None, len(results), elapsed_ms,
+        )
+    
+        return ChatRetrieveResponse(
+            session_id=req.session_id,
+            query=raw_query,
+            rewritten_query=rewritten_query,
+            intent=req.intent,
+            search_mode=search_mode,
+            total_results=len(results),
+            total_dropped=len(dropped),
+            latency_ms=elapsed_ms,
+            results=results,
+            answer=answer,
+            answer_model=answer_model,
+            answer_latency_ms=answer_latency_ms,
+            answer_error=answer_error,
+            debug_info=debug_info,
+        )
+    except HTTPException as e:
+        if trace:
+            det = e.detail
+            if isinstance(det, str):
+                msg = det[:500]
+            else:
+                import json as _json
+                try:
+                    msg = _json.dumps(det, ensure_ascii=False)[:500]
+                except Exception:
+                    msg = repr(det)[:500]
+            trace.error_state = {
+                "stage": "http",
+                "type": "HTTPException",
+                "message": msg,
+            }
+        raise
+    except Exception as e:
+        if trace and trace.error_state is None:
+            trace.set_error("exception", e)
+        raise
+    finally:
+        if trace:
+            trace.emit_final()

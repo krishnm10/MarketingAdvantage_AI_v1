@@ -2,7 +2,6 @@
 # app/api/v2/ingestion_admin_api.py
 # =============================================
 import asyncio
-import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,13 +16,18 @@ from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 
 # ✅ PERMANENT FIX: removed get_embedder, get_chroma_collection
 # Use _get_pipeline() directly — works with ANY backend (Chroma, Qdrant, Milvus...)
-from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2, _get_pipeline
+from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2, _get_pipeline, _normalize_business_id
 from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 from app.services.ingestion.tenant_guard import resolve_tenant_from_db_record
 from app.llm.llm_client import run_llm_normalization
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
-from app.utils.tenant_validator import validate_tenant_id, TenantValidationError
+from app.utils.tenant_validator import (
+    validate_tenant_id_strict,
+    get_storage_uuid,
+    TenantValidationError,
+    TenantContext,
+)
 from app.utils.tenant_storage_uuid import storage_business_uuid_for_tenant
 
 router = APIRouter(
@@ -32,27 +36,22 @@ router = APIRouter(
 )
 
 
-def _assert_filescoped_to_tenant(file: IngestedFileV2, tenant_id: Optional[str]) -> None:
+def _assert_filescoped_to_tenant(file: IngestedFileV2, tenant_ctx: TenantContext) -> None:
     """
     Enforce isolation when requesting file detail/chunks scoped to tenant_id.
+    
+    Args:
+        file: The file record to check
+        tenant_ctx: Validated tenant context (REQUIRED - caller must validate first)
+    
+    Raises:
+        HTTPException 404 if file does not belong to the tenant
     """
-    if not tenant_id or not str(tenant_id).strip():
-        return
-    try:
-        ctx = validate_tenant_id(
-            str(tenant_id).strip(),
-            source="query",
-            endpoint="ingestion_admin_scope",
-            allow_default=True,
-        )
-    except TenantValidationError:
-        raise HTTPException(status_code=422, detail="Invalid tenant_id") from None
-
-    scoped_uuid = storage_business_uuid_for_tenant(ctx.tenant_id, None)
+    scoped_uuid = get_storage_uuid(tenant_ctx)
     if file.business_id == scoped_uuid:
         return
     # Legacy uploads before deterministic UUID wiring (typically default tenant).
-    if ctx.tenant_id == "default" and file.business_id is None:
+    if tenant_ctx.tenant_id == "default" and file.business_id is None:
         return
 
     raise HTTPException(status_code=404, detail="File not found")
@@ -63,36 +62,36 @@ def _assert_filescoped_to_tenant(file: IngestedFileV2, tenant_id: Optional[str])
 # ===========================================================
 @router.get("/files")
 async def list_ingested_files(
-    tenant_id: Optional[str] = Query(
-        None,
-        description="When set, return only ingestion rows belonging to this tenant (isolated slice).",
+    tenant_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant identifier to scope file listing (tenant isolation).",
     ),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
-    """Returns a list of ingested files; optional tenant isolation via tenant_id."""
-    stmt = select(IngestedFileV2)
-    if tenant_id is not None and str(tenant_id).strip():
-        try:
-            ctx = validate_tenant_id(
-                str(tenant_id).strip(),
-                source="query",
-                endpoint="ingestion_admin_files",
-                allow_default=True,
-            )
-        except TenantValidationError as e:
-            raise HTTPException(status_code=422, detail=str(e)) from e
+    """Returns a list of ingested files for the specified tenant (mandatory tenant isolation)."""
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            tenant_id,
+            source="query",
+            endpoint="ingestion_admin_files",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
 
-        scoped_uuid = storage_business_uuid_for_tenant(ctx.tenant_id, None)
-        if ctx.tenant_id == "default":
-            stmt = stmt.where(
-                or_(
-                    IngestedFileV2.business_id == scoped_uuid,
-                    IngestedFileV2.business_id.is_(None),
-                )
+    scoped_uuid = get_storage_uuid(tenant_ctx)
+    stmt = select(IngestedFileV2)
+    if tenant_ctx.tenant_id == "default":
+        stmt = stmt.where(
+            or_(
+                IngestedFileV2.business_id == scoped_uuid,
+                IngestedFileV2.business_id.is_(None),
             )
-        else:
-            stmt = stmt.where(IngestedFileV2.business_id == scoped_uuid)
+        )
+    else:
+        stmt = stmt.where(IngestedFileV2.business_id == scoped_uuid)
 
     stmt = stmt.order_by(IngestedFileV2.created_at.desc())
     result = await db.execute(stmt)
@@ -122,14 +121,28 @@ async def list_ingested_files(
 @router.get("/files/{file_id}")
 async def get_file_detail(
     file_id: str,
-    tenant_id: Optional[str] = Query(None, description="Scope check — rejects files outside tenant"),
+    tenant_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant identifier to scope file access (tenant isolation).",
+    ),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            tenant_id,
+            source="query",
+            endpoint="ingestion_admin_file_detail",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
     file = await db.get(IngestedFileV2, file_id)
     if not file:
         raise HTTPException(status_code=404, detail="File not found")
-    _assert_filescoped_to_tenant(file, tenant_id)
+    _assert_filescoped_to_tenant(file, tenant_ctx)
     return {
         "id":               str(file.id),
         "file_name":        file.file_name,
@@ -155,14 +168,28 @@ async def get_file_detail(
 @router.get("/files/{file_id}/chunks")
 async def list_file_chunks(
     file_id: str,
-    tenant_id: Optional[str] = Query(None, description="Scope check — rejects files outside tenant"),
+    tenant_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant identifier to scope chunk access (tenant isolation).",
+    ),
     db: AsyncSession = Depends(get_db),
     user=Depends(require_role("admin", "editor", "viewer")),
 ):
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            tenant_id,
+            source="query",
+            endpoint="ingestion_admin_chunks",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
     parent = await db.get(IngestedFileV2, file_id)
     if not parent:
         raise HTTPException(status_code=404, detail="File not found")
-    _assert_filescoped_to_tenant(parent, tenant_id)
+    _assert_filescoped_to_tenant(parent, tenant_ctx)
 
     result = await db.execute(
         select(IngestedContentV2, GlobalContentIndexV2)
@@ -225,6 +252,7 @@ async def retry_ingestion(
 # ===========================================================
 class ChunkUpdatePayload(BaseModel):
     cleaned_text: str
+    tenant_id: str   # REQUIRED: tenant scope for update validation
     llm_mode: str | None = None   # None | "factual" | "creative"
 
 
@@ -238,11 +266,29 @@ async def update_chunk(
     """
     Edits a chunk's cleaned_text, optionally using LLM normalization,
     then re-embeds and upserts the vector via the pluggable pipeline.
+    
+    Tenant isolation: Validates that the chunk belongs to the specified tenant.
     Role: admin, editor
     """
+    # ── 0. Validate tenant ────────────────────────────────────────
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            payload.tenant_id,
+            source="body",
+            endpoint="chunk_update",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
     # ── 1. Fetch chunk ────────────────────────────────────────────
     chunk = await db.get(IngestedContentV2, chunk_id)
     if not chunk:
+        raise HTTPException(status_code=404, detail="Chunk not found")
+    
+    # ── 1b. Verify tenant ownership ───────────────────────────────
+    scoped_uuid = get_storage_uuid(tenant_ctx)
+    chunk_bid = chunk.business_id
+    if chunk_bid and str(chunk_bid) != str(scoped_uuid):
         raise HTTPException(status_code=404, detail="Chunk not found")
 
     original_text = chunk.cleaned_text or chunk.text
@@ -285,6 +331,10 @@ async def update_chunk(
     embedder = pipeline.embedder
     vectordb = pipeline.vectordb
 
+    from app.core.config.client_config_resolver import get_client_config
+
+    vdb_collection = get_client_config(_normalize_business_id(chunk.business_id)).vectordb.collection
+
     loop   = asyncio.get_running_loop()
     vector = await loop.run_in_executor(
         None, lambda: embedder.embed_query(final_text)
@@ -293,7 +343,7 @@ async def update_chunk(
     await loop.run_in_executor(
         None,
         lambda: vectordb.upsert(
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
+            collection=vdb_collection,
             doc_id=(gci.semantic_hash if gci else chunk.semantic_hash),
             embedding=vector,
             text=final_text,

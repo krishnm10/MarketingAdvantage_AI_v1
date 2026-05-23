@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>UI retrieve / RAG-lite — numbered architecture</title>
+  <style>
+    body { font-family: "Segoe UI", system-ui, sans-serif; margin: 1.25rem 2rem; color: #1a1a1a; max-width: 92rem; line-height: 1.45; }
+    h1 { font-size: 1.35rem; border-bottom: 2px solid #2563eb; padding-bottom: 0.35rem; }
+    h2 { font-size: 1.05rem; margin-top: 2rem; color: #1e40af; }
+    .meta { background: #f1f5f9; padding: 0.9rem 1rem; border-radius: 8px; font-size: 0.9rem; margin: 1rem 0; }
+    .mermaid { overflow-x: auto; background: #fafafa; padding: 1rem; border-radius: 8px; margin: 1rem 0; border: 1px solid #e2e8f0; }
+    table { border-collapse: collapse; width: 100%; font-size: 0.82rem; margin: 1rem 0; }
+    th, td { border: 1px solid #cbd5e1; padding: 0.45rem 0.55rem; vertical-align: top; text-align: left; }
+    th { background: #e2e8f0; }
+    .cfg { font-family: ui-monospace, monospace; font-size: 0.78rem; color: #0f172a; }
+    code { background: #f1f5f9; padding: 0.1rem 0.35rem; border-radius: 4px; font-size: 0.85em; }
+    @media print { .no-print { display: none; } h2 { page-break-after: avoid; } }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({ startOnLoad: true, theme: "neutral", sequence: { mirrorActors: false } });</script>
+</head>
+<body>
+
+<h1>Enterprise retrieval from admin UI — detailed numbered flow</h1>
+
+<p class="meta no-print">
+  <strong>Scope:</strong> Dashboard retrieve page
+  <code>app/frontend-admin/app/dashboard/retrieve/page.tsx</code> →
+  <code>POST /api/v2/retrieve/query</code> in <code>app/api/v2/retrieve_api.py</code>.
+  <strong>Concurrency:</strong> Request is handled <strong>synchronously</strong> in the API process (no Celery queue for this path).
+  <strong>PDF:</strong> Print from Chrome/Edge. If Mermaid fails on <code>file://</code>, run <code>python -m http.server 8765</code> in this folder.
+</p>
+
+<div class="meta">
+  <strong>Config authority at query time:</strong><br />
+  <span class="cfg">resolve_config_or_fail(client_id)</span> in
+  <code>app/retrieval/components.py</code> calls
+  <code>get_client_config</code> (<code>client_config_resolver.py</code>). On success,
+  <span class="cfg">resolve_runtime_components(ClientConfig)</span> yields frozen
+  <code>RuntimeComponents</code> (embedder/vectordb/collection/LLM/reranker defaults from JSON).<br />
+  <strong>Legacy fallback:</strong> If resolution fails and
+  <code>ENABLE_LEGACY_ENV_FALLBACK</code> is truthy (or <code>client_id == "default"</code>),
+  <span class="cfg">resolve_runtime_components_legacy()</span> uses env vars such as
+  <code>MAI_EMBEDDER</code>, <code>MAI_VECTORDB</code>, <code>MAI_COLLECTION</code>, <code>MAI_RERANKER</code>.<br />
+  <strong>Vector DB handle for search:</strong> When mode is
+  <code>authoritative_config</code>, the API builds
+  <code>RetrievalRepository(db_session, vectordb=_pipe.vectordb, collection=rc.collection)</code>
+  using <span class="cfg">_get_pipeline(retrieve_cid)</span> from
+  <code>ingestion_service_v2.py</code> so search uses the same vectordb instance as the merged config.
+  Otherwise <code>RetrievalRepository(db_session=db)</code> alone (legacy path in repository).<br />
+  <strong>Query embedding:</strong> <code>_embed_in_thread</code> → <code>_embed_query</code> →
+  <code>get_embedder(business_id)</code> → <code>_get_ingestion_pipeline(business_id)</code>
+  (ingestion-grade embedder only; matches indexed vectors for that tenant).<br />
+  <strong>Security (query-time):</strong> Before any external call (embedder / LLM),
+  <code>security_middleware.scan_text(req.query, context="retrieve_query")</code>.
+  Injection → HTTP 400. PII → <code>redacted_text</code> drives embedding (and HyDE builds on original question text in prompt but replaces <code>embed_text</code> with hypothetical answer when HyDE succeeds).<br />
+  <strong>Context before LLM:</strong> When <code>generate_answer</code> is true, concatenated chunk text is scanned again with
+  <code>context="retrieved_context"</code>; redacted text is passed in the RAG prompt.
+</div>
+
+<h2>1 — Sequence diagram (numbered messages)</h2>
+<p>Numbers appear on arrows. <code>repository.close()</code> runs in <code>finally</code> immediately after <code>runtime.retrieve</code>; post-processing (BM25/RRF, cross-encoder, threshold, response, optional LLM) uses in-memory <code>ranked_results</code> only.</p>
+
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  actor User as User
+  participant UI as dashboard/retrieve/page.tsx
+  participant AX as lib/apiClient.ts
+  participant MN as app/main.py
+  participant API as retrieve_api.py
+  participant RG as auth/guards.py
+  participant TV as tenant_validator.py
+  participant TU as tenant_storage_uuid.py
+  participant CMP as retrieval/components.py
+  participant SEC as security_middleware.py
+  participant ISV as ingestion_service_v2.py
+  participant PF as pipeline_factory.py
+  participant RR as retrieval/repository.py
+  participant RT as retrieval/runtime.py
+  participant BM as bm25_index.py + rrf_fusion.py
+  participant RRN as core/rerankers/*
+  participant LLM as core/llms/*
+
+  User->>UI: Enter query options tenant
+  UI->>UI: handleSubmit build JSON payload client_id from useTenant
+  UI->>AX: POST /api/v2/retrieve/query JSON
+  AX->>AX: Bearer authToken interceptor
+  AX->>MN: HTTPS
+  MN->>API: retrieve_query RetrieveRequest
+  API->>RG: require_role admin
+  RG-->>API: user OK
+  API->>TV: validate_tenant_id_strict client_id body
+  TV-->>API: tenant_ctx
+  API->>TU: get_storage_uuid_str tenant_ctx
+  TU-->>API: storage UUID string
+  API->>CMP: resolve_config_or_fail retrieve_cid
+  CMP-->>API: ClientConfig or None + runtime_mode
+  alt authoritative
+    API->>CMP: resolve_runtime_components config
+  else legacy fallback
+    API->>CMP: resolve_runtime_components_legacy
+  end
+  CMP-->>API: RuntimeComponents rc
+  API->>API: map intent answer explore audit
+  API->>SEC: scan_text req.query retrieve_query
+  SEC-->>API: redacted embed_text injection flag
+  alt injection
+    API-->>AX: 400 rejected
+  end
+  opt enable_hyde and LLM available
+    API->>LLM: generate hypothetical paragraph from req.query
+    LLM-->>API: text may replace embed_text
+  end
+  API->>ISV: asyncio.to_thread _embed_query embed_text retrieve_cid
+  Note over ISV: get_embedder → _get_ingestion_pipeline → embedder.encode
+  ISV-->>API: query_embedding vector
+  alt authoritative_config
+    API->>ISV: _get_pipeline retrieve_cid
+    ISV-->>API: pipeline with vectordb
+    API->>RR: RetrievalRepository db vectordb rc.collection
+  else legacy
+    API->>RR: RetrievalRepository db_session only
+  end
+  API->>RT: RetrievalRuntime repository DEFAULT_POLICY_REGISTRY
+  API->>RT: retrieve ctx QueryContext query original req.query embedding vector tenant storage_uuid top_k override
+  RT->>RR: fetch_candidates embedding recall_limit tenant filters
+  RR-->>RT: candidates
+  RT->>RT: policy decide score rank explain
+  RT-->>API: ranked_results dropped
+  API->>RR: close repository
+  opt search_mode hybrid or keyword
+    API->>BM: BM25Index build from ranked BM25 search reciprocal_rank_fusion optional
+    BM-->>API: reordered ranked_results
+  end
+  opt rc.reranker_name not none
+    API->>RRN: reranker_registry.build rerank req.query candidates
+    RRN-->>API: rescored order
+  end
+  opt similarity_threshold gt 0
+    API->>API: filter by score
+  end
+  API->>API: build ResultItem list debug_info
+  opt generate_answer and results and score gate RAG_ANSWER_MIN_SCORE
+    API->>SEC: scan_text context_str retrieved_context
+    SEC-->>API: sanitized context for prompt
+    API->>LLM: generate enterprise RAG prompt
+    LLM-->>API: answer text or error surface
+  end
+  API-->>AX: RetrieveResponse results answer debug_info
+  AX-->>UI: res.data history prepend
+  UI->>User: show chunks citations optional answer panel
+</div>
+
+<h2>1b — Inside <code>RetrievalRuntime.retrieve</code> (policy + recall + scoring)</h2>
+<p>Matches <code>app/retrieval/runtime.py</code>: resolve intent policy, wide recall, vectordb+SQL hydration in repository, trust decision, <code>compute_final_score</code>, <code>build_explanation</code>.</p>
+
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant RT as retrieval/runtime.py
+  participant POL as retrieval/policy.py
+  participant RR as retrieval/repository.py
+  participant SCR as retrieval/scorer.py
+  participant EXP as retrieval/explain.py
+  participant VDB as core/vectordb adapter
+  participant DB as PostgreSQL content rows
+
+  RT->>POL: policy_registry.resolve ctx.intent
+  POL-->>RT: policy max_results rules
+  RT->>RT: effective_max from override or policy recall_limit
+  RT->>RR: fetch_candidates query_embedding limit recall_limit tenant_id storage_uuid
+  RR->>VDB: vector search scoped
+  RR->>DB: hydrate chunk text metadata if needed
+  RR-->>RT: RetrievalCandidate list
+  loop each candidate
+    RT->>POL: policy.decide candidate
+    POL-->>RT: TrustDecision
+    alt REJECTED
+      RT->>RT: append dropped
+    else
+      RT->>SCR: compute_final_score candidate policy
+      SCR-->>RT: final_score or None
+      RT->>EXP: build_explanation
+      EXP-->>RT: explanation dict
+      RT->>RT: append RankedResult
+    end
+  end
+  RT-->>RT: sort by score return ranked dropped
+</div>
+
+<h2>2 — Layer diagram (where code lives)</h2>
+<div class="mermaid">
+flowchart TB
+  subgraph FE["Browser / Next.js"]
+    A[dashboard/retrieve/page.tsx]
+    B[apiClient.ts + auth]
+    C[TenantContext clientId]
+  end
+  subgraph API["FastAPI"]
+    D[main.py include_router]
+    E[retrieve_api.py retrieve_query]
+    F[guards require_role admin]
+  end
+  subgraph CFG["Configuration"]
+    G[components.resolve_config_or_fail]
+    H[client_config_resolver.get_client_config]
+    I[RuntimeComponents]
+  end
+  subgraph SEC["Query-time security"]
+    S1[security_middleware.scan_text]
+  end
+  subgraph EMB["Embedding (tenant ingest pipeline)"]
+    J[get_embedder / _get_ingestion_pipeline]
+    K[pipeline_factory.build]
+  end
+  subgraph RET["Retrieval core"]
+    L[RetrievalRepository]
+    M[RetrievalRuntime + policy]
+    N[vectordb + SQL hydration]
+  end
+  subgraph POST["API post-process (same request)"]
+    P[BM25 + RRF optional]
+    Q[cross-encoder rerank optional]
+    R[similarity_threshold]
+    T[optional LLM RAG answer]
+  end
+  A --> B
+  C --> A
+  B --> D --> E
+  E --> F
+  E --> G --> H
+  G --> I
+  E --> S1
+  E --> J --> K
+  E --> L --> M --> N
+  E --> P --> Q --> R --> T
+</div>
+
+<h2>3 — Step table: file · method · config / data</h2>
+<table>
+  <thead>
+    <tr><th>#</th><th>Phase</th><th>File</th><th>Method / symbol</th><th>Config / env / data</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1</td><td>UI</td><td><code>app/frontend-admin/app/dashboard/retrieve/page.tsx</code></td><td><code>handleSubmit</code></td><td>JSON: <code>query</code>, <code>intent</code>, <code>client_id</code> from <code>useTenant().clientId</code>; optional <code>top_k</code>, <code>search_mode</code>, <code>enable_hyde</code>, <code>hybrid_alpha</code>, <code>similarity_threshold</code>, <code>generate_answer</code>.</td></tr>
+    <tr><td>2</td><td>UI</td><td><code>app/frontend-admin/lib/apiClient.ts</code></td><td>Axios + interceptor</td><td><code>NEXT_PUBLIC_BACKEND_API_URL</code> or default; <code>Authorization: Bearer</code>.</td></tr>
+    <tr><td>3</td><td>HTTP</td><td><code>app/main.py</code></td><td><code>include_router</code></td><td>Mounts <code>/api/v2/retrieve</code>.</td></tr>
+    <tr><td>4</td><td>Auth</td><td><code>app/auth/guards.py</code></td><td><code>require_role("admin")</code></td><td>JWT / session per app auth setup.</td></tr>
+    <tr><td>5</td><td>API</td><td><code>app/api/v2/retrieve_api.py</code></td><td><code>retrieve_query</code></td><td><code>RetrieveRequest</code> body; <code>Depends(get_db)</code>.</td></tr>
+    <tr><td>6</td><td>Tenant</td><td><code>app/utils/tenant_validator.py</code></td><td><code>validate_tenant_id_strict</code></td><td><code>TENANT_ENFORCEMENT_MODE</code>; source <code>body</code>, endpoint <code>retrieve_query</code>.</td></tr>
+    <tr><td>7</td><td>Tenant</td><td><code>app/utils/tenant_storage_uuid.py</code></td><td><code>get_storage_uuid_str</code></td><td>Stable storage UUID for vector/SQL isolation filter.</td></tr>
+    <tr><td>8</td><td>Config</td><td><code>app/retrieval/components.py</code></td><td><code>resolve_config_or_fail</code></td><td><code>get_client_config</code>; fail-fast when non-default client and <code>ENABLE_LEGACY_ENV_FALLBACK=false</code>.</td></tr>
+    <tr><td>9</td><td>Config</td><td><code>app/retrieval/components.py</code></td><td><code>resolve_runtime_components</code> / <code>resolve_runtime_components_legacy</code></td><td>Authoritative: full stack from <code>ClientConfig</code>. Legacy: <code>MAI_*</code> env vars.</td></tr>
+    <tr><td>10</td><td>Telemetry</td><td><code>app/utils/pipeline_logger.py</code></td><td><code>PipelineLogger</code></td><td>Path <code>retrieve_api</code>; embedder/vectordb labels from <code>rc</code>.</td></tr>
+    <tr><td>11</td><td>Security</td><td><code>app/middleware/security_middleware.py</code></td><td><code>scan_text(..., "retrieve_query")</code></td><td>Injection → 400. Else <code>embed_text = redacted_text</code>.</td></tr>
+    <tr><td>12</td><td>Branch</td><td><code>retrieve_api.py</code></td><td>HyDE optional</td><td><code>rc.llm_provider</code> selects provider; env model/API keys per provider. Hypothetical text replaces <code>embed_text</code> when long enough.</td></tr>
+    <tr><td>13</td><td>Embed</td><td><code>retrieve_api.py</code></td><td><code>_embed_in_thread</code> → <code>_embed_query</code></td><td><code>get_embedder(retrieve_cid)</code> → <code>_get_ingestion_pipeline</code>; <code>normalize_embeddings=True</code>.</td></tr>
+    <tr><td>14</td><td>Repository</td><td><code>retrieve_api.py</code> + <code>retrieval/repository.py</code></td><td><code>RetrievalRepository</code></td><td>Authoritative: <code>_get_pipeline</code> vectordb + <code>rc.collection</code>. Legacy: DB session only constructor path.</td></tr>
+    <tr><td>15</td><td>Runtime</td><td><code>app/retrieval/runtime.py</code></td><td><code>RetrievalRuntime.retrieve</code></td><td><code>QueryContext</code> carries original <code>req.query</code>; embedding passed separately. <code>DEFAULT_POLICY_REGISTRY</code>.</td></tr>
+    <tr><td>16</td><td>Recall</td><td><code>retrieval/repository.py</code></td><td><code>fetch_candidates</code></td><td>Vector query + tenant <code>storage_uuid</code>; limit from runtime recall formula.</td></tr>
+    <tr><td>17</td><td>Governance</td><td><code>retrieval/policy.py</code></td><td><code>policy.decide</code></td><td>Intent <code>answer | explore | audit</code> maps to trust rules.</td></tr>
+    <tr><td>18</td><td>Scoring</td><td><code>retrieval/scorer.py</code></td><td><code>compute_final_score</code></td><td>Combines signals per policy weights.</td></tr>
+    <tr><td>19</td><td>Cleanup</td><td><code>retrieve_api.py</code></td><td><code>finally: repository.close()</code></td><td>After retrieve; before BM25/rerank/LLM.</td></tr>
+    <tr><td>20</td><td>Hybrid</td><td><code>app/core/search/bm25_index.py</code></td><td><code>BM25Index.build/search</code></td><td>Re-ranks retrieved chunk texts with original <code>req.query</code>.</td></tr>
+    <tr><td>21</td><td>Hybrid</td><td><code>app/core/search/rrf_fusion.py</code></td><td><code>reciprocal_rank_fusion</code></td><td><code>hybrid_alpha</code> from request when <code>search_mode=hybrid</code>.</td></tr>
+    <tr><td>22</td><td>Rerank</td><td><code>app/core/rerankers/*</code> + <code>plugin_registry</code></td><td><code>reranker_registry.build</code></td><td><code>rc.reranker_name</code>, <code>rc.reranker_model</code>; failures logged, order preserved.</td></tr>
+    <tr><td>23</td><td>Filter</td><td><code>retrieve_api.py</code></td><td><code>similarity_threshold</code></td><td>Request field; filters <code>ranked_results</code> by score.</td></tr>
+    <tr><td>24</td><td>Response</td><td><code>retrieve_api.py</code></td><td><code>ResultItem</code> + <code>debug_info</code></td><td>Embeds telemetry: modes, HyDE, hybrid, reranker used, security scan summary.</td></tr>
+    <tr><td>25</td><td>RAG answer</td><td><code>retrieve_api.py</code></td><td><code>generate_answer</code> branch</td><td><code>RAG_ANSWER_MIN_SCORE</code> env (default 0.25) gates LLM call; provider from <code>rc.llm_provider</code> with provider env keys.</td></tr>
+    <tr><td>26</td><td>Security</td><td><code>security_middleware.py</code></td><td><code>scan_text(..., "retrieved_context")</code></td><td>Redacts PII in concatenated passages before LLM prompt.</td></tr>
+    <tr><td>27</td><td>LLM</td><td><code>app/core/llms/*</code></td><td>e.g. <code>OpenAILLM.generate</code></td><td>Grounded prompt with <code>[Source n]</code> citations; errors → <code>answer_error</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>4 — Related surfaces (not the main sequence)</h2>
+<ul>
+  <li><strong>Chat-style UI:</strong> <code>app/frontend-admin/app/dashboard/retrieve/chat/page.tsx</code> may call <code>retrieve_chat_api</code> — overlapping behavior, different route module.</li>
+  <li><strong>Alternate RAG API:</strong> <code>app/api/v2/rag_api.py</code> — similar grounding patterns; compare auth and middleware if unifying APIs.</li>
+  <li><strong>CLI parity:</strong> Code comments reference <code>retrieve_cli.py</code>; same embedding/retrieval concepts, different entrypoint.</li>
+  <li><strong>Metadata:</strong> Same router exposes <code>GET /api/v2/retrieve/intents</code> and <code>GET /api/v2/retrieve/pipeline-config</code> for diagnostics.</li>
+</ul>
+
+<p class="no-print" style="margin-top:2rem;font-size:0.9rem;color:#64748b;">
+  Companion: <a href="data_flow_with_files.html"><code>data_flow_with_files.html</code></a>,
+  <a href="upload_from_ui_detailed_flow.html"><code>upload_from_ui_detailed_flow.html</code></a> (ingestion),
+  <a href="request_flow_steps.csv"><code>request_flow_steps.csv</code></a> (filter flows for Excel).
+</p>
+
+</body>
+</html>

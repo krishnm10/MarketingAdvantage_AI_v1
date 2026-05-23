@@ -160,7 +160,9 @@ class ChromaVectorDB(BaseVectorDB):
                     f"     OR wipe the folder: rmdir /s /q {self._path}\n"
                     f"  3. Change embedder model back to dim={stored_dim},\n"
                     f"     OR re-ingest all documents with the new embedder.\n"
-                    f"  NEVER mix two different embedding dimensions in one collection."
+                    f"  NEVER mix two different embedding dimensions in one collection.\n"
+                    f"Multi-tenant: use a unique vectordb.collection (and/or chroma.persist_directory)\n"
+                    f"per client in Client JSON so tenants do not share one collection with different embedders."
                 )
 
             # Dimension matches (or metadata missing on old collection) — cache and return
@@ -537,11 +539,18 @@ class ChromaVectorDB(BaseVectorDB):
         persist_directory: Optional[str],
         anonymized_telemetry: bool,
     ) -> chromadb.ClientAPI:
+        # Always disable Chroma product telemetry: the bundled PostHog integration can
+        # error on dependency version skew and spam ERROR logs from background threads.
+        # The ``anonymized_telemetry`` constructor flag on ChromaVectorDB is retained for
+        # logging/parity only; Settings always turns telemetry off here.
+        _ = anonymized_telemetry  # caller intent preserved for logs / API compatibility
         settings = Settings(
-            anonymized_telemetry=anonymized_telemetry,
-            chroma_client_auth_provider="chromadb.auth.token_authn.TokenAuthClientProvider" if api_key else None,
+            anonymized_telemetry=False,
+            chroma_client_auth_provider=(
+                "chromadb.auth.token_authn.TokenAuthClientProvider" if api_key else None
+            ),
             chroma_client_auth_credentials=api_key or None,
-        ) if api_key else Settings(anonymized_telemetry=anonymized_telemetry)
+        )
 
         # ── Remote mode: HttpClient ────────────────────────────────
         if host:

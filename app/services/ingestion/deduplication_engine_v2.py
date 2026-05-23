@@ -104,58 +104,6 @@ def _l3_get_embedding(chunk_id: str) -> Optional[List[float]]:
     return None
 
 
-# ── L3 Redis embedding offload ───────────────────────────────────────────────
-# For large batches (> _L3_REDIS_THRESHOLD chunks), store precomputed embedding
-# vectors in Redis temp keys (TTL = 300s) instead of holding all in RAM.
-# Transparent fallback to in-memory if Redis is unavailable.
-_L3_REDIS_THRESHOLD = int(os.getenv("DEDUP_L3_REDIS_THRESHOLD", "500"))
-_L3_REDIS_TTL = 300  # seconds
-_l3_redis = None
-_l3_redis_checked = False
-
-
-def _get_l3_redis():
-    """Lazy-connect to Redis for L3 embedding offload. Returns None if unavailable."""
-    global _l3_redis, _l3_redis_checked
-    if _l3_redis_checked:
-        return _l3_redis
-    _l3_redis_checked = True
-    try:
-        import redis
-        url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        _l3_redis = redis.Redis.from_url(url, decode_responses=True, socket_timeout=2)
-        _l3_redis.ping()
-    except Exception:
-        _l3_redis = None
-    return _l3_redis
-
-
-def _l3_store_embedding(chunk_id: str, embedding: List[float]) -> bool:
-    """Store an embedding vector in Redis. Returns True on success."""
-    r = _get_l3_redis()
-    if r is None:
-        return False
-    try:
-        r.setex(f"mai:l3embed:{chunk_id}", _L3_REDIS_TTL, _json.dumps(embedding))
-        return True
-    except Exception:
-        return False
-
-
-def _l3_get_embedding(chunk_id: str) -> Optional[List[float]]:
-    """Retrieve an embedding vector from Redis. Returns None on miss."""
-    r = _get_l3_redis()
-    if r is None:
-        return None
-    try:
-        val = r.get(f"mai:l3embed:{chunk_id}")
-        if val:
-            return _json.loads(val)
-    except Exception:
-        pass
-    return None
-
-
 def _build_gci_metadata(chunk: Dict[str, Any]) -> Dict[str, Any]:
     """
     Keep GCI metadata small and citation-relevant.
@@ -336,7 +284,7 @@ async def check_embedding_similarity(
     once in deduplicate_chunks() and reused here without re-embedding.
     """
     try:
-        resolved_collection = collection_name or os.getenv("MAI_COLLECTION", "ingested_content")
+        resolved_collection = collection_name or "ingested_content"
 
         loop = asyncio.get_running_loop()
         hits = await loop.run_in_executor(
@@ -386,6 +334,9 @@ async def deduplicate_chunks(
     enable_embedding_dedup: bool = True,
     similarity_threshold: float = 0.95,
     collection_name: str = None,
+    l3_redis_threshold: int = 500,
+    l3_embed_batch_size: int = 64,
+    l3_search_concurrency: int = 32,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     3-Layer Deduplication Pipeline. PURE READ PHASE — zero DB writes.
@@ -583,8 +534,8 @@ async def deduplicate_chunks(
 
     if enable_embedding_dedup and l2_survivors:
         loop = asyncio.get_running_loop()
-        L3_MAX_CONCURRENCY = _safe_env_int("DEDUP_SEARCH_CONCURRENCY", 32)
-        L3_EMBED_BATCH_SIZE = _safe_env_int("DEDUP_EMBED_BATCH_SIZE", 64)
+        L3_MAX_CONCURRENCY = max(1, int(l3_search_concurrency))
+        L3_EMBED_BATCH_SIZE = max(1, int(l3_embed_batch_size))
         sem = asyncio.Semaphore(L3_MAX_CONCURRENCY)
         l3_embed_dups = 0
 
@@ -592,10 +543,10 @@ async def deduplicate_chunks(
         # carry a cached vector. This removes the old 1-request-per-chunk pattern
         # from semantic dedup and lets the active embedder use its fastest batch path.
         #
-        # For large batches (> _L3_REDIS_THRESHOLD), offload vectors to Redis
+        # For large batches (> l3_redis_threshold), offload vectors to Redis
         # temp keys to avoid holding all embeddings in RAM simultaneously.
         _use_redis_offload = (
-            len(l2_survivors) > _L3_REDIS_THRESHOLD
+            len(l2_survivors) > l3_redis_threshold
             and _get_l3_redis() is not None
         )
         uncached_chunks = [

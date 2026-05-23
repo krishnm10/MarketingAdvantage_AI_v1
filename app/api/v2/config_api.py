@@ -4,10 +4,11 @@
 # =============================================================================
 
 import json
+import logging
 import os
 import re
 import signal
-import logging
+import time
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -17,6 +18,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.guards import require_role
+from app.core.config.pipeline_runtime import DEPRECATED_PIPELINE_ENV_VARS
 from app.core.pipeline_factory import pipeline_factory
 from app.db.session_v2 import get_db
 from app.db.models.admin_audit_log import AdminAuditLog
@@ -143,6 +145,48 @@ _VALID_AI_PROFILES = {"cpu", "gpu", "api", "dist"}
 _VALID_VISION_API_PROVIDERS = {"openai", "anthropic", "google"}
 _VALID_VISION_QUANTIZE = {"none", "4bit", "8bit"}
 
+# Pipeline semantics belong in Client JSON — reject deprecated / per-tenant MAI_* switches on .env writes.
+_PIPELINE_ENV_FROM_UI_FORBIDDEN = re.compile(
+    r"^MAI_[A-Z0-9_]+_(VECTORDB|EMBEDDER|LLM|COLLECTION|SEARCH_MODE|RERANKER|RERANKER_MODEL)$"
+)
+
+# Keys migrated to merged Client JSON — reject writes from admin .env UI.
+_TENANT_JSON_PIPELINE_ENV_KEYS = frozenset({
+    "CHUNK_SIZE",
+    "CHUNK_OVERLAP",
+    "MIN_CHUNK_TOKENS",
+    "CHUNKING_TOKEN_COUNTER_CACHE_SIZE",
+    "USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING",
+    "DEFAULT_TOKENIZER_BACKEND",
+    "HF_TOKENIZER_MODEL",
+    "INGEST_BATCH_SIZE",
+    "INGEST_EMBED_PARALLELISM",
+    "EMBED_PARALLELISM",
+    "PHANTOM_EMBED_BATCH_SIZE",
+    "PHANTOM_UPSERT_BATCH_SIZE",
+    "PHANTOM_INGEST_WORKERS",
+    "PHANTOM_BLOOM_CAPACITY",
+    "MAI_DEDUP_L1_ENABLED",
+    "MAI_DEDUP_L2_ENABLED",
+    "MAI_DEDUP_L3_ENABLED",
+    "DEDUP_EMBED_BATCH_SIZE",
+    "DEDUP_SEARCH_CONCURRENCY",
+    "DEDUP_L3_REDIS_THRESHOLD",
+    "VISUAL_LLM_CONCURRENCY",
+    # Embedder / LLM model ids belong in merged Client JSON, not .env.
+    "OPENAI_EMBED_MODEL",
+    "OPENAI_LLM_MODEL",
+    "OLLAMA_EMBED_MODEL",
+    "OLLAMA_LLM_MODEL",
+    "HF_EMBED_MODEL",
+    "GROQ_LLM_MODEL",
+    "ANTHROPIC_LLM_MODEL",
+    "GEMINI_LLM_MODEL",
+    "GEMINI_EMBED_MODEL",
+    "GOOGLE_EMBED_MODEL",
+    "COHERE_EMBED_MODEL",
+})
+
 
 def _mask(key: str, val: str) -> str:
     """Return masked value for sensitive keys."""
@@ -225,6 +269,22 @@ async def update_config(
             if value not in _VALID_VISION_QUANTIZE:
                 invalid_values[key] = value
 
+    forbidden_pipeline = {
+        k for k in payload.updates
+        if k in DEPRECATED_PIPELINE_ENV_VARS
+        or _PIPELINE_ENV_FROM_UI_FORBIDDEN.match(k)
+        or k in _TENANT_JSON_PIPELINE_ENV_KEYS
+    }
+    if forbidden_pipeline:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Pipeline, chunking, tokenization, PHANTOM, dedup, and Celery dispatch settings "
+                "must be configured in merged Client JSON (RAG / tenant config APIs), not .env. "
+                f"Remove keys: {sorted(forbidden_pipeline)}"
+            ),
+        )
+
     if blocked:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -246,6 +306,27 @@ async def update_config(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=" ".join(detail_parts),
         )
+
+    # #region agent log
+    if "CHROMA_PATH" in payload.updates:
+        try:
+            _dbg_path = Path(__file__).resolve().parents[3] / "debug-2bf9cb.log"
+            _line = {
+                "sessionId": "2bf9cb",
+                "hypothesisId": "H2",
+                "location": "config_api.py:update_config",
+                "message": "global .env update includes CHROMA_PATH",
+                "data": {
+                    "keys": list(payload.updates.keys()),
+                    "chroma_path_len": len(str(payload.updates.get("CHROMA_PATH", ""))),
+                },
+                "timestamp": int(time.time() * 1000),
+            }
+            with open(_dbg_path, "a", encoding="utf-8") as _df:
+                _df.write(json.dumps(_line) + "\n")
+        except Exception:
+            pass
+    # #endregion
 
     # Read old values for audit diff BEFORE writing
     old_values = _parse_env(_ENV_PATH)
@@ -276,22 +357,17 @@ async def update_config(
     # Avoids every next request paying the full pipeline build cost.
     try:
         import asyncio as _asyncio
+        from app.middleware.security_middleware import validate_business_id
         from app.services.ingestion.ingestion_service_v2 import _get_pipeline
 
-        active_ids = [
-            v for k, v in os.environ.items()
-            if k.startswith("MAI_") and k.endswith("_VECTORDB")
-        ]
-        # Also warm up the default (no-tenant) pipeline
-        default_id = os.getenv("MAI_DEFAULT_BUSINESS_ID", "default")
+        default_id = validate_business_id(os.getenv("MAI_DEFAULT_BUSINESS_ID"))
 
         async def _warm_up():
             loop = _asyncio.get_running_loop()
-            for bid in [default_id]:
-                try:
-                    await loop.run_in_executor(None, _get_pipeline, bid)
-                except Exception as warm_exc:
-                    logger.debug("Warm-up for %s skipped: %s", bid, warm_exc)
+            try:
+                await loop.run_in_executor(None, _get_pipeline, default_id)
+            except Exception as warm_exc:
+                logger.debug("Warm-up for %s skipped: %s", default_id, warm_exc)
 
         _asyncio.ensure_future(_warm_up())
     except Exception as e:

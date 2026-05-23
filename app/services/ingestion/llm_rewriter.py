@@ -18,14 +18,35 @@ from app.config import ingestion_settings
 # -------------------------------------------------------------------
 # CONFIGURATION (kept as in your original file)
 # -------------------------------------------------------------------
-OLLAMA_URL = ingestion_settings.OLLAMA_API_URL
-MODEL_NAME = ingestion_settings.OLLAMA_MODEL
-CACHE_ENABLED = True
+def _ollama_rewrite_target() -> tuple[str, str]:
+    """Prefer default tenant Client JSON for Ollama URL/model; fallback to ingestion_settings."""
+    try:
+        from app.core.config.client_config_resolver import get_client_config
+
+        cfg = get_client_config("default")
+        if cfg.llm and cfg.llm.single and cfg.llm.single.type.value == "ollama":
+            base = (cfg.llm.single.base_url or "http://localhost:11434").rstrip("/")
+            m = cfg.llm.single.model or ingestion_settings.OLLAMA_MODEL
+            return f"{base}/api/generate", m
+    except Exception:
+        pass
+    return ingestion_settings.OLLAMA_API_URL, ingestion_settings.OLLAMA_MODEL
+
+
+def _ollama_url() -> str:
+    return _ollama_rewrite_target()[0]
+
+
+def _ollama_model() -> str:
+    return _ollama_rewrite_target()[1]
+
+
+_CACHE_ENABLED = True
 MAX_RETRIES = 3
 RETRY_DELAY_BASE = 2
 BATCH_SIZE = 8
 TIMEOUT = 180  # Increased from 60 → 180 for long content (e.g. web scraping)
-MAX_CONCURRENCY = 2 if MODEL_NAME.startswith("llama3.1:8b") else 4
+MAX_CONCURRENCY = 2 if _ollama_model().startswith("llama3.1:8b") else 4
 LATENCY_WINDOW = 20
 BACKPRESSURE_THRESHOLD = 5.0
 MIN_BACKOFF = 1.0
@@ -225,12 +246,12 @@ async def _rewrite_call(
 ) -> str:
     key = _cache_key(text)
     async with _cache_lock:
-        if CACHE_ENABLED and key in _cache:
+        if _CACHE_ENABLED and key in _cache:
             return _cache[key]
 
     prompt = create_normalization_prompt(text)
     log_info(
-        f"[llm_rewriter] Sending prompt to Ollama: model={MODEL_NAME}, len={len(prompt)} chars"
+        f"[llm_rewriter] Sending prompt to Ollama: model={_ollama_model()}, len={len(prompt)} chars"
     )
 
     close_client = False
@@ -242,8 +263,8 @@ async def _rewrite_call(
         close_client = True
 
     try:
-        payload = {"model": MODEL_NAME, "prompt": prompt, "stream": False}
-        async with client.post(OLLAMA_URL, json=payload) as response:
+        payload = {"model": _ollama_model(), "prompt": prompt, "stream": False}
+        async with client.post(_ollama_url(), json=payload) as response:
             if response.status != 200:
                 raise RuntimeError(f"Ollama returned {response.status}")
             result = await response.json()
@@ -259,7 +280,7 @@ async def _rewrite_call(
                 raise RuntimeError("Empty Ollama response")
 
             async with _cache_lock:
-                if CACHE_ENABLED:
+                if _CACHE_ENABLED:
                     _cache_put(key, output)
             return output
     finally:
@@ -312,8 +333,8 @@ async def is_llm_ready() -> bool:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=5)
         ) as session:
-            payload = {"model": MODEL_NAME, "prompt": "ping", "stream": False}
-            async with session.post(OLLAMA_URL, json=payload) as response:
+            payload = {"model": _ollama_model(), "prompt": "ping", "stream": False}
+            async with session.post(_ollama_url(), json=payload) as response:
                 return response.status == 200
     except Exception:
         return False

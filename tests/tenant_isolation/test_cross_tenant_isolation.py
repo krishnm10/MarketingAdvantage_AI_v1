@@ -383,6 +383,17 @@ class TestAdversarialAttacks:
                 tenant_id="",
             )
 
+    def test_missing_tenant_id_raises_in_multi_tenant_mode(self, seeded_vdb):
+        """Gate 1: tenant_id=None must hard-fail when isolation is enabled."""
+        assert seeded_vdb._tenant_isolation_enabled is True
+        with pytest.raises(TenantFilterViolation):
+            seeded_vdb.search(
+                collection=COLLECTION,
+                query_embedding=[1.0, 0.0, 0.0],
+                top_k=10,
+                tenant_id=None,
+            )
+
     def test_whitespace_tenant_id_raises(self, seeded_vdb):
         with pytest.raises(TenantFilterViolation):
             seeded_vdb.search(

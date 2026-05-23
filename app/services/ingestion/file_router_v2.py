@@ -211,8 +211,14 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         try:
             from app.worker.broker_config import is_celery_enabled
             if is_celery_enabled():
+                from app.core.config.client_config_resolver import (
+                    get_celery_ingestion_enqueue_kwargs,
+                )
                 from app.worker.tasks import run_ingestion_pipeline
-                task = run_ingestion_pipeline.delay(file_id, saved_path, file_ext, tenant_ctx.tenant_id)
+                task = run_ingestion_pipeline.apply_async(
+                    args=[file_id, saved_path, file_ext, tenant_ctx.tenant_id],
+                    **get_celery_ingestion_enqueue_kwargs(tenant_ctx.tenant_id),
+                )
                 _write_log(f"[QUEUED] {original_file_name} → task_id={task.id}")
                 log_info(f"[file_router_v2] Queued Celery task task_id={task.id} for {original_file_name}")
                 return {

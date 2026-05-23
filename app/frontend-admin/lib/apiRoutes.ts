@@ -40,6 +40,9 @@ export const API = {
     CUSTOMERS_RAG_DASHBOARD: () => "/api/v2/admin/customers-rag-dashboard",
     TENANT_OVERVIEW: (clientId: string) =>
       `/api/v2/admin/tenants/${encodeURIComponent(clientId)}/overview`,
+    /** Soft-delete: moves client overlay JSON/YAML to `_archived/` on the server. */
+    ARCHIVE_CLIENT_CONFIG: (clientId: string) =>
+      `/api/v2/admin/tenants/${encodeURIComponent(clientId)}/client-config`,
   },
 
   // Phase 1 — Embedding & Tokenization Alignment
@@ -84,6 +87,11 @@ export const API = {
     GET_PIPELINE:     (clientId: string) => `/api/v2/rag-config/pipeline/${encodeURIComponent(clientId)}`,
     PUT_PIPELINE:     (clientId: string) => `/api/v2/rag-config/pipeline/${encodeURIComponent(clientId)}`,
     VALIDATE_PIPELINE:(clientId: string) => `/api/v2/rag-config/pipeline/${encodeURIComponent(clientId)}/validate`,
+    PIPELINE_PLUGGABLE_GET: (clientId: string) =>
+      `/api/v2/rag-config/pipeline-pluggable/${encodeURIComponent(clientId)}`,
+    PIPELINE_PLUGGABLE_PATCH: (clientId: string) =>
+      `/api/v2/rag-config/pipeline-pluggable/${encodeURIComponent(clientId)}`,
+    TENANT_CONFIG_TEMPLATE: () => "/api/v2/rag-config/tenant-config-template",
   },
 
   // Phase 2 — Prompt Template Library
@@ -113,7 +121,12 @@ export const API = {
   MODELS: {
     LLM:       () => "/api/v2/models/llm",
     RERANKER:  () => "/api/v2/models/reranker",
-    DEFAULTS:  () => "/api/v2/models/defaults",
+    DEFAULTS:  (clientId?: string) =>
+      clientId
+        ? `/api/v2/models/defaults?client_id=${encodeURIComponent(clientId)}`
+        : "/api/v2/models/defaults",
+    RUNTIME:   (clientId: string) =>
+      `/api/v2/models/runtime?client_id=${encodeURIComponent(clientId)}`,
   },
 
   // Phase 3 — Pipeline Templates

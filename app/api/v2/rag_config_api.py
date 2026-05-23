@@ -8,6 +8,8 @@ Endpoints:
   GET  /api/v2/rag-config/query-transforms       → List query transform options
   GET  /api/v2/rag-config/pipeline/{client_id}   → Get current pipeline config
   PUT  /api/v2/rag-config/pipeline/{client_id}   → Update pipeline config
+  GET  /api/v2/rag-config/pipeline-pluggable/{client_id} → Resolved pipeline identity (JSON merges)
+  PATCH /api/v2/rag-config/pipeline-pluggable/{client_id} → Patch vectordb/embedder/llm/collection/search_mode
   POST /api/v2/rag-config/pipeline/{client_id}/validate → Validate a config
   GET  /api/v2/rag-config/reranker-rules         → Get the rules reference table
 
@@ -17,8 +19,9 @@ Design:
   - Validation runs dry-build of the pipeline without persisting.
   - GET /pipeline/{client_id} returns synthetic defaults when no file exists
     (is_default=true) so the UI can display editable defaults on first use.
-  - PUT /pipeline/{client_id} creates the config file when none exists, using
-    environment variable defaults (MAI_VECTORDB, MAI_EMBEDDER, etc.).
+  - PUT /pipeline/{client_id} creates the config file when none exists, seeded from
+    `default.json` (no MAI_* pipeline env vars).
+
   - Searches both app/core/configs/ AND configs/ at repo root (mirrors rag_api.py).
 ================================================================================
 """
@@ -27,7 +30,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -103,141 +105,110 @@ def _get_client_config_path(client_id: str) -> Optional[Path]:
 
 def _build_default_config_dict(client_id: str) -> dict:
     """
-    Build a minimal ClientConfig-compatible dict from environment variables.
-    Used when creating a new config file via PUT for an unknown client_id.
-    Falls back to safe Chroma + HuggingFace defaults if env vars are absent.
+    Seed dict for a new `{client}.json` from canonical `default` config (JSON-only).
+    Does not consult MAI_* pipeline env vars.
     """
-    vectordb_type = os.getenv("MAI_VECTORDB", "chroma").lower()
-    collection    = os.getenv("MAI_COLLECTION", "ingested_content")
-    embedder_type = os.getenv("MAI_EMBEDDER", "huggingface").lower()
-    llm_type      = os.getenv("MAI_LLM", "ollama").lower()
+    from copy import deepcopy
 
-    cfg: Dict[str, Any] = {
-        "client_id":   client_id,
-        "client_name": client_id.replace("_", " ").title(),
-        "version":     "1.0",
-        "vectordb": {
-            "type":       vectordb_type,
-            "collection": collection,
-        },
-        "embedder": {
-            "type": embedder_type,
-        },
-        "retrieval": {
-            "search_mode":                   "semantic",
-            "enable_token_budget":           True,
-            "token_budget_context_fraction": 0.6,
-        },
-    }
+    from app.core.config.client_config_resolver import load_default_client_raw_dict
 
-    # VectorDB sub-config
-    if vectordb_type == "chroma":
-        cfg["vectordb"]["chroma"] = {
-            "persist_directory": os.getenv("CHROMA_PATH", "./pluggable_db"),
-        }
-    elif vectordb_type == "qdrant":
-        cfg["vectordb"]["qdrant"] = {
-            "host": os.getenv("QDRANT_HOST", "localhost"),
-            "port": int(os.getenv("QDRANT_PORT", "6333")),
-        }
-    elif vectordb_type == "pinecone":
-        cfg["vectordb"]["pinecone"] = {
-            "index_name":    os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
-            "embedding_dim": 768,
-            "api_key_env":   "PINECONE_API_KEY",
-        }
-    elif vectordb_type == "weaviate":
-        cfg["vectordb"]["weaviate"] = {
-            "url":         os.getenv("WEAVIATE_URL", "http://localhost:8080"),
-            "api_key_env": "WEAVIATE_API_KEY",
-        }
-    elif vectordb_type == "milvus":
-        cfg["vectordb"]["milvus"] = {
-            "host": os.getenv("MILVUS_HOST", "localhost"),
-            "port": int(os.getenv("MILVUS_PORT", "19530")),
-        }
-    elif vectordb_type == "redis":
-        cfg["vectordb"]["redis"] = {
-            "url": os.getenv("REDIS_URL", "redis://localhost:6379/0"),
-        }
+    cfg = deepcopy(load_default_client_raw_dict())
+    cfg["client_id"] = sanitize_client_id(client_id)
+    if "client_name" not in cfg or cfg.get("client_name") == "Default":
+        cfg["client_name"] = str(client_id).replace("_", " ").strip() or cfg["client_id"]
+    from app.core.prompts.ssot import enforce_library_first_prompt_persist
+
+    return enforce_library_first_prompt_persist(cfg, client_id=client_id)
+
+
+def _merged_effective_client_dict(client_id: str) -> Dict[str, Any]:
+    """Matches resolver merge rules (defaults + `{client}` overlay), without env overlays."""
+    from copy import deepcopy
+
+    from app.core.config.client_config_resolver import _deep_merge, load_default_client_raw_dict
+
+    safe_id = sanitize_client_id(client_id)
+    cfg_path = _get_client_config_path(safe_id)
+
+    if safe_id == "default":
+        if cfg_path is None:
+            merged = deepcopy(load_default_client_raw_dict())
+        else:
+            text = cfg_path.read_text(encoding="utf-8")
+            if cfg_path.suffix.lower() in (".yaml", ".yml"):
+                merged = deepcopy(yaml.safe_load(text) or {})
+            else:
+                merged = deepcopy(json.loads(text or "{}"))
+        merged["client_id"] = "default"
+        return merged
+
+    base = deepcopy(load_default_client_raw_dict())
+    if cfg_path is not None:
+        text = cfg_path.read_text(encoding="utf-8")
+        if cfg_path.suffix.lower() in (".yaml", ".yml"):
+            overlay = yaml.safe_load(text) or {}
+        else:
+            overlay = json.loads(text or "{}")
+        merged = _deep_merge(base, overlay)
     else:
-        # Unknown type — safe fallback to Chroma
-        cfg["vectordb"]["type"] = "chroma"
-        cfg["vectordb"]["chroma"] = {
-            "persist_directory": os.getenv("CHROMA_PATH", "./pluggable_db"),
-        }
+        merged = base
+    merged["client_id"] = safe_id
+    return merged
 
-    # Embedder sub-config
-    if embedder_type == "huggingface":
-        cfg["embedder"]["huggingface"] = {
-            "model":  os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5"),
-            "device": os.getenv("HF_EMBED_DEVICE", "auto"),
-        }
-    elif embedder_type == "openai":
-        cfg["embedder"]["openai"] = {
-            "model":       os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small"),
-            "api_key_env": "OPENAI_API_KEY",
-        }
-    elif embedder_type == "ollama":
-        cfg["embedder"]["ollama"] = {
-            "model":    os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text"),
-            "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        }
-    elif embedder_type == "cohere":
-        cfg["embedder"]["cohere"] = {
-            "model":       os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0"),
-            "api_key_env": "COHERE_API_KEY",
-        }
-    elif embedder_type == "gemini":
-        cfg["embedder"]["gemini"] = {
-            "model":       os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001"),
-            "api_key_env": "GOOGLE_API_KEY",
-        }
-    else:
-        # Unknown type — safe fallback to HuggingFace
-        cfg["embedder"]["type"] = "huggingface"
-        cfg["embedder"]["huggingface"] = {
-            "model":  "BAAI/bge-large-en-v1.5",
-            "device": "auto",
-        }
 
-    # LLM sub-config (optional — omit if unrecognised)
-    if llm_type == "ollama":
-        cfg["llm"] = {"single": {
-            "type":     "ollama",
-            "model":    os.getenv("OLLAMA_LLM_MODEL", "llama3.2"),
-            "base_url": os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        }}
-    elif llm_type == "openai":
-        cfg["llm"] = {"single": {
-            "type":        "openai",
-            "model":       os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
-            "api_key_env": "OPENAI_API_KEY",
-            "base_url":    "https://api.openai.com/v1",
-        }}
-    elif llm_type == "gemini":
-        cfg["llm"] = {"single": {
-            "type":        "gemini",
-            "model":       os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-            "api_key_env": "GOOGLE_API_KEY",
-            "base_url":    "https://generativelanguage.googleapis.com/v1",
-        }}
-    elif llm_type == "groq":
-        cfg["llm"] = {"single": {
-            "type":        "groq",
-            "model":       os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant"),
-            "api_key_env": "GROQ_API_KEY",
-            "base_url":    "https://api.groq.com/openai/v1",
-        }}
-    elif llm_type == "anthropic":
-        cfg["llm"] = {"single": {
-            "type":        "anthropic",
-            "model":       os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
-            "api_key_env": "ANTHROPIC_API_KEY",
-            "base_url":    "https://api.anthropic.com",
-        }}
+def _validate_config_dict_raises(merged_raw: Dict[str, Any]) -> None:
+    from pydantic import ValidationError
 
-    return cfg
+    from app.core.config.client_config_schema import ClientConfig
+    from app.core.config.client_config_resolver import IssueSeverity, validate_config_compatibility
+
+    try:
+        cfg = ClientConfig.from_dict(merged_raw)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Schema validation failed: {e}") from e
+
+    errs = [i for i in validate_config_compatibility(cfg) if i.severity == IssueSeverity.ERROR]
+    if errs:
+        raise HTTPException(
+            status_code=400,
+            detail=" | ".join(f"[{x.component}] {x.message}" for x in errs),
+        )
+
+
+def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON atomically (temp + rename) under `_CONFIGS_DIR` containment."""
+    path = path.resolve()
+    if not str(path).startswith(str(_CONFIGS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid configuration path.")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def _apply_vectordb_type(cfg: Dict[str, Any], vt: str) -> None:
+    """
+    Apply vectordb type to cfg dict. Defaults come from canonical default.json
+    merge templates — not from process env — so tenant overlays stay isolated.
+    """
+    from app.core.config.default_config_templates import default_vectordb_dict_for_type
+
+    prev = cfg.get("vectordb") or {}
+    cfg["vectordb"] = default_vectordb_dict_for_type(vt, prev)
+
+
+def _apply_embedder_type(cfg: Dict[str, Any], et: str) -> None:
+    from app.core.config.default_config_templates import default_embedder_dict_for_type
+
+    prev = cfg.get("embedder") or {}
+    cfg["embedder"] = default_embedder_dict_for_type(et, prev)
+
+
+def _apply_llm_provider(cfg: Dict[str, Any], llm_provider: str) -> None:
+    from app.core.config.default_config_templates import default_llm_root_dict_for_provider
+
+    prev = cfg.get("llm") or {}
+    cfg["llm"] = default_llm_root_dict_for_provider(llm_provider, prev)
 
 
 def _build_synthetic_pipeline_response(client_id: str) -> dict:
@@ -296,7 +267,42 @@ class RerankerConfigUpdate(BaseModel):
     security:                 Optional[Dict[str, Any]] = None
     prompt:                   Optional[Dict[str, Any]] = None
     formatter:                Optional[Dict[str, Any]] = None
-    context_window:           Optional[Dict[str, Any]] = None
+
+
+class PipelinePluggablePatch(BaseModel):
+    """Sparse patch for pipeline fields stored in Client JSON (not .env)."""
+    vectordb_type: Optional[str] = Field(None, description="e.g. chroma, qdrant, pinecone")
+    embedder_type: Optional[str] = Field(None, description="e.g. ollama, openai, huggingface, gemini")
+    llm_provider:  Optional[str] = Field(None, description="e.g. ollama, openai, gemini")
+    collection:    Optional[str] = Field(None, description="Vector collection / logical name")
+    search_mode:   Optional[str] = Field(None, description="semantic | hybrid | keyword")
+    chroma_persist_directory: Optional[str] = Field(
+        None,
+        description="Local Chroma persist path for this tenant (vectordb.chroma.persist_directory).",
+    )
+    vectordb_config: Optional[Dict[str, Any]] = Field(
+        None,
+        description=(
+            "Deep-merge patch for the active vectordb sub-config "
+            "(chroma, qdrant, pinecone, weaviate, milvus, redis)."
+        ),
+    )
+    client_name: Optional[str] = Field(
+        None,
+        description="Human-readable tenant display name (Client JSON client_name).",
+    )
+    ingestion: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Deep-merge patch for ingestion.* (chunking, phantom, dedup, embed_parallelism, …).",
+    )
+    tokenization: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Deep-merge patch for tokenization.*",
+    )
+    celery_dispatch: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Deep-merge patch for celery_dispatch.*",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -495,8 +501,8 @@ async def update_pipeline_config(
     Update reranking and query-transform settings for a client pipeline.
     Writes changes back to the client's config file and invalidates the
     cached pipeline so the next query uses the updated configuration.
-    If no config file exists, a new one is created from environment defaults
-    and the requested updates are applied to it.
+    If no config file exists, a new one is seeded from canonical `default.json`
+    (`_build_default_config_dict`) and the requested updates are merged in.
     """
     client_id = _validated_tenant_path(client_id, "update_pipeline_config")
     import json as _json
@@ -504,7 +510,7 @@ async def update_pipeline_config(
     config_path = _get_client_config_path(client_id)
 
     if config_path is None:
-        # No existing file — create one from env-based defaults
+        # No existing file — create one from canonical default.json seeds
         safe_id = sanitize_client_id(client_id)
         _CONFIGS_DIR.mkdir(parents=True, exist_ok=True)
         config_path = (_CONFIGS_DIR / f"{safe_id}.json").resolve()
@@ -524,6 +530,10 @@ async def update_pipeline_config(
                 config_data = yaml.safe_load(f)
 
     updates = req.model_dump(exclude_none=True)
+
+    # Allow explicit null to clear retrieval.prompt_template_id (System Default in admin UI).
+    if "prompt_template_id" in req.model_fields_set:
+        updates["prompt_template_id"] = req.prompt_template_id
 
     # Map flat API fields to nested config structure
     reranker_updates  = {}
@@ -565,6 +575,41 @@ async def update_pipeline_config(
             config_data["retrieval"] = {}
         config_data["retrieval"].update(retrieval_updates)
 
+    # Normalize reranker type/model after merge (stack-topology + catalog alignment).
+    if config_data.get("reranker"):
+        try:
+            from app.core.config.client_config_schema import ClientConfig
+            from app.core.config.reranker_config_coercion import (
+                resolve_reranker_runtime,
+                resolved_to_reranker_config,
+            )
+
+            safe_id = sanitize_client_id(client_id)
+            merge_payload = {**config_data, "client_id": safe_id}
+            if not merge_payload.get("vectordb") or not merge_payload.get("embedder"):
+                seed = _build_default_config_dict(safe_id)
+                for key in ("vectordb", "embedder", "llm", "retrieval", "features"):
+                    if key not in merge_payload or merge_payload[key] is None:
+                        merge_payload[key] = seed.get(key)
+            temp_cfg = ClientConfig.from_dict(merge_payload)
+            resolved_rr = resolve_reranker_runtime(temp_cfg)
+            if resolved_rr.plugin_name != "none":
+                coerced_rr = resolved_to_reranker_config(resolved_rr)
+                existing_rr = config_data.get("reranker") or {}
+                config_data["reranker"] = {
+                    **existing_rr,
+                    "type": coerced_rr.type.value,
+                    "model": coerced_rr.model,
+                    "api_key_env": coerced_rr.api_key_env,
+                    "judge_provider": coerced_rr.judge_provider,
+                }
+        except Exception as e:
+            logger.warning(
+                "[rag_config_api] Reranker normalization skipped for '%s': %s",
+                client_id,
+                e,
+            )
+
     def _deep_update(target: Dict[str, Any], patch: Dict[str, Any]) -> Dict[str, Any]:
         for key, value in patch.items():
             if isinstance(value, dict) and isinstance(target.get(key), dict):
@@ -577,11 +622,21 @@ async def update_pipeline_config(
     for section in ("security", "prompt", "formatter", "context_window"):
         section_update = updates.get(section)
         if isinstance(section_update, dict):
-            if "custom_template" in section_update and "template" not in section_update:
-                section_update["template"] = section_update.pop("custom_template")
+            if section == "prompt":
+                section_update = {
+                    k: v
+                    for k, v in section_update.items()
+                    if k not in ("template", "custom_template")
+                }
             if section not in config_data or not isinstance(config_data.get(section), dict):
                 config_data[section] = {}
             _deep_update(config_data[section], section_update)
+
+    from app.core.prompts.ssot import enforce_library_first_prompt_persist
+
+    config_data = enforce_library_first_prompt_persist(
+        config_data, client_id=client_id
+    )
 
     # Write back
     with config_path.open("w") as f:
@@ -590,17 +645,22 @@ async def update_pipeline_config(
         else:
             yaml.dump(config_data, f, default_flow_style=False)
 
-    # Invalidate cached pipeline so next query rebuilds with new config
+    # Invalidate cached pipeline + effective runtime SSOT so next query/UI rebuilds
     try:
         from app.core.pipeline_factory import pipeline_factory
+        from app.core.config.effective_tenant_runtime import (
+            invalidate_effective_tenant_runtime_cache,
+        )
+
         pipeline_factory.invalidate(client_id)
+        invalidate_effective_tenant_runtime_cache(client_id)
         logger.info(
-            "[rag_config_api] Updated config for client='%s'; pipeline cache invalidated.",
+            "[rag_config_api] Updated config for client='%s'; pipeline + runtime cache invalidated.",
             client_id,
         )
     except Exception as e:
         logger.warning(
-            "[rag_config_api] Could not invalidate pipeline cache for '%s': %s",
+            "[rag_config_api] Could not invalidate caches for '%s': %s",
             client_id, e,
         )
 
@@ -712,3 +772,176 @@ async def validate_pipeline_config(client_id: str):
             "client_id": client_id,
             "error":     str(e),
         }
+
+
+_TENANT_TEMPLATE_PATH = _CONFIGS_DIR / "_templates" / "tenant_config.template.json"
+
+
+@router.get("/tenant-config-template")
+async def get_tenant_config_template():
+    """Return the canonical tenant JSON overlay template (slim .env companion)."""
+    if not _TENANT_TEMPLATE_PATH.is_file():
+        return {"_error": "template_not_found", "path": str(_TENANT_TEMPLATE_PATH)}
+    return json.loads(_TENANT_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+
+@router.get("/pipeline-pluggable/{client_id}")
+async def get_pipeline_pluggable(client_id: str):
+    """Return merged pipeline identity for dashboards (Client JSON + resolver)."""
+    from app.core.config.pipeline_runtime import get_pipeline_identity
+
+    cid = _validated_tenant_path(client_id, "get_pipeline_pluggable")
+    return get_pipeline_identity(cid)
+
+
+@router.patch("/pipeline-pluggable/{client_id}")
+async def patch_pipeline_pluggable(client_id: str, patch: PipelinePluggablePatch):
+    """Apply sparse pipeline fields to the client's config JSON and invalidate caches."""
+    cid = _validated_tenant_path(client_id, "patch_pipeline_pluggable")
+    merged = _merged_effective_client_dict(cid)
+
+    if patch.vectordb_type:
+        try:
+            _apply_vectordb_type(merged, patch.vectordb_type)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    if patch.embedder_type:
+        try:
+            _apply_embedder_type(merged, patch.embedder_type)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    if patch.llm_provider:
+        try:
+            _apply_llm_provider(merged, patch.llm_provider)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    if patch.collection is not None:
+        coll = str(patch.collection).strip()
+        if not coll:
+            raise HTTPException(status_code=400, detail="collection must be non-empty when provided.")
+        merged.setdefault("vectordb", {})["collection"] = coll
+    if patch.search_mode is not None:
+        sm = str(patch.search_mode).strip().lower()
+        merged.setdefault("retrieval", {})["search_mode"] = sm
+    if patch.chroma_persist_directory is not None:
+        pd_raw = str(patch.chroma_persist_directory).strip()
+        vdb = merged.setdefault("vectordb", {})
+        vtype = str(vdb.get("type", "")).strip().lower()
+        if vtype != "chroma":
+            raise HTTPException(
+                status_code=400,
+                detail="chroma_persist_directory applies only when vectordb.type is chroma.",
+            )
+        ch = vdb.setdefault("chroma", {})
+        ch["persist_directory"] = pd_raw
+
+    from app.core.config.client_config_resolver import _deep_merge
+
+    if patch.vectordb_config is not None and isinstance(patch.vectordb_config, dict):
+        vdb = merged.setdefault("vectordb", {})
+        vtype = str(vdb.get("type", "")).strip().lower()
+        sub_keys = {
+            "chroma": "chroma",
+            "qdrant": "qdrant",
+            "pinecone": "pinecone",
+            "weaviate": "weaviate",
+            "milvus": "milvus",
+            "redis": "redis",
+        }
+        sub_key = sub_keys.get(vtype)
+        if not sub_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"vectordb_config cannot be applied: unknown vectordb.type '{vtype}'.",
+            )
+        base_sub = vdb.get(sub_key)
+        if not isinstance(base_sub, dict):
+            base_sub = {}
+        merged_sub = _deep_merge(base_sub, patch.vectordb_config)
+        if vtype == "chroma" and isinstance(merged_sub, dict):
+            host = (merged_sub.get("host") or "").strip() if merged_sub.get("host") else ""
+            pd = (merged_sub.get("persist_directory") or "").strip() if merged_sub.get(
+                "persist_directory"
+            ) else ""
+            if host:
+                merged_sub["persist_directory"] = None
+            elif pd:
+                merged_sub["host"] = None
+        vdb[sub_key] = merged_sub
+
+    if patch.client_name is not None:
+        cn = str(patch.client_name).strip()
+        if cn:
+            merged["client_name"] = cn
+
+    if patch.ingestion is not None and isinstance(patch.ingestion, dict):
+        base_ing = merged.get("ingestion")
+        if not isinstance(base_ing, dict):
+            base_ing = {}
+        merged["ingestion"] = _deep_merge(base_ing, patch.ingestion)
+    if patch.tokenization is not None and isinstance(patch.tokenization, dict):
+        base_tok = merged.get("tokenization")
+        if not isinstance(base_tok, dict):
+            base_tok = {}
+        merged["tokenization"] = _deep_merge(base_tok, patch.tokenization)
+    if patch.celery_dispatch is not None and isinstance(patch.celery_dispatch, dict):
+        base_cd = merged.get("celery_dispatch")
+        if not isinstance(base_cd, dict):
+            base_cd = {}
+        merged["celery_dispatch"] = _deep_merge(base_cd, patch.celery_dispatch)
+
+    from app.core.prompts.ssot import enforce_library_first_prompt_persist
+
+    merged = enforce_library_first_prompt_persist(merged, client_id=cid)
+
+    _validate_config_dict_raises(merged)
+
+    safe_id = sanitize_client_id(cid)
+    out_path = (_CONFIGS_DIR / f"{safe_id}.json").resolve()
+    if not str(out_path).startswith(str(_CONFIGS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid client_id.")
+    _atomic_write_json(out_path, merged)
+
+    # #region agent log
+    try:
+        _dbg_path = Path(__file__).resolve().parents[3] / "debug-2bf9cb.log"
+        _vdb = merged.get("vectordb") or {}
+        _ch = _vdb.get("chroma") if isinstance(_vdb.get("chroma"), dict) else {}
+        _line = {
+            "sessionId": "2bf9cb",
+            "hypothesisId": "H1",
+            "location": "rag_config_api.py:patch_pipeline_pluggable",
+            "message": "wrote tenant client json",
+            "data": {
+                "client_id": cid,
+                "written_file": out_path.name,
+                "vectordb_type": _vdb.get("type"),
+                "collection": _vdb.get("collection"),
+                "chroma_persist": (_ch or {}).get("persist_directory"),
+                "client_name": merged.get("client_name"),
+            },
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_dbg_path, "a", encoding="utf-8") as _df:
+            _df.write(json.dumps(_line) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+    from app.core.pipeline_factory import pipeline_factory
+    from app.core.config.effective_tenant_runtime import (
+        invalidate_effective_tenant_runtime_cache,
+    )
+
+    pipeline_factory.invalidate(cid)
+    invalidate_effective_tenant_runtime_cache(cid)
+    try:
+        from app.services.ingestion.ingestion_service_v2 import clear_ingestion_pipeline_cache
+
+        clear_ingestion_pipeline_cache(cid)
+    except Exception as e:
+        logger.warning("[rag_config_api] Failed to clear ingestion pipeline cache: %s", e)
+
+    from app.core.config.pipeline_runtime import get_pipeline_identity
+
+    return {"status": "saved", "client_id": cid, "pipeline": get_pipeline_identity(cid)}

@@ -39,7 +39,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -56,21 +55,23 @@ from app.core.chunking_stratagies.segmenter_v2 import (
 from app.utils.logger import log_info
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION — read from env, with sane defaults
-# ─────────────────────────────────────────────────────────────────────────────
+# Configuration: callers pass explicit sizes; defaults match default.json ingestion.chunking.
+_DEFAULT_CHUNK_SIZE = 512
+_DEFAULT_CHUNK_OVERLAP = 64
+_DEFAULT_MIN_CHUNK_TOKENS = 30
+
 
 def _get_chunk_size() -> int:
-    return int(os.getenv("CHUNK_SIZE", "512"))
+    return _DEFAULT_CHUNK_SIZE
 
 
 def _get_chunk_overlap() -> int:
-    return int(os.getenv("CHUNK_OVERLAP", "64"))
+    return _DEFAULT_CHUNK_OVERLAP
 
 
 def _get_min_chunk_tokens() -> int:
     """Minimum token count — chunks below this are merged into neighbours."""
-    return int(os.getenv("MIN_CHUNK_TOKENS", "30"))
+    return _DEFAULT_MIN_CHUNK_TOKENS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -149,7 +150,7 @@ class TokenChunkingService:
     @property
     def tokenizer(self) -> BaseTokenizer:
         if self._tokenizer is None:
-            self._tokenizer = get_tokenizer()
+            self._tokenizer = get_tokenizer("huggingface")
 
         # Phase A bridge: if a TokenizerContract was injected, wrap it so
         # the rest of the service always works against BaseTokenizer.
@@ -444,14 +445,12 @@ class TokenAwareChunker(Chunker):
     """
     Chunking registry adapter for TokenChunkingService.
 
-    Registered as "token_aware" strategy. Can be selected via:
-      - CHUNKING_STRATEGY=token_aware in .env
-      - strategy_override="token_aware" in _chunk_text_with_strategy()
-      - get_chunker("token_aware") directly
+    Registered as "token_aware" strategy. Resolves chunk sizes and tokenizer
+    from merged Client JSON when business_id is present.
     """
 
     def __init__(self):
-        self._service = TokenChunkingService()
+        self._service: Optional[TokenChunkingService] = None
 
     async def chunk(
         self,
@@ -463,6 +462,31 @@ class TokenAwareChunker(Chunker):
         source_type: Optional[str] = None,
         embedding_model: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
+        from app.core.config.client_config_resolver import get_client_config_for_ingestion
+        from app.core.tokenization.factory import get_tokenizer_for_client
+
+        chunk_size = _DEFAULT_CHUNK_SIZE
+        chunk_overlap = _DEFAULT_CHUNK_OVERLAP
+        min_tok = _DEFAULT_MIN_CHUNK_TOKENS
+        tok = None
+        if business_id:
+            try:
+                cfg = get_client_config_for_ingestion(str(business_id))
+                ch = cfg.ingestion.chunking
+                chunk_size = int(ch.chunk_size)
+                chunk_overlap = int(ch.chunk_overlap)
+                min_tok = int(ch.min_chunk_len)
+                tok = get_tokenizer_for_client(cfg.tokenization)
+            except Exception:
+                tok = get_tokenizer("huggingface")
+        else:
+            tok = get_tokenizer("huggingface")
+        self._service = TokenChunkingService(
+            tokenizer=tok,
+            chunk_size=chunk_size,
+            chunk_overlap=chunk_overlap,
+            min_chunk_tokens=min_tok,
+        )
         return await self._service.chunk(
             text,
             db_session=db_session,
@@ -489,6 +513,8 @@ async def token_aware_chunk(
     tokenizer_contract: "Optional[TokenizerContract]" = None,
     chunk_size: Optional[int] = None,
     chunk_overlap: Optional[int] = None,
+    min_chunk_tokens: Optional[int] = None,
+    client_tokenization: Any = None,
 ) -> List[Dict[str, Any]]:
     """
     Convenience async function for token-aware chunking.
@@ -532,6 +558,10 @@ async def token_aware_chunk(
         resolved_tokenizer: Optional[Any] = tokenizer_contract
     elif tokenizer_backend:
         resolved_tokenizer = get_tokenizer(tokenizer_backend)
+    elif client_tokenization is not None:
+        from app.core.tokenization.factory import get_tokenizer_for_client
+
+        resolved_tokenizer = get_tokenizer_for_client(client_tokenization)
     else:
         resolved_tokenizer = None
 
@@ -539,6 +569,7 @@ async def token_aware_chunk(
         tokenizer=resolved_tokenizer,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
+        min_chunk_tokens=min_chunk_tokens,
     )
     return await service.chunk(
         text,

@@ -13,6 +13,7 @@ import asyncio
 import datetime
 import os
 import socket
+from typing import Any, Optional
 
 router = APIRouter(prefix="/api/v2/ingestion", tags=["Ingestion Health"])
 
@@ -38,6 +39,95 @@ def _tcp_reachable(host: str, port: int, timeout: float = 2) -> bool:
         return True
     except Exception:
         return False
+
+
+def _health_scope_client(client_id: str | None = None):
+    """
+    Resolve tenant id and merged ClientConfig for health checks.
+    
+    Args:
+        client_id: Optional specific tenant to check. If None, uses MAI_DEFAULT_BUSINESS_ID.
+    
+    Returns:
+        Tuple of (tenant_id, ClientConfig or None if resolver fails)
+    """
+    try:
+        from app.utils.tenant_validator import validate_tenant_id
+        from app.core.config.client_config_resolver import get_client_config
+
+        # Use provided client_id or fall back to env default
+        raw_cid = client_id or os.getenv("MAI_DEFAULT_BUSINESS_ID")
+        ctx = validate_tenant_id(raw_cid, endpoint="health", allow_default=True)
+        return ctx.tenant_id, get_client_config(ctx.tenant_id)
+    except Exception:
+        try:
+            from app.core.config.client_config_resolver import get_client_config
+
+            return "default", get_client_config("default")
+        except Exception:
+            return "default", None
+
+
+def _is_emb_configured(name: str, hcfg: Optional[Any]) -> bool:
+    """True if *name* embedder is worth probing (active tenant JSON or legacy env)."""
+    legacy = {
+        "huggingface": lambda: True,
+        "ollama": lambda: True,
+        "openai": lambda: bool(os.getenv("OPENAI_API_KEY")),
+        "cohere": lambda: bool(os.getenv("COHERE_API_KEY")),
+        "google": lambda: bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+        "gemini": lambda: bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+    }
+    if hcfg is None:
+        return legacy.get(name, lambda: False)()
+    try:
+        active = hcfg.embedder.type.value.lower()
+        if active == "google":
+            active = "gemini"
+        probe = "gemini" if name == "google" else name
+        if probe != active:
+            return legacy.get(name, lambda: False)()
+        sub = getattr(hcfg.embedder, active, None)
+        if sub is None:
+            return False
+        envn = getattr(sub, "api_key_env", None)
+        if envn:
+            return bool(os.getenv(envn, "").strip())
+        return True
+    except Exception:
+        return legacy.get(name, lambda: False)()
+
+
+def _is_llm_configured(name: str, hcfg: Optional[Any]) -> bool:
+    legacy = {
+        "ollama": lambda: True,
+        "openai": lambda: bool(os.getenv("OPENAI_API_KEY")),
+        "groq": lambda: bool(os.getenv("GROQ_API_KEY")),
+        "grok": lambda: bool(os.getenv("GROQ_API_KEY")),
+        "anthropic": lambda: bool(os.getenv("ANTHROPIC_API_KEY")),
+        "gemini": lambda: bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+        "google": lambda: bool(os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")),
+    }
+    if hcfg is None:
+        return legacy.get(name, lambda: False)()
+    try:
+        ll = hcfg.llm.single if hcfg.llm and hcfg.llm.single else None
+        if ll is None:
+            return legacy.get(name, lambda: False)()
+        active = ll.type.value.lower()
+        if active == "google":
+            active = "gemini"
+        probe = "gemini" if name == "google" else name
+        if name == "grok":
+            probe = "groq"
+        if probe != active:
+            return legacy.get(name, lambda: False)()
+        envn = ll.api_key_env
+        if envn:
+            return bool(os.getenv(envn, "").strip())
+        return True
+    except Exception:
+        return legacy.get(name, lambda: False)()
 
 
 # ── async httpx helper (no threads, native async) ────────────────────
@@ -88,21 +178,39 @@ async def _check_postgres() -> dict:
 #  2. VECTOR DATABASES — pure httpx / socket checks (NO client libs)
 # ══════════════════════════════════════════════════════════════════════
 
-async def _check_qdrant() -> dict:
+async def _check_qdrant(hcfg: Optional[Any] = None) -> dict:
     """Qdrant REST API   GET /collections"""
+    from app.core.config.client_config_schema import VectorDBType
+
     host = os.getenv("QDRANT_HOST", "localhost")
     port = int(os.getenv("QDRANT_PORT", "6333"))
-    url  = os.getenv("QDRANT_URL") or f"http://{host}:{port}"
+    url = os.getenv("QDRANT_URL") or None
     api_key = os.getenv("QDRANT_API_KEY") or None
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.QDRANT and vdb.qdrant is not None:
+                qc = vdb.qdrant
+                if qc.url:
+                    url = qc.url
+                host = qc.host or host
+                port = int(qc.port)
+                if qc.api_key_env:
+                    api_key = os.getenv(qc.api_key_env) or api_key
+    except Exception:
+        pass
+
+    url_eff = url or f"http://{host}:{port}"
     hdrs = {"api-key": api_key} if api_key else {}
-    data = await _http_get(f"{url}/collections", headers=hdrs)
+    data = await _http_get(f"{url_eff}/collections", headers=hdrs)
     if data and "result" in data:
         n = len(data["result"].get("collections", []))
         return _ok(f"{n} collection(s) | {host}:{port}")
     return _fail(f"Cannot reach {host}:{port}")
 
 
-async def _check_chroma() -> dict:
+async def _check_chroma(hcfg: Optional[Any] = None) -> dict:
     """ChromaDB — remote HttpClient OR local PersistentClient.
 
     Remote mode: CHROMA_HOST is set → use httpx to probe heartbeat and
@@ -111,25 +219,42 @@ async def _check_chroma() -> dict:
                  servers.
     Local mode:  CHROMA_HOST is empty → use PersistentClient singleton.
     """
+    from app.core.config.client_config_schema import VectorDBType
+
     chroma_host = os.getenv("CHROMA_HOST") or None
+    chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
+    use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
+    api_key = os.getenv("CHROMA_API_KEY") or None
+    tenant = os.getenv("CHROMA_TENANT", "default_tenant")
+    database = os.getenv("CHROMA_DATABASE", "default_database")
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.CHROMA and vdb.chroma is not None:
+                cc = vdb.chroma
+                chroma_host = cc.host or chroma_host
+                chroma_port = int(cc.port)
+                use_ssl = bool(cc.ssl)
+                tenant = cc.tenant or tenant
+                database = cc.database or database
+                if cc.api_key_env:
+                    api_key = os.getenv(cc.api_key_env) or api_key
+    except Exception:
+        pass
 
     if chroma_host:
         # ── Remote mode — httpx (no client libs, no gRPC) ─────────
-        port    = int(os.getenv("CHROMA_PORT") or "8000")
-        use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
-        scheme  = "https" if use_ssl else "http"
-        url     = f"{scheme}://{chroma_host}:{port}"
-        api_key = os.getenv("CHROMA_API_KEY") or None
-        hdrs    = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        tenant  = os.getenv("CHROMA_TENANT", "default_tenant")
-        database = os.getenv("CHROMA_DATABASE", "default_database")
+        scheme = "https" if use_ssl else "http"
+        url = f"{scheme}://{chroma_host}:{chroma_port}"
+        hdrs = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
         # 1) heartbeat — try v2 first, fall back to v1
         hb = await _http_get(f"{url}/api/v2/heartbeat", headers=hdrs)
         if hb is None:
             hb = await _http_get(f"{url}/api/v1/heartbeat", headers=hdrs)
         if hb is None:
-            return _fail(f"Cannot reach {chroma_host}:{port}")
+            return _fail(f"Cannot reach {chroma_host}:{chroma_port}")
 
         # 2) collection count — v2 path-based, then v1 query-param
         coll_data = await _http_get(
@@ -143,21 +268,32 @@ async def _check_chroma() -> dict:
             )
         if coll_data is not None:
             n = len(coll_data) if isinstance(coll_data, list) else 0
-            return _ok(f"{n} collection(s) | {chroma_host}:{port}")
+            return _ok(f"{n} collection(s) | {chroma_host}:{chroma_port}")
         # heartbeat OK but collections endpoint failed — still online
-        return _ok(f"Connected | {chroma_host}:{port}")
+        return _ok(f"Connected | {chroma_host}:{chroma_port}")
 
     # ── Local mode — use BaseVectorDB abstraction ──────────────────
     try:
         from app.core.vectordb.chroma_v1 import ChromaVectorDB
+
         chroma_path = os.getenv("CHROMA_PATH") or "./pluggable_db"
+        collection_name = os.getenv("MAI_COLLECTION", "ingested_content")
+        try:
+            if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+                vdb = hcfg.vectordb
+                if vdb.type == VectorDBType.CHROMA and vdb.chroma is not None:
+                    if vdb.chroma.persist_directory:
+                        chroma_path = vdb.chroma.persist_directory
+                    collection_name = vdb.collection or collection_name
+        except Exception:
+            pass
+
         vdb = ChromaVectorDB(
             persist_directory=chroma_path,
             anonymized_telemetry=False,
         )
         if not vdb.health_check():
             return _fail("ChromaDB local health_check returned False")
-        collection_name = os.getenv("MAI_COLLECTION", "ingested_content")
         stats = vdb.stats(collection_name)
         doc_count = stats.get("document_count", 0)
         return _ok(f"{doc_count} doc(s) | {chroma_path}")
@@ -165,16 +301,31 @@ async def _check_chroma() -> dict:
         return _fail(str(e))
 
 
-async def _check_milvus() -> dict:
+async def _check_milvus(hcfg: Optional[Any] = None) -> dict:
     """Milvus — TCP socket check + optional REST health (port 9091).
     NEVER imports pymilvus here (gRPC deadlocks w/ asyncio)."""
     host = os.getenv("MILVUS_HOST", "localhost")
     port = int(os.getenv("MILVUS_PORT", "19530"))
-    uri  = os.getenv("MILVUS_URI")
+    uri = os.getenv("MILVUS_URI")
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            from app.core.config.client_config_schema import VectorDBType
+
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.MILVUS and vdb.milvus is not None:
+                mc = vdb.milvus
+                if mc.uri:
+                    uri = mc.uri
+                host = mc.host or host
+                port = int(mc.port)
+    except Exception:
+        pass
 
     target_host, target_port = host, port
     if uri:
         from urllib.parse import urlparse
+
         p = urlparse(uri if "://" in uri else f"http://{uri}")
         target_host = p.hostname or host
         target_port = p.port or port
@@ -196,11 +347,39 @@ async def _check_milvus() -> dict:
     return _ok(f"Reachable (gRPC) | {target_host}:{target_port}")
 
 
-async def _check_pinecone() -> dict:
-    if os.getenv("PINECONE_MODE", "cloud").strip().lower() == "local":
-        local_path = os.getenv("PINECONE_LOCAL_PATH") or "./pinecone_local_db"
+async def _check_pinecone(hcfg: Optional[Any] = None) -> dict:
+    mode = os.getenv("PINECONE_MODE", "cloud").strip().lower()
+    local_path = os.getenv("PINECONE_LOCAL_PATH") or "./pinecone_local_db"
+    region = os.getenv("PINECONE_REGION", "us-east-1")
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            from app.core.config.client_config_schema import VectorDBType
+
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.PINECONE and vdb.pinecone is not None:
+                pc = vdb.pinecone
+                mode = str(pc.mode or "cloud").strip().lower()
+                if pc.local_path:
+                    local_path = pc.local_path
+                region = str(pc.region or region)
+    except Exception:
+        pass
+
+    if mode == "local":
         return _ok(f"Local emulation | {local_path}")
     api_key = os.getenv("PINECONE_API_KEY", "")
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            from app.core.config.client_config_schema import VectorDBType
+
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.PINECONE and vdb.pinecone is not None:
+                pc = vdb.pinecone
+                if pc.api_key_env:
+                    api_key = os.getenv(pc.api_key_env) or api_key
+    except Exception:
+        pass
     if not api_key:
         return _skip("PINECONE_API_KEY not set")
     data = await _http_get(
@@ -210,15 +389,29 @@ async def _check_pinecone() -> dict:
     )
     if data and "indexes" in data:
         n = len(data["indexes"])
-        return _ok(f"{n} index(es) | {os.getenv('PINECONE_REGION','us-east-1')}")
+        return _ok(f"{n} index(es) | {region}")
     if data is None:
         return _fail("Cannot reach Pinecone API")
     return _fail("Unexpected response")
 
 
-async def _check_weaviate() -> dict:
+async def _check_weaviate(hcfg: Optional[Any] = None) -> dict:
     url = os.getenv("WEAVIATE_URL", "http://localhost:8080")
     api_key = os.getenv("WEAVIATE_API_KEY") or None
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            from app.core.config.client_config_schema import VectorDBType
+
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.WEAVIATE and vdb.weaviate is not None:
+                wv = vdb.weaviate
+                url = str(wv.url or url)
+                if wv.api_key_env:
+                    api_key = os.getenv(wv.api_key_env) or api_key
+    except Exception:
+        pass
+
     hdrs = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     import httpx
 
@@ -238,10 +431,27 @@ async def _check_weaviate() -> dict:
     return _fail(f"Cannot reach {url}")
 
 
-async def _check_redis() -> dict:
+async def _check_redis(hcfg: Optional[Any] = None) -> dict:
     url = os.getenv("REDIS_URL")
     host = os.getenv("REDIS_HOST", "localhost")
     port = int(os.getenv("REDIS_PORT", "6379"))
+    password = os.getenv("REDIS_PASSWORD") or None
+
+    try:
+        if hcfg is not None and getattr(hcfg, "vectordb", None) is not None:
+            from app.core.config.client_config_schema import VectorDBType
+
+            vdb = hcfg.vectordb
+            if vdb.type == VectorDBType.REDIS and vdb.redis is not None:
+                rcfg = vdb.redis
+                if rcfg.url:
+                    url = rcfg.url
+                host = rcfg.host or host
+                port = int(rcfg.port)
+                if rcfg.password_env:
+                    password = os.getenv(rcfg.password_env) or password
+    except Exception:
+        pass
     # quick TCP probe
     reachable = await asyncio.get_event_loop().run_in_executor(
         None, _tcp_reachable, host, port, 2
@@ -257,7 +467,7 @@ async def _check_redis() -> dict:
             client = redis_lib.Redis(
                 host=host,
                 port=port,
-                password=os.getenv("REDIS_PASSWORD") or None,
+                password=password,
                 socket_timeout=_T,
             )
         pong = client.ping()
@@ -293,8 +503,15 @@ _VECTORDB_CHECKS = {
 #  3. EMBEDDERS
 # ══════════════════════════════════════════════════════════════════════
 
-async def _check_emb_huggingface() -> dict:
-    model = os.getenv("HF_EMBED_MODEL", "BAAI/bge-large-en-v1.5")
+async def _check_emb_huggingface(hcfg: Optional[Any] = None) -> dict:
+    model = "BAAI/bge-large-en-v1.5"
+    try:
+        if hcfg is not None and getattr(hcfg, "embedder", None):
+            e = hcfg.embedder
+            if e.type.value.lower() == "huggingface" and e.huggingface:
+                model = e.huggingface.model or model
+    except Exception:
+        pass
     try:
         cache_dir = os.path.join(
             os.getenv("SENTENCE_TRANSFORMERS_HOME",
@@ -316,9 +533,17 @@ async def _check_emb_huggingface() -> dict:
         return _fail(str(e))
 
 
-async def _check_emb_ollama() -> dict:
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    model    = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+async def _check_emb_ollama(hcfg: Optional[Any] = None) -> dict:
+    base_url = "http://localhost:11434"
+    model = "nomic-embed-text"
+    try:
+        if hcfg is not None and getattr(hcfg, "embedder", None):
+            e = hcfg.embedder
+            if e.type.value.lower() == "ollama" and e.ollama:
+                base_url = e.ollama.base_url or base_url
+                model = e.ollama.model or model
+    except Exception:
+        pass
     code, data = await _http_post(
         f"{base_url}/api/embeddings",
         json={"model": model, "prompt": "health"},
@@ -330,11 +555,22 @@ async def _check_emb_ollama() -> dict:
     return _fail(f"HTTP {code}" if code else "Ollama unreachable")
 
 
-async def _check_emb_openai() -> dict:
-    api_key = os.getenv("OPENAI_API_KEY", "")
+async def _check_emb_openai(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "text-embedding-3-small"
+    try:
+        if hcfg is not None and getattr(hcfg, "embedder", None):
+            e = hcfg.embedder
+            if e.type.value.lower() == "openai" and e.openai:
+                model = e.openai.model or model
+                if e.openai.api_key_env:
+                    api_key = os.getenv(e.openai.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("OPENAI_API_KEY not set")
-    model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return _skip("OpenAI embedding API key not set (see embedder.openai.api_key_env in tenant JSON).")
     code, data = await _http_post(
         "https://api.openai.com/v1/embeddings",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -347,11 +583,23 @@ async def _check_emb_openai() -> dict:
     return _fail(f"HTTP {code}")
 
 
-async def _check_emb_cohere() -> dict:
-    api_key = os.getenv("COHERE_API_KEY", "")
+async def _check_emb_cohere(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "embed-english-v3.0"
+    try:
+        if hcfg is not None and getattr(hcfg, "embedder", None):
+            e = hcfg.embedder
+            if e.type.value.lower() == "cohere" and e.cohere:
+                model = e.cohere.model or model
+                if e.cohere.api_key_env:
+                    api_key = os.getenv(e.cohere.api_key_env, "") or api_key
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.getenv("COHERE_API_KEY", "")
     if not api_key:
         return _skip("COHERE_API_KEY not set")
-    model = os.getenv("COHERE_EMBED_MODEL", "embed-english-v3.0")
+    model = model or "embed-english-v3.0"
     code, data = await _http_post(
         "https://api.cohere.ai/v1/embed",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -364,11 +612,22 @@ async def _check_emb_cohere() -> dict:
     return _fail(f"HTTP {code}")
 
 
-async def _check_emb_google() -> dict:
-    api_key = os.getenv("GEMINI_API_KEY", "")
+async def _check_emb_google(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "gemini-embedding-001"
+    try:
+        if hcfg is not None and getattr(hcfg, "embedder", None):
+            e = hcfg.embedder
+            if e.type.value.lower() == "gemini" and e.gemini:
+                model = e.gemini.model or model
+                if e.gemini.api_key_env:
+                    api_key = os.getenv(e.gemini.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("GEMINI_API_KEY not set")
-    model = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+        api_key = os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return _skip("Google embedding API key not set (see embedder.gemini.api_key_env in tenant JSON).")
     # Use the embedContent endpoint to validate the model and key
     code, data = await _http_post(
         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:embedContent?key={api_key}",
@@ -395,23 +654,42 @@ _EMBEDDER_CHECKS = {
 #  4. LLMs
 # ══════════════════════════════════════════════════════════════════════
 
-async def _check_llm_ollama() -> dict:
-    base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    model    = os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
+async def _check_llm_ollama(hcfg: Optional[Any] = None) -> dict:
+    base_url = "http://localhost:11434"
+    model = "llama3.2"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() == "ollama":
+                base_url = ll.base_url or base_url
+                model = ll.model or model
+    except Exception:
+        pass
     data = await _http_get(f"{base_url}/api/tags", timeout=_T)
     if data:
         models = data.get("models", [])
-        names  = [m.get("name", "") for m in models]
-        found  = model in names or any(model in n for n in names)
+        names = [m.get("name", "") for m in models]
+        found = model in names or any(model in n for n in names)
         return _ok(f"{model} | {len(models)} model(s)" + (" | loaded" if found else " | NOT loaded"))
     return _fail("Ollama unreachable")
 
 
-async def _check_llm_openai() -> dict:
-    api_key = os.getenv("OPENAI_API_KEY", "")
+async def _check_llm_openai(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "gpt-4o-mini"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() == "openai":
+                model = ll.model or model
+                if ll.api_key_env:
+                    api_key = os.getenv(ll.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("OPENAI_API_KEY not set")
-    model = os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+    if not api_key:
+        return _skip("OpenAI LLM API key not set (see llm.single.api_key_env in tenant JSON).")
     data = await _http_get(
         "https://api.openai.com/v1/models",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -420,11 +698,22 @@ async def _check_llm_openai() -> dict:
     return _ok(f"{model} | API key valid") if data else _fail("OpenAI unreachable")
 
 
-async def _check_llm_groq() -> dict:
-    api_key = os.getenv("GROQ_API_KEY", "")
+async def _check_llm_groq(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "llama-3.1-8b-instant"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() in ("groq", "grok"):
+                model = ll.model or model
+                if ll.api_key_env:
+                    api_key = os.getenv(ll.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("GROQ_API_KEY not set")
-    model = os.getenv("GROQ_LLM_MODEL", "llama-3.1-8b-instant")
+        api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        return _skip("Groq LLM API key not set (see llm.single.api_key_env in tenant JSON).")
     data = await _http_get(
         "https://api.groq.com/openai/v1/models",
         headers={"Authorization": f"Bearer {api_key}"},
@@ -433,11 +722,22 @@ async def _check_llm_groq() -> dict:
     return _ok(f"{model} | API key valid") if data else _fail("Groq unreachable")
 
 
-async def _check_llm_anthropic() -> dict:
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+async def _check_llm_anthropic(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "claude-3-5-sonnet-20241022"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() == "anthropic":
+                model = ll.model or model
+                if ll.api_key_env:
+                    api_key = os.getenv(ll.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("ANTHROPIC_API_KEY not set")
-    model = os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022")
+        api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key:
+        return _skip("Anthropic LLM API key not set (see llm.single.api_key_env in tenant JSON).")
     code, data = await _http_post(
         "https://api.anthropic.com/v1/messages",
         headers={
@@ -456,11 +756,22 @@ async def _check_llm_anthropic() -> dict:
     return _fail(f"HTTP {code}")
 
 
-async def _check_llm_gemini() -> dict:
-    api_key = os.getenv("GEMINI_API_KEY", "")
+async def _check_llm_gemini(hcfg: Optional[Any] = None) -> dict:
+    api_key = ""
+    model = "gemini-1.5-flash"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() in ("gemini", "google"):
+                model = ll.model or model
+                if ll.api_key_env:
+                    api_key = os.getenv(ll.api_key_env, "") or api_key
+    except Exception:
+        pass
     if not api_key:
-        return _skip("GEMINI_API_KEY not set")
-    model = os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash")
+        api_key = os.getenv("GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        return _skip("Gemini LLM API key not set (see llm.single.api_key_env in tenant JSON).")
     data = await _http_get(
         f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
         timeout=_T + 5,
@@ -496,41 +807,62 @@ _VDB_CONFIGURED = {
     "redis":    lambda: bool(os.getenv("REDIS_URL")) or bool(os.getenv("REDIS_PASSWORD")),
 }
 
-_EMB_CONFIGURED = {
-    "huggingface": lambda: True,
-    "ollama":      lambda: True,
-    "openai":      lambda: bool(os.getenv("OPENAI_API_KEY")),
-    "cohere":      lambda: bool(os.getenv("COHERE_API_KEY")),
-    "google":      lambda: bool(os.getenv("GEMINI_API_KEY")),
-    "gemini":      lambda: bool(os.getenv("GEMINI_API_KEY")),
-}
-
-_LLM_CONFIGURED = {
-    "ollama":    lambda: True,
-    "openai":    lambda: bool(os.getenv("OPENAI_API_KEY")),
-    "groq":      lambda: bool(os.getenv("GROQ_API_KEY")),
-    "grok":      lambda: bool(os.getenv("GROQ_API_KEY")),
-    "anthropic": lambda: bool(os.getenv("ANTHROPIC_API_KEY")),
-    "gemini":    lambda: bool(os.getenv("GEMINI_API_KEY")),
-    "google":    lambda: bool(os.getenv("GEMINI_API_KEY")),
-}
-
 
 @router.get("/health")
 async def ingestion_health(
     scope: str = Query(
-        "configured",
-        description="Health scope: active | configured | all",
-    )
+        "active",  # Changed from "configured" to "active" for routine polling
+        description="Health scope: active (default, only active pipeline) | configured | all",
+    ),
+    client_id: str = Query(
+        None,
+        description="Optional: specific client/tenant to check pipeline health for",
+    ),
 ):
     """
-    Comprehensive health — pings active + configured services only.
+    Comprehensive health — pings services based on scope.
+    
+    Scope modes:
+    - "active" (default): Only check the currently active pipeline components.
+                          Best for routine polling and operator dashboards.
+    - "configured": Check active + any API-keyed providers.
+    - "all": Probe all known backends (useful for diagnostics).
+    
+    When client_id is provided, resolves that tenant's specific pipeline config
+    instead of the default tenant.
+    
     All checks are native-async (httpx / socket). No gRPC libs imported.
     Typically completes in 1-5 s.
     """
-    active_vdb = os.getenv("MAI_VECTORDB", "qdrant").lower()
-    active_emb = os.getenv("MAI_EMBEDDER", "huggingface").lower()
-    active_llm = os.getenv("MAI_LLM", "ollama").lower()
+    active_vdb: str
+    active_emb: str
+    active_llm: str
+
+    _, _hcfg = _health_scope_client(client_id=client_id)
+    if _hcfg is not None:
+        active_vdb = _hcfg.vectordb.type.value.lower()
+        active_emb = _hcfg.embedder.type.value.lower()
+        active_llm = (
+            _hcfg.llm.single.type.value.lower()
+            if _hcfg.llm and _hcfg.llm.single
+            else "ollama"
+        )
+    else:
+        active_vdb = os.getenv("MAI_VECTORDB", "chroma").lower()
+        try:
+            from app.core.config.client_config_resolver import get_client_config
+
+            _dcfg = get_client_config("default")
+            active_emb = _dcfg.embedder.type.value.lower()
+            active_llm = (
+                _dcfg.llm.single.type.value.lower()
+                if _dcfg.llm and _dcfg.llm.single
+                else "ollama"
+            )
+        except Exception:
+            active_emb = os.getenv("MAI_EMBEDDER", "huggingface").lower()
+            active_llm = os.getenv("MAI_LLM", "ollama").lower()
+
     mode = (scope or "configured").strip().lower()
     if mode not in {"active", "configured", "all"}:
         mode = "configured"
@@ -542,24 +874,38 @@ async def ingestion_health(
             return name == active_name
         return name == active_name or cfg_map.get(name, lambda: False)()
 
+    def _emb_should(name: str) -> bool:
+        if mode == "all":
+            return True
+        if mode == "active":
+            return name == active_emb
+        return name == active_emb or _is_emb_configured(name, _hcfg)
+
+    def _llm_should(name: str) -> bool:
+        if mode == "all":
+            return True
+        if mode == "active":
+            return name == active_llm
+        return name == active_llm or _is_llm_configured(name, _hcfg)
+
     # ── collect coroutines ───────────────────────────────────────────
     tasks: dict[str, any] = {}
     tasks["db__postgresql"] = _check_postgres()
 
     for name, fn in _VECTORDB_CHECKS.items():
         if _should_check(name, active_vdb, _VDB_CONFIGURED):
-            tasks[f"vdb__{name}"] = fn()
+            tasks[f"vdb__{name}"] = fn(_hcfg)
 
     for name, fn in _EMBEDDER_CHECKS.items():
-        if _should_check(name, active_emb, _EMB_CONFIGURED):
-            tasks[f"emb__{name}"] = fn()
+        if _emb_should(name):
+            tasks[f"emb__{name}"] = fn(_hcfg)
 
     seen: set = set()
     for name, fn in _LLM_CHECKS.items():
         if fn in seen:
             continue
-        if _should_check(name, active_llm, _LLM_CONFIGURED):
-            tasks[f"llm__{name}"] = fn()
+        if _llm_should(name):
+            tasks[f"llm__{name}"] = fn(_hcfg)
             seen.add(fn)
 
     # ── Celery broker + worker health (sync, run in executor) ──────
@@ -601,14 +947,16 @@ async def ingestion_health(
         "postgresql": {**(flat.get("db__postgresql", _fail("Unknown"))), "active": True}
     }
     vectordbs = {k: _entry(k, "vdb", _VECTORDB_CHECKS, active_vdb, _VDB_CONFIGURED) for k in _VECTORDB_CHECKS}
-    embedders = {k: _entry(k, "emb", _EMBEDDER_CHECKS, active_emb, _EMB_CONFIGURED) for k in _EMBEDDER_CHECKS}
+    _emb_cfg_map = {k: (lambda kk=k: _is_emb_configured(kk, _hcfg)) for k in _EMBEDDER_CHECKS}
+    embedders = {k: _entry(k, "emb", _EMBEDDER_CHECKS, active_emb, _emb_cfg_map) for k in _EMBEDDER_CHECKS}
 
     llms: dict = {}
     seen2: set = set()
+    _llm_cfg_map = {k: (lambda kk=k: _is_llm_configured(kk, _hcfg)) for k in _LLM_CHECKS}
     for k in _LLM_CHECKS:
         if _LLM_CHECKS[k] in seen2 and k != active_llm:
             continue
-        llms[k] = _entry(k, "llm", _LLM_CHECKS, active_llm, _LLM_CONFIGURED)
+        llms[k] = _entry(k, "llm", _LLM_CHECKS, active_llm, _llm_cfg_map)
         seen2.add(_LLM_CHECKS[k])
 
     active_entries = [
@@ -672,17 +1020,21 @@ async def ingestion_health(
 @router.get("/pipeline-config")
 async def pipeline_config():
     """
-    Returns the active pipeline configuration from .env.
+    Returns merged Client JSON pipeline identity for the default tenant (+ infra flags).
     Used by the frontend Pipeline page to render the Data Flow dynamically.
     """
     from app.worker.broker_config import is_celery_enabled
+    from app.core.config.pipeline_runtime import get_pipeline_identity
+
     broker_name = os.getenv("CELERY_BROKER", "redis").lower()
+    cid_sc, _ = _health_scope_client()
+    pi = get_pipeline_identity(cid_sc)
 
     return {
-        "vectordb":  os.getenv("MAI_VECTORDB", "chroma").lower(),
-        "embedder":  os.getenv("MAI_EMBEDDER", "ollama").lower(),
-        "llm":       os.getenv("MAI_LLM", "ollama").lower(),
-        "reranker":  os.getenv("MAI_RERANKER", "none").lower(),
+        "vectordb":  str(pi["vectordb"]).lower(),
+        "embedder":  str(pi["embedder"]).lower(),
+        "llm":       str(pi["llm"]).lower(),
+        "reranker":  str(pi["reranker"]).lower(),
         "broker":    broker_name if is_celery_enabled() else "none",
         "celery_enabled": is_celery_enabled(),
         "kafka_events_enabled": os.getenv("KAFKA_EVENTS_ENABLED", "false").strip().lower() in ("true", "1", "yes"),

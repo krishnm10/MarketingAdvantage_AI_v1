@@ -15,7 +15,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -35,6 +35,12 @@ router = APIRouter(prefix="/api/v2/retrieve")
 
 class RetrieveRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=2000, description="Natural language question")
+    client_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant / client identifier for tenant-scoped retrieval.",
+    )
     intent: str = Field("answer", description="Retrieval intent: answer | explore | audit")
     top_k: Optional[int] = Field(None, ge=1, le=50, description="Override max results (default from policy)")
     search_mode: str = Field("semantic", description="Search mode: semantic | hybrid | keyword")
@@ -84,12 +90,12 @@ class RetrieveResponse(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pluggable embedder (uses MAI_EMBEDDER from .env — ollama/openai/huggingface)
+# Pluggable embedder — uses ingestion pipeline embedder for the resolved client_id
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _embed_query(query: str) -> List[float]:
-    """Embed a query string → vector using the pluggable embedder."""
-    embedder = get_embedder()
+def _embed_query(query: str, business_id: Optional[str] = None) -> List[float]:
+    """Embed a query string → vector using the pluggable embedder for this tenant."""
+    embedder = get_embedder(business_id)
     result = embedder.encode(query, normalize_embeddings=True)
     return result.tolist()
 
@@ -110,18 +116,49 @@ async def retrieve_query(
     Flow: embed query → semantic recall → governance scoring → ranked results.
     Mirrors retrieve_cli.py but exposed as an HTTP API.
     """
-    import os as _os_plog
-    plog = PipelineLogger(
-        request_path="retrieve_api",
-        embedder_model=_os_plog.getenv("MAI_EMBEDDER", "unknown"),
-        vectordb_backend=_os_plog.getenv("MAI_VECTORDB", "unknown"),
+    from app.utils.tenant_validator import (
+        validate_tenant_id_strict,
+        get_storage_uuid_str,
+        TenantValidationError,
     )
-    plog.info("Retrieve query received", query_length=len(req.query), intent=req.intent)
-
+    from app.retrieval.components import (
+        resolve_config_or_fail,
+        resolve_runtime_components,
+        resolve_runtime_components_legacy,
+        instantiate_llm,
+    )
     from app.retrieval.runtime import RetrievalRuntime
     from app.retrieval.repository import RetrievalRepository
     from app.retrieval.types_retrieve import QueryContext, RetrievalIntent
     from app.retrieval.policy import DEFAULT_POLICY_REGISTRY
+
+    # Validate tenant with strict enforcement (uses TENANT_ENFORCEMENT_MODE)
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            req.client_id,
+            source="body",
+            endpoint="retrieve_query",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    
+    retrieve_cid = tenant_ctx.tenant_id
+    # Storage UUID for vector/SQL filtering (Phase 2 will use this)
+    _storage_uuid_str = get_storage_uuid_str(tenant_ctx)
+
+    _cfg_for_authoritative, runtime_mode = resolve_config_or_fail(retrieve_cid)
+    if _cfg_for_authoritative is not None:
+        rc = resolve_runtime_components(_cfg_for_authoritative)
+    else:
+        rc = resolve_runtime_components_legacy()
+
+    plog = PipelineLogger(
+        request_path="retrieve_api",
+        client_id=retrieve_cid,
+        embedder_model=rc.embedder_type,
+        vectordb_backend=rc.vectordb_type,
+    )
+    plog.info("Retrieve query received", query_length=len(req.query), intent=req.intent)
 
     # Validate intent
     intent_map = {
@@ -135,8 +172,6 @@ async def retrieve_query(
             status_code=400,
             detail=f"Invalid intent '{req.intent}'. Must be one of: answer, explore, audit",
         )
-
-    import os as _os_module
 
     start = time.perf_counter()
 
@@ -153,40 +188,24 @@ async def retrieve_query(
     # Use the PII-redacted version for all downstream processing
     embed_text = _scan_result.redacted_text
 
+    def _hyde_llm_provider() -> str:
+        p = (rc.llm_provider or "ollama").lower()
+        return "gemini" if p == "google" else p
+
     # 1. Optional HyDE expansion — use LLM to generate hypothetical answer,
     #    then embed that instead of the raw query for better retrieval.
     if req.enable_hyde:
         try:
-            llm_provider = _os_module.getenv("MAI_LLM", "ollama").lower()
-            llm = None
-            if llm_provider == "ollama":
-                from app.core.llms.ollama_v1 import OllamaLLM
-                _ollama_model = _os_module.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
-                llm = OllamaLLM(model=_ollama_model)
-            elif llm_provider == "openai":
-                from app.core.llms.openai_v1 import OpenAILLM
-                llm = OpenAILLM()
-            elif llm_provider in ("groq", "grok"):
-                from app.core.llms.groq_v1 import GroqLLM
-                llm = GroqLLM()
-            elif llm_provider in ("gemini", "google"):
-                _api_key = _os_module.getenv("GEMINI_API_KEY", "")
-                if _api_key:
-                    from app.core.llms.gemini_v1 import GeminiLLM
-                    llm = GeminiLLM(
-                        model=_os_module.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-                        api_key=_api_key,
-                    )
-            elif llm_provider == "anthropic":
-                _api_key = _os_module.getenv("ANTHROPIC_API_KEY", "")
-                if _api_key:
-                    from app.core.llms.anthropic_v1 import AnthropicLLM
-                    llm = AnthropicLLM(
-                        model=_os_module.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
-                        api_key=_api_key,
-                    )
-
-            if llm is not None:
+            if (rc.llm_provider or "").strip().lower() not in ("", "none"):
+                llm_provider = _hyde_llm_provider()
+                if llm_provider == "google":
+                    llm_provider = "gemini"
+                llm, _resolved = instantiate_llm(
+                    llm_provider,
+                    rc.llm_model,
+                    api_key_env=rc.llm_api_key_env,
+                    base_url=rc.llm_base_url,
+                )
                 hyde_prompt = (
                     "Write a short factual paragraph that would answer this question. "
                     "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
@@ -202,19 +221,30 @@ async def retrieve_query(
 
     # 2. Embed query
     try:
-        query_embedding = await _embed_in_thread(embed_text)
+        query_embedding = await _embed_in_thread(embed_text, retrieve_cid)
     except Exception as e:
         logger.error(f"[RetrieveAPI] Embedding failed: {e}")
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
-    # 2. Build runtime
-    repository = RetrievalRepository(db_session=db)
+    # Build repository aligned with merged Client JSON when authoritative
+    if runtime_mode == "authoritative_config" and _cfg_for_authoritative is not None:
+        from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
+
+        _pipe = get_query_pipeline_for_client(retrieve_cid)
+        repository = RetrievalRepository(
+            db_session=db,
+            vectordb=_pipe.vectordb,
+            collection=rc.collection,
+        )
+    else:
+        repository = RetrievalRepository(db_session=db)
+
     runtime = RetrievalRuntime(
         repository=repository,
         policy_registry=DEFAULT_POLICY_REGISTRY,
     )
 
-    # 3. Retrieve
+    # 3. Retrieve with tenant isolation
     ctx = QueryContext(
         query=req.query,
         intent=intent_enum,
@@ -226,6 +256,8 @@ async def retrieve_query(
             ctx=ctx,
             query_embedding=query_embedding,
             max_results_override=req.top_k,
+            tenant_id=retrieve_cid,           # Tenant slug for logging
+            storage_uuid=_storage_uuid_str,   # Storage UUID for filtering
         )
     except Exception as e:
         logger.error(f"[RetrieveAPI] Retrieval failed: {e}", exc_info=True)
@@ -282,50 +314,50 @@ async def retrieve_query(
         except Exception as e:
             logger.warning("[RetrieveAPI] Hybrid/keyword search failed, using semantic order: %s", e)
 
-    # 4b. Optional cross-encoder reranker — re-scores top-K candidates using a
-    #     cross-attention model for higher precision before threshold filtering.
-    #     Driven by MAI_RERANKER env var (default: none). Failures are non-fatal.
-    _reranker_name = _os_module.getenv("MAI_RERANKER", "none").strip().lower()
+    # 4b. Optional reranker — stack-aware resolver + circuit breaker (non-fatal).
+    _reranker_name = (rc.reranker_name or "none").strip().lower()
     reranker_used = "none"
 
-    if _reranker_name not in ("none", "", "disabled") and ranked_results:
-        try:
-            import app.core.rerankers.register as _rr_register  # noqa: F401 — side-effect registration
-            from app.core.plugin_registry import reranker_registry as _rr_registry
-            from app.core.rerankers.base import RerankCandidate as _RerankCandidate
+    if (
+        _reranker_name not in ("none", "", "disabled")
+        and ranked_results
+        and _cfg_for_authoritative is not None
+    ):
+        from app.core.rerankers.base import RerankCandidate as _RerankCandidate
+        from app.retrieval.reranker_runtime import apply_reranker_with_fallback
 
-            _rr_model = _os_module.getenv("MAI_RERANKER_MODEL", "").strip()
-            _rr_build_kwargs: Dict[str, Any] = {}
-            if _rr_model:
-                _rr_build_kwargs["model_name"] = _rr_model
-
-            _reranker = _rr_registry.build(_reranker_name, **_rr_build_kwargs)
-            _rr_candidates = [
-                _RerankCandidate(
-                    id=r.chunk_id,
-                    text=r.text,
-                    vector_score=r.score,
-                    metadata={},
-                )
-                for r in ranked_results
-            ]
-            _rr_top_k = req.top_k or 10
-            _rr_scored = _reranker.rerank(req.query, _rr_candidates, top_k=_rr_top_k)
-            # Re-order ranked_results to match reranker's ordering
+        _rr_candidates = [
+            _RerankCandidate(
+                id=r.chunk_id,
+                text=r.text,
+                vector_score=r.score,
+                metadata={},
+            )
+            for r in ranked_results
+        ]
+        _rr_top_k = req.top_k or 10
+        _rr_scored, reranker_used, _fb_applied, _fb_reason = apply_reranker_with_fallback(
+            config=_cfg_for_authoritative,
+            query=req.query,
+            candidates=_rr_candidates,
+            top_k=_rr_top_k,
+        )
+        if reranker_used != "none":
             _rr_score_map = {c.id: (c.rerank_score or 0.0) for c in _rr_scored}
             ranked_results = [r for r in ranked_results if r.chunk_id in _rr_score_map]
             ranked_results.sort(
                 key=lambda r: _rr_score_map.get(r.chunk_id, 0.0), reverse=True
             )
-            reranker_used = _reranker_name
             logger.info(
                 "[RetrieveAPI] Reranker '%s' applied | %d → %d candidates",
-                _reranker_name, len(_rr_candidates), len(ranked_results),
+                reranker_used,
+                len(_rr_candidates),
+                len(ranked_results),
             )
-        except Exception as _rr_err:
+        elif _fb_applied:
             logger.warning(
-                "[RetrieveAPI] Reranker '%s' failed, using original order: %s",
-                _reranker_name, _rr_err,
+                "[RetrieveAPI] Reranker fallback exhausted: %s",
+                _fb_reason,
             )
 
     # 5. Apply similarity_threshold filter
@@ -375,8 +407,11 @@ async def retrieve_query(
     answer_latency_ms: Optional[float] = None
     answer_error: Optional[str] = None
 
-    _llm_provider_name = _os_module.getenv("MAI_LLM", "openai").lower()
-    _rag_min_score = float(_os_module.getenv("RAG_ANSWER_MIN_SCORE", "0.25"))
+    _llm_provider_name = (
+        "gemini" if (rc.llm_provider or "openai").lower() == "google"
+        else (rc.llm_provider or "openai").lower()
+    )
+    _rag_min_score = float(rc.rag_min_score)
 
     if req.generate_answer:
         if not results:
@@ -394,52 +429,21 @@ async def retrieve_query(
                     _llm_gen_start = time.perf_counter()
                     _llm = None
 
-                    if _llm_provider_name == "openai":
-                        from app.core.llms.openai_v1 import OpenAILLM
-                        _llm = OpenAILLM()
-                        answer_model = _os_module.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini")
-
-                    elif _llm_provider_name == "ollama":
-                        from app.core.llms.ollama_v1 import OllamaLLM
-                        answer_model = _os_module.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b")
-                        _llm = OllamaLLM(model=answer_model)
-
-                    elif _llm_provider_name in ("groq", "grok"):
-                        from app.core.llms.groq_v1 import GroqLLM
-                        _llm = GroqLLM()
-                        answer_model = _os_module.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile")
-
-                    elif _llm_provider_name in ("gemini", "google"):
-                        _gemini_key = _os_module.getenv("GEMINI_API_KEY", "")
-                        if not _gemini_key:
-                            answer_error = (
-                                "LLM generation failed: GEMINI_API_KEY is not set. "
-                                "Add it to your .env file."
-                            )
-                        else:
-                            from app.core.llms.gemini_v1 import GeminiLLM
-                            answer_model = _os_module.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash")
-                            _llm = GeminiLLM(model=answer_model, api_key=_gemini_key)
-
-                    elif _llm_provider_name == "anthropic":
-                        _anthropic_key = _os_module.getenv("ANTHROPIC_API_KEY", "")
-                        if not _anthropic_key:
-                            answer_error = (
-                                "LLM generation failed: ANTHROPIC_API_KEY is not set. "
-                                "Add it to your .env file."
-                            )
-                        else:
-                            from app.core.llms.anthropic_v1 import AnthropicLLM
-                            answer_model = _os_module.getenv(
-                                "ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"
-                            )
-                            _llm = AnthropicLLM(model=answer_model, api_key=_anthropic_key)
-
-                    else:
+                    if _llm_provider_name not in ("openai", "ollama", "groq", "grok", "gemini", "google", "anthropic"):
                         answer_error = (
                             f"LLM provider '{_llm_provider_name}' is not wired for answer generation. "
                             "Supported: openai, ollama, groq, gemini, anthropic. "
-                            "Update MAI_LLM in your .env file."
+                            "Configure the LLM provider in Client JSON (RAG / pipeline-pluggable)."
+                        )
+                    else:
+                        _prov = "gemini" if _llm_provider_name == "google" else _llm_provider_name
+                        if _prov == "grok":
+                            _prov = "groq"
+                        _llm, answer_model = instantiate_llm(
+                            _prov,
+                            rc.llm_model,
+                            api_key_env=rc.llm_api_key_env,
+                            base_url=rc.llm_base_url,
                         )
 
                     if _llm is not None:
@@ -512,11 +516,13 @@ async def retrieve_query(
     # 8. Build debug metadata (always populated — used by the debug panel)
     # ─────────────────────────────────────────────────────────────────────────
     debug_info: Dict[str, Any] = {
-        "embedder":               _os_module.getenv("MAI_EMBEDDER", "unknown"),
-        "llm_provider":           _llm_provider_name,
-        "vectordb":               _os_module.getenv("MAI_VECTORDB", "unknown"),
-        "chunking_strategy":      _os_module.getenv("CHUNKING_STRATEGY", "unknown"),
-        "collection":             _os_module.getenv("MAI_COLLECTION", "ingested_content"),
+        "client_id":               retrieve_cid,
+        "embedder":                rc.embedder_type,
+        "embedder_model":          rc.embedder_model or None,
+        "llm_provider":            _llm_provider_name,
+        "vectordb":                rc.vectordb_type,
+        "chunking_strategy":       rc.chunking_strategy,
+        "collection":              rc.collection,
         "search_mode":            search_mode,
         "intent":                 req.intent,
         "top_k_requested":        req.top_k,
@@ -572,47 +578,61 @@ async def list_intents(_user=Depends(require_role("admin"))):
 
 
 @router.get("/pipeline-config")
-async def retrieve_pipeline_config(_user=Depends(require_role("admin"))):
+async def retrieve_pipeline_config(
+    client_id: Optional[str] = Query(
+        None,
+        description="Client / tenant id (defaults via MAI_DEFAULT_BUSINESS_ID or 'default').",
+    ),
+    _user=Depends(require_role("admin")),
+):
     """
-    Return the active retrieval pipeline configuration from environment.
-    Used by the Retrieve page debug panel to show what was active for each query.
+    Return active retrieval pipeline fields from merged Client JSON (resolver).
+    Used by the Retrieve page debug panel.
     """
     import os as _os
-    llm_provider = _os.getenv("MAI_LLM", "openai").lower()
+
+    from app.middleware.security_middleware import validate_business_id
+    from app.retrieval.components import (
+        resolve_config_or_fail,
+        resolve_runtime_components,
+        resolve_runtime_components_legacy,
+    )
+
+    cid = validate_business_id(client_id or _os.getenv("MAI_DEFAULT_BUSINESS_ID"))
+    cfg, mode = resolve_config_or_fail(cid)
+    rc = resolve_runtime_components(cfg) if cfg is not None else resolve_runtime_components_legacy()
+
+    llm_provider = (rc.llm_provider or "openai").lower()
+    if llm_provider == "google":
+        llm_provider = "gemini"
+
     llm_key_set = {
         "openai":    bool(_os.getenv("OPENAI_API_KEY")),
         "groq":      bool(_os.getenv("GROQ_API_KEY")),
         "grok":      bool(_os.getenv("GROQ_API_KEY")),
         "anthropic": bool(_os.getenv("ANTHROPIC_API_KEY")),
-        "gemini":    bool(_os.getenv("GEMINI_API_KEY")),
-        "google":    bool(_os.getenv("GEMINI_API_KEY")),
+        "gemini":    bool(_os.getenv("GOOGLE_API_KEY") or _os.getenv("GEMINI_API_KEY")),
+        "google":    bool(_os.getenv("GOOGLE_API_KEY") or _os.getenv("GEMINI_API_KEY")),
         "ollama":    True,
     }
-    llm_model_map = {
-        "openai":    _os.getenv("OPENAI_LLM_MODEL", "gpt-4o-mini"),
-        "groq":      _os.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile"),
-        "grok":      _os.getenv("GROQ_LLM_MODEL", "llama-3.1-70b-versatile"),
-        "anthropic": _os.getenv("ANTHROPIC_LLM_MODEL", "claude-3-5-sonnet-20241022"),
-        "gemini":    _os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-        "google":    _os.getenv("GEMINI_LLM_MODEL", "gemini-1.5-flash"),
-        "ollama":    _os.getenv("OLLAMA_LLM_MODEL", "llama3.1:8b"),
-    }
+
+    if rc.llm_api_key_env:
+        llm_api_ok = bool(_os.getenv(rc.llm_api_key_env))
+    else:
+        llm_api_ok = llm_key_set.get(llm_provider, False)
+
     return {
-        "embedder":             _os.getenv("MAI_EMBEDDER", "unknown"),
-        "embedder_model": (
-            _os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
-            if _os.getenv("MAI_EMBEDDER", "").lower() in ("google", "gemini")
-            else _os.getenv("OPENAI_EMBED_MODEL", "")
-            if _os.getenv("MAI_EMBEDDER", "").lower() == "openai"
-            else _os.getenv("HF_EMBED_MODEL", "")
-        ),
+        "client_id":            cid,
+        "config_mode":          mode,
+        "embedder":             rc.embedder_type,
+        "embedder_model":       rc.embedder_model or "",
         "llm_provider":         llm_provider,
-        "llm_model":            llm_model_map.get(llm_provider, "unknown"),
-        "llm_api_key_set":      llm_key_set.get(llm_provider, False),
-        "vectordb":             _os.getenv("MAI_VECTORDB", "unknown"),
-        "collection":           _os.getenv("MAI_COLLECTION", "ingested_content"),
-        "chunking_strategy":    _os.getenv("CHUNKING_STRATEGY", "unknown"),
-        "rag_min_score":        float(_os.getenv("RAG_ANSWER_MIN_SCORE", "0.25")),
+        "llm_model":            rc.llm_model or "unknown",
+        "llm_api_key_set":      llm_api_ok,
+        "vectordb":             rc.vectordb_type,
+        "collection":           rc.collection,
+        "chunking_strategy":    rc.chunking_strategy,
+        "rag_min_score":        rc.rag_min_score,
         "supported_providers":  ["openai", "ollama", "groq", "gemini", "anthropic"],
     }
 
@@ -621,7 +641,7 @@ async def retrieve_pipeline_config(_user=Depends(require_role("admin"))):
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _embed_in_thread(query: str) -> List[float]:
+async def _embed_in_thread(query: str, business_id: Optional[str] = None) -> List[float]:
     """Run embedding in thread pool to avoid blocking the event loop."""
     import asyncio
-    return await asyncio.to_thread(_embed_query, query)
+    return await asyncio.to_thread(_embed_query, query, business_id)

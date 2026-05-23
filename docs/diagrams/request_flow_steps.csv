@@ -1,0 +1,69 @@
+FlowID,Step,From,To,Action,PrimaryFilesOrModules
+A_API_SHELL,1,User,page.tsx / components,Interaction (click submit),app/frontend-admin/app/**/page.tsx
+A_API_SHELL,2,page.tsx,middleware.ts,Next.js navigation / request,app/frontend-admin/middleware.ts
+A_API_SHELL,3,page.tsx,apiRoutes.ts,Build backend URL,app/frontend-admin/lib/apiRoutes.ts
+A_API_SHELL,4,page.tsx,apiClient.ts,fetch() with Bearer,app/frontend-admin/lib/apiClient.ts
+A_API_SHELL,5,apiClient.ts,app/main.py,HTTPS JSON to FastAPI,app/main.py
+A_API_SHELL,6,main.py,app/api/v2/*_api.py,Route to handler e.g. retrieve_api.py,app/api/v2/*.py
+A_API_SHELL,7,handler,app/auth/guards.py,require_role(...) when protected,app/auth/guards.py
+A_API_SHELL,8,guards,app/auth/deps.py,JWT validation,app/auth/deps.py
+A_API_SHELL,9,handler,services/core/db,Execute business logic,app/services/* app/core/* app/db/*
+A_API_SHELL,10,handler,apiClient,JSON HTTP response,—
+A_API_SHELL,11,apiClient,page.tsx,Parse response,—
+A_API_SHELL,12,page.tsx,User,Updated UI,—
+B_LOGIN,1,User,login/page.tsx,Enter credentials,app/frontend-admin/app/auth/login/page.tsx
+B_LOGIN,2,login/page.tsx,apiClient.ts,POST login,app/frontend-admin/lib/apiClient.ts
+B_LOGIN,3,apiClient.ts,auth_api.py,POST /api/v2/auth/login,app/api/v2/auth_api.py
+B_LOGIN,4,auth_api.py,session_v2.py,Depends(get_db) session opened,app/db/session_v2.py
+B_LOGIN,5,auth_api.py,auth_api.py,Verify USERS_DB / password hash,—
+B_LOGIN,6,auth_api.py,generate_token.py,create_access_token,app/auth/generate_token.py
+B_LOGIN,7,generate_token.py,auth_api.py,JWT returned in body,—
+B_LOGIN,8,auth_api.py,apiClient.ts,TokenResponse JSON,—
+B_LOGIN,9,apiClient.ts,browser,Store token (e.g. localStorage),app/frontend-admin/lib/authToken.ts if used
+C_INGEST_UPLOAD,1,User,upload/page.tsx,Select file + tenant,app/frontend-admin/app/ingestion/upload/page.tsx
+C_INGEST_UPLOAD,2,upload/page.tsx,apiClient.ts,multipart POST + business_id,lib/apiClient.ts
+C_INGEST_UPLOAD,3,apiClient.ts,ingestion_api_v2.py,POST /api/v2/ingestion/upload,app/api/v2/ingestion_api_v2.py
+C_INGEST_UPLOAD,4,ingestion_api_v2.py,tenant_validator.py,validate_tenant_id_strict,app/utils/tenant_validator.py
+C_INGEST_UPLOAD,5,ingestion_api_v2.py,file_router_v2.py,route_file_ingestion,app/services/ingestion/file_router_v2.py
+C_INGEST_UPLOAD,6,file_router_v2.py,static/uploads/api,Write file bytes,static/uploads/api (path)
+C_INGEST_UPLOAD,7,file_router_v2.py,session_v2 + model,Dedup SELECT by hash + tenant,app/db/session_v2.py app/db/models/ingested_file_v2.py
+C_INGEST_UPLOAD,8a,file_router_v2.py,ingestion_api_v2,Return duplicate_skipped if match,—
+C_INGEST_UPLOAD,9,file_router_v2.py,session_v2,INSERT IngestedFileV2 status=uploaded,app/db/models/ingested_file_v2.py
+C_INGEST_UPLOAD,10a,file_router_v2.py,broker_config + tasks.py,Celery: run_ingestion_pipeline.delay,app/worker/broker_config.py app/worker/tasks.py
+C_INGEST_UPLOAD,11a,file_router_v2.py,ingestion_api_v2,HTTP response status=queued,—
+C_INGEST_UPLOAD,10b,file_router_v2.py,parsers e.g. pdf_parser_v2.py,Parse file on API process,app/services/ingestion/pdf_parser_v2.py (or docx csv …)
+C_INGEST_UPLOAD,11b,file_router_v2.py,ingestion_orchestrator.py,ingest_parsed_output,app/services/ingestion/ingestion_orchestrator.py
+C_INGEST_UPLOAD,12b,orchestrator,ingestion_service_v2.py,Chunk dedupe embed upsert,app/services/ingestion/ingestion_service_v2.py
+C_INGEST_UPLOAD,13b,file_router_v2.py,ingestion_api_v2,HTTP response status=ingested,—
+C_INGEST_UPLOAD,14,ingestion_api_v2,upload/page.tsx,JSON to UI,—
+D_CELERY_INGEST,1,Message broker,celery_app.py,Deliver task to worker,app/worker/celery_app.py
+D_CELERY_INGEST,2,tasks.py,tenant_guard.py,resolve_ingestion_tenant,app/worker/tasks.py app/services/ingestion/tenant_guard.py
+D_CELERY_INGEST,3,tasks.py,file_router_v2 PARSER_MAP,Resolve parser for extension,app/services/ingestion/file_router_v2.py
+D_CELERY_INGEST,4,tasks.py,parsers e.g. parse_pdf,_run(parser_func(saved_path)),app/services/ingestion/*_parser_v2.py
+D_CELERY_INGEST,5,tasks.py,ingestion_orchestrator.py,ingest_parsed_output,app/services/ingestion/ingestion_orchestrator.py
+D_CELERY_INGEST,6,orchestrator,client_config_resolver.py,get_client_config + fingerprint,app/core/config/client_config_resolver.py
+D_CELERY_INGEST,7,orchestrator,ingestion_security.py,sanitize_ingestion_chunks,app/services/security/ingestion_security.py
+D_CELERY_INGEST,8,orchestrator,ingestion_service_v2.py,Full ingestion pipeline,app/services/ingestion/ingestion_service_v2.py
+D_CELERY_INGEST,9,ingestion_service_v2.py,app/core/vectordb/*,Upsert vectors,app/core/vectordb/chroma_v1.py pinecone_v1.py …
+D_CELERY_INGEST,10,tasks.py,session_v2.py,Dispose pool + cache_clear after task per tasks.py,app/db/session_v2.py
+E_RETRIEVE_QUERY,1,User,retrieve/page.tsx (example),Submit query + client_id,app/frontend-admin/app/dashboard/retrieve/page.tsx
+E_RETRIEVE_QUERY,2,retrieve/page.tsx,apiClient.ts,POST /api/v2/retrieve/query,lib/apiClient.ts
+E_RETRIEVE_QUERY,3,apiClient.ts,retrieve_api.py,POST + Bearer,app/api/v2/retrieve_api.py
+E_RETRIEVE_QUERY,4,retrieve_api.py,guards.py + deps.py,Admin role check,app/auth/guards.py app/auth/deps.py
+E_RETRIEVE_QUERY,5,retrieve_api.py,tenant_validator.py,validate_tenant_id_strict,app/utils/tenant_validator.py
+E_RETRIEVE_QUERY,6,retrieve_api.py,retrieval/components.py,resolve_config_or_fail resolve_runtime_components,app/retrieval/components.py
+E_RETRIEVE_QUERY,7,retrieve_api.py,security_middleware.scan_text,PII + injection gate,app/middleware/security_middleware.py
+E_RETRIEVE_QUERY,8,retrieve_api.py,ingestion_service_v2._get_pipeline,Optional pipeline for vectordb when authoritative,app/services/ingestion/ingestion_service_v2.py
+E_RETRIEVE_QUERY,9,retrieve_api.py,retrieval/runtime.py + repository.py,runtime.retrieve vector search,app/retrieval/runtime.py app/retrieval/repository.py
+E_RETRIEVE_QUERY,10,retrieval,app/core/vectordb/*,Query embeddings collection,vectordb adapters
+E_RETRIEVE_QUERY,11,retrieve_api.py,app/core/llms/* (optional),generate_answer or HyDE,app/core/llms/*.py
+E_RETRIEVE_QUERY,12,retrieve_api.py,apiClient,RetrieveResponse JSON,—
+F_RAG_QUERY,1,User,dashboard or client,Submit RAG query,—
+F_RAG_QUERY,2,apiClient,rag_api.py,POST /api/v2/rag/query,app/api/v2/rag_api.py
+F_RAG_QUERY,3,rag_api.py,tenant_validator.py,_validated_tenant,app/utils/tenant_validator.py
+F_RAG_QUERY,4,rag_api.py,security_middleware.scan_text,PII + injection gate,app/middleware/security_middleware.py
+F_RAG_QUERY,5,rag_api.py,pipeline_factory.get_cached,Pipeline cache lookup,app/core/pipeline_factory.py
+F_RAG_QUERY,6,rag_api.py,client_config_resolver.py,Build-if-missing get_client_config,app/core/config/client_config_resolver.py
+F_RAG_QUERY,7,rag_api.py,pipeline object,pipeline.query(...),app/core/rag_pipeline.py (assembled graph)
+F_RAG_QUERY,8,pipeline,vectordb + llms,Retrieve + generate,app/core/vectordb/* app/core/llms/*
+F_RAG_QUERY,9,rag_api.py,client,RAGQueryResponse,—

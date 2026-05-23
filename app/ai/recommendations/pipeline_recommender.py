@@ -5,7 +5,8 @@
 #
 # Given an embedding model_id (from embedder_catalog.yaml), produces a
 # complete PipelineRecommendation: compatible VectorDB, Reranker, LLM,
-# chunking strategy, safe token limits, and ready-to-apply env delta sets.
+# chunking strategy, safe token limits, tenant_json_hints for Client JSON patches,
+# and pipeline_pluggable_patch for topology (PATCH rag-config endpoint).
 #
 # Design constraints:
 #   - Pure: no os.getenv, no DB calls, no network calls.
@@ -95,7 +96,7 @@ _LLM_BY_PROVIDER: Dict[str, Dict[str, str]] = {
         "tier":          "cloud-api",
         "reason": (
             "OpenAI GPT-4o-mini is a cost-effective default. "
-            "Alternatively configure Gemini via MAI_LLM=gemini."
+            "Alternatively pair with Gemini LLM in Client JSON (`llm.single.type=gemini`)."
         ),
     },
     "mistral": {
@@ -204,17 +205,6 @@ _TOKENIZER_FAMILY_LABELS: Dict[str, str] = {
     "sentencepiece": "SentencePiece",
 }
 
-# Maps provider → embedding model env var key
-_EMBED_MODEL_ENV_KEY: Dict[str, str] = {
-    "openai":      "OPENAI_EMBED_MODEL",
-    "huggingface": "HF_EMBED_MODEL",
-    "ollama":      "OLLAMA_EMBED_MODEL",
-    "cohere":      "COHERE_EMBED_MODEL",
-    "anthropic":   "ANTHROPIC_EMBED_MODEL",
-    "google":      "GOOGLE_EMBED_MODEL",
-    "mistral":     "MISTRAL_EMBED_MODEL",
-}
-
 # Tokenizer backend recommendation for token_aware chunking
 _TOKENIZER_BACKEND_BY_FAMILY: Dict[str, str] = {
     "tiktoken":      "huggingface",
@@ -248,23 +238,6 @@ def _compute_recommended_overlap(safe_chunk_size: int) -> int:
     """Return 10% of safe_chunk_size as recommended overlap (minimum 8)."""
     return max(8, safe_chunk_size // 10)
 
-
-def _strip_provider_prefix(provider: str, model_id: str) -> str:
-    """Strip leading 'provider/' prefix from model_id if present."""
-    prefix = f"{provider}/"
-    if model_id.startswith(prefix):
-        return model_id[len(prefix):]
-    return model_id
-
-
-def _normalize_client_id(client_id: str) -> str:
-    """Normalize client_id to uppercase env var prefix (mirrors _build_config_from_env)."""
-    return client_id.upper().replace("-", "_").replace(" ", "_")
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def list_catalog_models(
     *,
@@ -332,6 +305,16 @@ def list_catalog_models(
     return sorted(results, key=lambda m: (m["provider"], m["model_id"]))
 
 
+def _embedder_type_from_catalog_provider(provider: str) -> str:
+    """Map embedder_catalog provider → ClientConfig `embedder.type` string."""
+    p = (provider or "").strip().lower()
+    if p == "google":
+        return "gemini"
+    if p in ("openai", "ollama", "huggingface", "cohere", "gemini"):
+        return p
+    return "huggingface"
+
+
 def generate_recommendation(
     *,
     embedder_model_id: str,
@@ -358,7 +341,7 @@ def generate_recommendation(
         success          : bool
         catalog_entry    : display-ready catalog fields (if success=True)
         recommendation   : full recommendation details (if success=True)
-        env_deltas       : {global_updates, tenant_updates, client_id}
+        env_deltas       : {pipeline_pluggable_patch, infra_env_hints, client_id, global_updates?, tenant_updates?}
         alignment_notes  : list of informational strings
         error            : error message (if success=False)
     """
@@ -488,33 +471,29 @@ def generate_recommendation(
             f"Model primarily supports '{lang}'. Ensure your documents match this language."
         )
 
-    # ── 8. Build global env deltas ────────────────────────────────────────
-    embed_model_clean = _strip_provider_prefix(provider, embedder_model_id)
-    embed_env_key     = _EMBED_MODEL_ENV_KEY.get(provider, "EMBED_MODEL")
+    # ── 8. Tenant JSON patch hints (no CHUNK_SIZE / tokenizer in .env) ───────
+    tokenizer_backend = _TOKENIZER_BACKEND_BY_FAMILY.get(family, "huggingface")
 
-    global_updates: Dict[str, str] = {
-        "MAI_EMBEDDER":         provider,
-        embed_env_key:          embed_model_clean,
-        "MAI_VECTORDB":         recommended_vectordb,
-        "MAI_LLM":              llm_rec["provider"],
-        llm_rec["env_model_key"]: llm_rec["model"],
-        "CHUNKING_STRATEGY":    chunking_strategy,
-        "CHUNK_SIZE":           str(safe_chunk_size),
-        "CHUNK_OVERLAP":        str(recommended_overlap),
-        "DEFAULT_TOKENIZER_BACKEND": "huggingface",
+    tenant_json_hints: Dict[str, Any] = {
+        "ingestion.chunking.chunk_size": safe_chunk_size,
+        "ingestion.chunking.chunk_overlap": recommended_overlap,
+        "tokenization.default_tokenizer_backend": tokenizer_backend,
     }
 
-    # ── 9. Build per-tenant env deltas (only when not default) ────────────
-    tenant_updates: Dict[str, str] = {}
-    if client_id and client_id.lower() != "default":
-        pfx = _normalize_client_id(client_id)
-        tenant_updates = {
-            f"MAI_{pfx}_EMBEDDER":  provider,
-            f"MAI_{pfx}_VECTORDB":  recommended_vectordb,
-            f"MAI_{pfx}_LLM":       llm_rec["provider"],
-        }
+    infra_env_hints: Dict[str, str] = {}
 
-    # ── 10. Catalog-level metadata for UI display ─────────────────────────
+    embedder_cfg_type = _embedder_type_from_catalog_provider(provider)
+
+    pipeline_pluggable_patch: Dict[str, str] = {
+        "vectordb_type":  recommended_vectordb,
+        "embedder_type":  embedder_cfg_type,
+        "llm_provider":   llm_rec["provider"],
+    }
+
+    # ── Deprecated: empty placeholders (UI should use pipeline_pluggable_patch + infra hints)
+    global_updates: Dict[str, str] = {}
+    tenant_updates: Dict[str, str] = {}
+
     tokenizer_label = _TOKENIZER_FAMILY_LABELS.get(family, family)
 
     catalog_display = {
@@ -552,6 +531,9 @@ def generate_recommendation(
             "llm":        llm_rec,
         },
         "env_deltas": {
+            "pipeline_pluggable_patch": pipeline_pluggable_patch,
+            "infra_env_hints": infra_env_hints,
+            "tenant_json_hints": tenant_json_hints,
             "global_updates":  global_updates,
             "tenant_updates":  tenant_updates,
             "client_id":       client_id,

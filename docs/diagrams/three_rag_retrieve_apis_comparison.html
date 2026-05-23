@@ -1,0 +1,331 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Three APIs: RAG vs Retrieve vs Retrieve Chat — comparison</title>
+  <style>
+    body.tre { font-family: "Segoe UI", system-ui, sans-serif; margin: 1.25rem 2rem; color: #1a1a1a; max-width: 96rem; line-height: 1.45; }
+    body.tre h1 { font-size: 1.35rem; border-bottom: 2px solid #0d9488; padding-bottom: 0.35rem; }
+    body.tre h2 { font-size: 1.08rem; margin-top: 2rem; color: #0f766e; }
+    body.tre h3 { font-size: 0.98rem; margin-top: 1.25rem; color: #134e4a; }
+    body.tre .meta { background: #f0fdfa; padding: 0.9rem 1rem; border-radius: 8px; font-size: 0.9rem; margin: 1rem 0; border: 1px solid #99f6e4; }
+    body.tre .warn { background: #fff7ed; border-color: #fed7aa; }
+    body.tre .mermaid { overflow-x: auto; background: #fafafa; padding: 1rem; border-radius: 8px; margin: 1rem 0; border: 1px solid #e2e8f0; }
+    body.tre table { border-collapse: collapse; width: 100%; font-size: 0.8rem; margin: 1rem 0; }
+    body.tre th, body.tre td { border: 1px solid #cbd5e1; padding: 0.4rem 0.5rem; vertical-align: top; text-align: left; }
+    body.tre th { background: #e2e8f0; }
+    body.tre code { background: #f1f5f9; padding: 0.08rem 0.3rem; border-radius: 4px; font-size: 0.85em; }
+    body.tre ul.files { font-size: 0.82rem; }
+    @media print { body.tre .no-print { display: none; } body.tre h2 { page-break-after: avoid; } }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js"></script>
+  <script>mermaid.initialize({ startOnLoad: true, theme: "neutral", flowchart: { curve: "basis" } });</script>
+</head>
+<body class="tre">
+
+<h1>Three related APIs: pluggable RAG, enterprise retrieval, and retrieval chat</h1>
+
+<p class="meta no-print">
+  <strong>How to view diagrams:</strong> open this file in Chrome/Edge. If Mermaid does not load from <code>file://</code>, run
+  <code>python -m http.server 8765</code> in <code>docs/diagrams</code> and open this page via <code>http://localhost:8765/</code>.
+</p>
+
+<p class="meta warn">
+  <strong>Security note:</strong> In the current codebase, <code>POST /api/v2/rag/query</code> does <strong>not</strong> use
+  <code>Depends(require_role(...))</code> unlike the two <code>/api/v2/retrieve/*</code> routes. If your deployment expects admin-only access
+  for all query paths, gate <code>/api/v2/rag</code> at the proxy or add an auth dependency in <code>rag_api.py</code>.
+</p>
+
+<h2>1 — At-a-glance comparison</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Aspect</th>
+      <th><code>POST /api/v2/rag/query</code><br/><small>Pluggable RAG</small></th>
+      <th><code>POST /api/v2/retrieve/query</code><br/><small>Retrieval (+ optional LLM)</small></th>
+      <th><code>POST /api/v2/retrieve/chat</code><br/><small>Chat RAG</small></th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Router module</td>
+      <td><code>app/api/v2/rag_api.py</code> — mounted with prefix <code>/api/v2/rag</code> in <code>main.py</code></td>
+      <td><code>app/api/v2/retrieve_api.py</code> — router prefix <code>/api/v2/retrieve</code></td>
+      <td><code>app/api/v2/retrieve_chat_api.py</code> — same prefix <code>/api/v2/retrieve</code></td>
+    </tr>
+    <tr>
+      <td>Primary orchestrator</td>
+      <td><code>pipeline_factory</code> → <code>AssembledPipeline.query</code> → <code>RAGPipeline.query</code> (<code>app/core/rag_pipeline.py</code>)</td>
+      <td><code>RetrievalRuntime.retrieve</code> (<code>app/retrieval/runtime.py</code>) + API-layer post steps</td>
+      <td>Same retrieval core as retrieve/query, then chat-specific steps</td>
+    </tr>
+    <tr>
+      <td>Auth (handler)</td>
+      <td>No <code>require_role</code> on <code>rag_query</code></td>
+      <td><code>require_role("admin")</code></td>
+      <td><code>require_role("admin")</code></td>
+    </tr>
+    <tr>
+      <td>Tenant validation</td>
+      <td><code>validate_tenant_id</code> (422 on error; optional <code>allow_default</code> in helper)</td>
+      <td><code>validate_tenant_id_strict</code> + <code>get_storage_uuid_str</code> for isolation</td>
+      <td>Same strict tenant + storage UUID as retrieve/query</td>
+    </tr>
+    <tr>
+      <td>Config path</td>
+      <td><code>get_client_config(tenant)</code> inside auto-build; full <code>ClientConfig</code> wired into <code>RAGPipeline</code></td>
+      <td><code>resolve_config_or_fail</code> → <code>RuntimeComponents</code> or <code>resolve_runtime_components_legacy</code> (<code>retrieval/components.py</code>)</td>
+      <td>Same as retrieve/query; plus <strong>per-request</strong> overrides for LLM and reranker</td>
+    </tr>
+    <tr>
+      <td>Pipeline cache</td>
+      <td>Uses <code>pipeline_factory.get_cached</code> / <code>build</code> — explicit cache invalidation via <code>DELETE /api/v2/rag/pipeline/cache</code></td>
+      <td>No global RAG pipeline cache; uses <code>_get_ingestion_pipeline</code> / <code>_get_pipeline</code> per need</td>
+      <td>Same as retrieve/query</td>
+    </tr>
+    <tr>
+      <td>Embedding source</td>
+      <td>Inside <code>RAGPipeline</code> — the pipeline’s configured <code>embedder</code> (same family as factory build)</td>
+      <td><code>get_embedder(client_id)</code> → <code>_get_ingestion_pipeline</code> (<code>ingestion_service_v2.py</code>)</td>
+      <td>Same <code>get_embedder</code> path as retrieve/query</td>
+    </tr>
+    <tr>
+      <td>Vector access</td>
+      <td><code>RAGPipeline</code> → <code>vectordb.search</code> with config collection + merged metadata filters</td>
+      <td><code>RetrievalRepository.fetch_candidates</code> — when authoritative, repo gets live <code>vectordb</code> from <code>_get_pipeline</code></td>
+      <td>Same repository/runtime path</td>
+    </tr>
+    <tr>
+      <td>Governance / trust UI</td>
+      <td>Trust scoring inside pipeline (<code>RAGResult.trust_score</code>); chunk story in pipeline metadata</td>
+      <td>Rich <code>ResultItem</code>: <code>trust_decision</code>, <code>explanation</code>, <code>signals</code> from policy + scorer</td>
+      <td><code>ChatResultItem</code> with <code>trust_decision</code> + <code>trust_state</code> (lighter than retrieve debug)</td>
+    </tr>
+    <tr>
+      <td>Query-time security scan (HTTP layer)</td>
+      <td><code>scan_text(..., "rag_query")</code> — injection → 400</td>
+      <td><code>scan_text(..., "retrieve_query")</code>; second scan on context before LLM</td>
+      <td>Scan on last user message <code>"chat_retrieve"</code>; on rewritten query <code>"chat_rewrite"</code>; context scan before LLM</td>
+    </tr>
+    <tr>
+      <td>Extra pipeline PII nodes</td>
+      <td><code>RAGPipeline</code> may run node-based PII middleware pre-embed (<code>pipeline.nodes</code>) — can block or redact</td>
+      <td>Does not use <code>RAGPipeline.nodes</code> for query path</td>
+      <td>Same as retrieve/query</td>
+    </tr>
+    <tr>
+      <td>Hybrid alpha tuning</td>
+      <td>From <code>ClientConfig.retrieval.hybrid_alpha</code> inside pipeline</td>
+      <td>Request field <code>hybrid_alpha</code> on <code>RetrieveRequest</code></td>
+      <td>BM25/RRF uses hard-coded <code>alpha=0.7</code> in handler (no request field)</td>
+    </tr>
+    <tr>
+      <td>Hybrid / BM25 + RRF</td>
+      <td>Controlled by <code>ClientConfig.retrieval.search_mode</code> inside <code>RAGPipeline</code> / shared executor</td>
+      <td>Request <code>search_mode</code>: after retrieval, BM25+RRF reorder in API</td>
+      <td>Same BM25/RRF helpers; order: <strong>rerank first, then BM25/RRF</strong> (differs from retrieve/query)</td>
+    </tr>
+    <tr>
+      <td>Cross-encoder rerank</td>
+      <td>Pipeline’s plugged <code>reranker</code> inside <code>RAGPipeline.query</code></td>
+      <td>After BM25/RRF: <code>reranker_registry.build(rc.reranker_name)</code></td>
+      <td><code>req.reranker</code> overrides config; runs <strong>before</strong> BM25/RRF step</td>
+    </tr>
+    <tr>
+      <td>LLM answer</td>
+      <td>Default part of full RAG: pipeline builds answer from retrieved context (unless chain/model disabled)</td>
+      <td>Opt-in: <code>generate_answer</code> default <strong>false</strong>; gated by <code>RAG_ANSWER_MIN_SCORE</code></td>
+      <td>Default <code>generate_answer</code> <strong>true</strong>; same score gate env var</td>
+    </tr>
+    <tr>
+      <td>Multi-turn / rewrite</td>
+      <td>Single string query only</td>
+      <td>Single query string</td>
+      <td><code>messages[]</code> + <code>_rewrite_query</code> → <code>rewritten_query</code> for embedding when history &gt; 1</td>
+    </tr>
+    <tr>
+      <td>Session</td>
+      <td>Request id / trace in <code>RAGRuntimeContext</code> (not a chat session)</td>
+      <td>None</td>
+      <td><code>session_id</code> (UUID) returned for client-side grouping</td>
+    </tr>
+    <tr>
+      <td>Prompt templates</td>
+      <td>Optional <code>system_prompt</code> on request; else <code>retrieval.prompt_template_id</code> → JSON under <code>app/core/configs/prompts/</code></td>
+      <td>Fixed enterprise RAG prompt string in handler when generating answer</td>
+      <td>Same style prompt as retrieve answer path</td>
+    </tr>
+    <tr>
+      <td>Response shape</td>
+      <td><code>RAGQueryResponse</code>: <code>final_answer</code>, <code>chunk_count</code>, <code>reranked</code>, <code>trust_score</code>, <code>latency_ms</code> breakdown, <code>metadata</code></td>
+      <td><code>RetrieveResponse</code>: ranked <code>results[]</code> with explanations, optional <code>answer*</code>, <code>debug_info</code></td>
+      <td><code>ChatRetrieveResponse</code>: <code>rewritten_query</code>, results, answer fields, <code>debug_info</code></td>
+    </tr>
+    <tr>
+      <td>Admin UI (typical)</td>
+      <td>Route constant in <code>lib/apiRoutes.ts</code>; not wired to a primary dashboard page in-repo</td>
+      <td><code>app/frontend-admin/app/dashboard/retrieve/page.tsx</code></td>
+      <td><code>app/frontend-admin/app/dashboard/retrieve/chat/page.tsx</code></td>
+    </tr>
+    <tr>
+      <td>Observability extra</td>
+      <td>Non-blocking <code>_shadow_dual_execute</code> when migration controller enables shadow dual pipeline (<code>migration_controller</code>)</td>
+      <td>—</td>
+      <td>—</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>2 — Visual: one diagram, three branches</h2>
+<div class="mermaid">
+flowchart TB
+  subgraph Client["Client"]
+    U[User / integrator]
+  end
+
+  subgraph Entry["FastAPI entry — app/main.py"]
+    RAG[POST /api/v2/rag/query<br/>rag_api.rag_query]
+    RET[POST /api/v2/retrieve/query<br/>retrieve_api.retrieve_query]
+    CHAT[POST /api/v2/retrieve/chat<br/>retrieve_chat_api.chat_retrieve]
+  end
+
+  subgraph Sec["Shared security middleware"]
+    SC[security_middleware.scan_text]
+  end
+
+  subgraph RAGStack["Pluggable RAG stack"]
+    PF[pipeline_factory<br/>get_cached / build]
+    AP[AssembledPipeline]
+    RP[RAGPipeline.query<br/>rag_pipeline.py]
+    VDB1[(VectorDB via pipeline)]
+    RR1[Reranker + LLM inside pipeline]
+  end
+
+  subgraph RetStack["Enterprise retrieval stack"]
+    TV[tenant_validator strict + storage UUID]
+    CMP[retrieval/components.py<br/>resolve_config_or_fail]
+    EM[get_embedder → ingestion pipeline]
+    REPO[RetrievalRepository]
+    RT[RetrievalRuntime + policy]
+    POST[API: BM25/RRF, rerank, threshold]
+    LLM2[Optional LLM in handler]
+  end
+
+  subgraph ChatExtra["Chat-only"]
+    RW[_rewrite_query multi-turn]
+    OVR[Per-request llm and reranker overrides]
+  end
+
+  U --> RAG
+  U --> RET
+  U --> CHAT
+
+  RAG --> SC
+  RAG --> PF --> AP --> RP --> VDB1
+  RP --> RR1
+
+  RET --> TV
+  RET --> CMP
+  RET --> SC
+  RET --> EM --> REPO --> RT
+  RT --> POST --> LLM2
+
+  CHAT --> TV
+  CHAT --> CMP
+  CHAT --> RW
+  CHAT --> OVR
+  CHAT --> SC
+  CHAT --> EM --> REPO --> RT
+  RT --> POST
+  POST --> LLM2
+</div>
+
+<h2>3 — Sequence-style overview (condensed)</h2>
+<div class="mermaid">
+sequenceDiagram
+  autonumber
+  participant C as Client
+  participant A as API handler
+  participant X as scan_text
+  participant P as RAGPipeline OR RetrievalRuntime
+  participant V as Vector index
+
+  C->>A: HTTP POST JSON
+  Note over A: rag: optional auth. retrieve*: admin JWT.
+  A->>X: injection / PII redaction on query (or last user line / rewrite)
+  X-->>A: safe text
+  alt Pluggable RAG
+    A->>P: pipeline.query(sanitized)
+    P->>V: search + rerank + LLM internal
+  else Retrieve or Chat
+    A->>P: embed + repository.fetch + policy score
+    P->>V: tenant-scoped recall + hydrate
+    P-->>A: ranked chunks
+    Note over A: BM25/RRF + rerank order differs chat vs retrieve
+    opt generate_answer
+      A->>X: scan retrieved context
+      A->>A: LLM.generate grounded prompt
+    end
+  end
+  A-->>C: JSON response
+</div>
+
+<h2>4 — File-level workflow: <code>POST /api/v2/rag/query</code></h2>
+<ul class="files">
+  <li><code>app/main.py</code> — <code>include_router(rag_router, prefix="/api/v2/rag")</code></li>
+  <li><code>app/api/v2/rag_api.py</code> — <code>rag_query</code>: <code>_validated_tenant</code> → <code>RAGRuntimeContext</code> → <code>scan_text</code> → <code>pipeline_factory.get_cached</code> or <code>get_client_config</code> + <code>pipeline_factory.build</code> → optional prompt template <code>_resolve_prompt_template</code> → <code>pipeline.query(..., runtime_context=)</code> → <code>_shadow_dual_execute</code> (optional) → <code>RAGQueryResponse</code></li>
+  <li><code>app/core/pipeline_factory.py</code> — <code>PipelineFactory.build</code>, cache, <code>AssembledPipeline.query</code> delegation</li>
+  <li><code>app/core/rag_pipeline.py</code> — <code>RAGPipeline.query</code>: config merges, optional node PII, retrieval executor or legacy inline path, embed → search → rerank → context → LLM → trust</li>
+  <li><code>app/core/config/client_config_resolver.py</code> — <code>get_client_config</code>, fingerprints</li>
+  <li><code>app/core/config/client_config_schema.py</code> — <code>ClientConfig</code></li>
+  <li><code>app/utils/tenant_validator.py</code> — <code>validate_tenant_id</code></li>
+  <li><code>app/middleware/security_middleware.py</code> — <code>scan_text</code></li>
+  <li><code>app/utils/pipeline_logger.py</code> — structured logging</li>
+  <li><code>app/core/runtime/runtime_context.py</code> — <code>RAGRuntimeContext</code></li>
+  <li><code>app/core/configs/prompts/*.json</code> — optional system prompt templates</li>
+  <li><code>app/core/migration/migration_controller.py</code> — shadow dual execution flag (used by <code>_shadow_dual_execute</code>)</li>
+  <li>Concrete adapters: <code>app/core/vectordb/*.py</code>, <code>app/core/embedders/*</code>, <code>app/core/rerankers/*</code>, <code>app/core/llms/*</code> (selected at factory build time)</li>
+</ul>
+
+<h2>5 — File-level workflow: <code>POST /api/v2/retrieve/query</code></h2>
+<ul class="files">
+  <li><code>app/main.py</code> — <code>include_router(retrieve_router)</code></li>
+  <li><code>app/api/v2/retrieve_api.py</code> — <code>retrieve_query</code>: <code>require_role("admin")</code> → strict tenant + storage UUID → <code>resolve_config_or_fail</code> / <code>resolve_runtime_components*</code> → intent map → <code>scan_text</code> → optional HyDE (inline LLM) → <code>_embed_in_thread</code> → <code>RetrievalRepository</code> (with <code>_get_pipeline</code> when authoritative) → <code>RetrievalRuntime.retrieve</code> → <code>repository.close()</code> → BM25/RRF → <code>reranker_registry</code> → threshold → <code>ResultItem</code> list → optional answer branch with context <code>scan_text</code> → <code>RetrieveResponse</code></li>
+  <li><code>app/retrieval/components.py</code> — <code>RuntimeComponents</code>, legacy env fallback</li>
+  <li><code>app/retrieval/repository.py</code> — <code>fetch_candidates</code>, DB + vectordb hydration</li>
+  <li><code>app/retrieval/runtime.py</code> — policy, scoring, ranking</li>
+  <li><code>app/retrieval/policy.py</code> / <code>scorer.py</code> / <code>explain.py</code> — governance and explanations</li>
+  <li><code>app/services/ingestion/ingestion_service_v2.py</code> — <code>get_embedder</code>, <code>_get_pipeline</code></li>
+  <li><code>app/core/search/bm25_index.py</code> / <code>rrf_fusion.py</code> — optional hybrid reorder</li>
+  <li><code>app/core/plugin_registry.py</code> + <code>app/core/rerankers/register.py</code> — reranker plugins</li>
+  <li><code>app/frontend-admin/app/dashboard/retrieve/page.tsx</code> — primary UI caller</li>
+</ul>
+
+<h2>6 — File-level workflow: <code>POST /api/v2/retrieve/chat</code></h2>
+<ul class="files">
+  <li><code>app/main.py</code> — same <code>retrieve_router</code> registration as retrieve/query (<code>retrieve_chat_api</code> shares prefix)</li>
+  <li><code>app/api/v2/retrieve_chat_api.py</code> — <code>chat_retrieve</code>: <code>require_role("admin")</code> → intent → strict tenant + storage UUID → <code>resolve_config_or_fail</code> → <code>_resolve_llm</code> for rewrite+answer → scan last user message → <code>_rewrite_query</code> (if multi-turn) + scan rewrite → optional HyDE → <code>_embed_in_thread</code> → same <code>RetrievalRepository</code>/<code>RetrievalRuntime.retrieve</code> as retrieve/query → <strong>reranker (with per-request override)</strong> → <strong>BM25/RRF</strong> → threshold → build <code>ChatResultItem</code> → optional LLM answer with context scan → <code>ChatRetrieveResponse</code></li>
+  <li>All retrieval stack files listed in §5 apply equally here after the chat-specific prologue</li>
+  <li><code>app/frontend-admin/app/dashboard/retrieve/chat/page.tsx</code> — UI for multi-turn chat</li>
+  <li><code>app/frontend-admin/lib/apiRoutes.ts</code> — documents both <code>CHAT</code> and <code>RAG.QUERY</code> paths</li>
+</ul>
+
+<h2>7 — When to use which</h2>
+<table>
+  <tbody>
+    <tr><th><code>/api/v2/rag/query</code></th><td>Use when you want the <strong>single packaged RAG pipeline</strong> (factory-built, config-complete): one call for embed → retrieve → rerank → answer with pipeline-internal trust and timing breakdown. Best for <strong>integrations</strong> that mirror how <code>RAGPipeline</code> is documented. Ensure you are comfortable with the <strong>current auth posture</strong> or add guarding.</td></tr>
+    <tr><th><code>/api/v2/retrieve/query</code></th><td>Use for <strong>admin retrieval debugging</strong>: intents, rich trust/signal explanations, optional hybrid/rerank ordering, retrieval without LLM (<code>generate_answer=false</code>), strict tenant enforcement aligned with ingestion UUIDs.</td></tr>
+    <tr><th><code>/api/v2/retrieve/chat</code></th><td>Use for <strong>multi-turn conversational RAG</strong> in the admin UI: history, query rewrite, per-turn model/rerank overrides, LLM on by default, session id for the client.</td></tr>
+  </tbody>
+</table>
+
+<p class="no-print" style="margin-top:1.5rem;font-size:0.9rem;color:#64748b;">
+  See also:
+  <a href="retrieve_from_ui_detailed_flow.html"><code>retrieve_from_ui_detailed_flow.html</code></a>,
+  <a href="upload_from_ui_detailed_flow.html"><code>upload_from_ui_detailed_flow.html</code></a>,
+  <a href="README.md"><code>README.md</code></a>.
+</p>
+
+</body>
+</html>

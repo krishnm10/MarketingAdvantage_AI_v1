@@ -74,9 +74,10 @@ def _run(coro):
         # properly closed and their WAL state is flushed to disk.
         try:
             from app.services.ingestion.ingestion_service_v2 import (
-                _get_pipeline_for_client,
+                clear_ingestion_pipeline_cache,
             )
-            _get_pipeline_for_client.cache_clear()
+
+            clear_ingestion_pipeline_cache()
         except Exception:
             pass
         loop.close()
@@ -97,7 +98,7 @@ if celery_app is not None:
     @celery_app.task(
         bind=True,
         name="tasks.run_ingestion_pipeline",
-        max_retries=3,
+        max_retries=50,
         default_retry_delay=60,
         queue="ingestion",
     )
@@ -116,6 +117,7 @@ if celery_app is not None:
         from app.services.ingestion.tenant_guard import resolve_ingestion_tenant
         from app.utils.logger import log_info, log_warning
 
+        tenant_id = business_id
         try:
             # Resolve tenant: prefer explicit param, fall back to DB recovery
             tenant_ctx = resolve_ingestion_tenant(
@@ -124,6 +126,7 @@ if celery_app is not None:
                 source="celery_task",
                 allow_default=True,
             )
+            tenant_id = tenant_ctx.tenant_id
 
             parser_func = PARSER_MAP.get(file_ext)
             if parser_func is None:
@@ -143,12 +146,25 @@ if celery_app is not None:
 
         except Exception as exc:
             log_warning(f"[celery/ingestion] Task failed for file_id={file_id}: {exc}")
-            raise self.retry(exc=exc)
+            delay = 60
+            cap = 3
+            try:
+                if tenant_id:
+                    from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+                    _cd = get_client_config_for_ingestion(str(tenant_id)).celery_dispatch
+                    delay = int(_cd.retry_delay_seconds)
+                    cap = int(_cd.max_retries)
+            except Exception:
+                pass
+            if self.request.retries < cap:
+                raise self.retry(exc=exc, countdown=delay)
+            raise
 
     @celery_app.task(
         bind=True,
         name="tasks.run_external_ingestion_task",
-        max_retries=3,
+        max_retries=50,
         default_retry_delay=120,
         queue="ingestion",
     )
@@ -169,6 +185,7 @@ if celery_app is not None:
         from app.services.ingestion.file_router_v2 import route_external_ingestion
         from app.utils.logger import log_info, log_warning
 
+        tenant_id = business_id
         try:
             log_info(f"[celery/external] Ingesting {source_type.upper()} → {source_url}")
             result = _run(
@@ -182,7 +199,20 @@ if celery_app is not None:
             return result
         except Exception as exc:
             log_warning(f"[celery/external] Task failed for {source_url}: {exc}")
-            raise self.retry(exc=exc)
+            delay = 120
+            cap = 3
+            try:
+                if tenant_id:
+                    from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+                    _cd = get_client_config_for_ingestion(str(tenant_id)).celery_dispatch
+                    delay = int(_cd.retry_delay_seconds)
+                    cap = int(_cd.max_retries)
+            except Exception:
+                pass
+            if self.request.retries < cap:
+                raise self.retry(exc=exc, countdown=delay)
+            raise
 
     # ── VALIDATION TASKS (driven by Celery Beat) ─────────────────────────────
 

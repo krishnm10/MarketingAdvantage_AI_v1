@@ -37,6 +37,7 @@ from app.ai.contracts.reranker_contract import (
     RerankerScoreSpace,
     ScoredCandidate,
 )
+from app.core.rerankers.base import RerankerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,11 @@ class LLMJudgeReranker(RerankerContract):
     @property
     def capabilities(self) -> RerankerCapabilities:
         return self._capabilities
+
+    @property
+    def info(self) -> RerankerInfo:
+        """Align with ``BaseReranker`` for ``RAGPipeline`` / ``AssembledPipeline`` logging."""
+        return RerankerInfo(provider="openai_llm_judge", model=self._llm_model)
 
     def rerank(
         self,
@@ -414,6 +420,11 @@ class GenericLLMJudgeReranker(RerankerContract):
     @property
     def capabilities(self) -> RerankerCapabilities:
         return self._capabilities
+
+    @property
+    def info(self) -> RerankerInfo:
+        """Align with ``BaseReranker`` for ``RAGPipeline`` / ``AssembledPipeline`` logging."""
+        return RerankerInfo(provider=f"llm_judge/{self._provider}", model=self._llm_model)
 
     def rerank(
         self,

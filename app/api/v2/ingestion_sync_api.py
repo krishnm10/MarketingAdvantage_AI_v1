@@ -11,7 +11,7 @@ Strategy:
 """
 
 import asyncio
-import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -34,7 +34,19 @@ BATCH_SIZE = 500  # Check IDs in batches to avoid oversized requests
 
 def _get_vectordb_and_collection():
     """Get the pluggable vectordb instance and collection name."""
-    _, adapter = get_chroma_collection()
+    try:
+        _, adapter = get_chroma_collection()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Ingestion sync could not open the vector store adapter (pipeline build). "
+                "Underlying error: "
+                f"{e}"
+            ),
+        ) from e
     # The adapter wraps a BaseVectorDB — extract for direct API calls
     vectordb = adapter._vdb
     collection = adapter.name
@@ -85,13 +97,7 @@ async def detect_orphans(
     Works with ALL vector backends.
     Read-only. No mutations.
     """
-    try:
-        vectordb, collection = _get_vectordb_and_collection()
-    except Exception as e:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Vector DB not available: {e}",
-        )
+    vectordb, collection = _get_vectordb_and_collection()
 
     backend = vectordb.kind
 

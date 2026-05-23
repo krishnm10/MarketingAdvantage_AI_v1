@@ -25,14 +25,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class AppSettings(BaseSettings):
     """
-    Single source of truth for all application configuration.
-    Every field maps 1-to-1 with an existing os.getenv() call in the codebase.
+    Application settings loaded from environment variables and `.env`.
+    Prefer merged Client JSON (`get_client_config*`) for pipeline semantics.
     """
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,   # MAI_VECTORDB and mai_vectordb both work
+        case_sensitive=False,
         extra="ignore",         # Unknown env vars are silently ignored
     )
 
@@ -62,7 +62,8 @@ class AppSettings(BaseSettings):
     )
 
     # ── Vector DB ─────────────────────────────────────────────────────────────
-    mai_vectordb: str = Field(default="chroma", alias="MAI_VECTORDB")
+    # Pipeline backends are configured per tenant in Client JSON (merged default + overlay).
+    # Do not use MAI_VECTORDB here — see app/core/config/client_config_resolver.py.
 
     # ── CORS ──────────────────────────────────────────────────────────────────
     cors_origins: str = Field(default="*", alias="CORS_ORIGINS")
@@ -166,13 +167,7 @@ class AppSettings(BaseSettings):
     celery_worker_disable_gossip: bool = Field(default=True, alias="CELERY_WORKER_DISABLE_GOSSIP")
     celery_worker_disable_mingle: bool = Field(default=True, alias="CELERY_WORKER_DISABLE_MINGLE")
 
-    # ── PHANTOM Hardware Tuning ───────────────────────────────────────────────
-    phantom_embed_batch_size: str = Field(default="", alias="PHANTOM_EMBED_BATCH_SIZE")
-    phantom_upsert_batch_size: str = Field(default="", alias="PHANTOM_UPSERT_BATCH_SIZE")
-    phantom_ingest_workers: str = Field(default="", alias="PHANTOM_INGEST_WORKERS")
-    phantom_bloom_capacity: str = Field(default="", alias="PHANTOM_BLOOM_CAPACITY")
-
-
+    # PHANTOM tuning lives in merged Client JSON under ingestion.phantom (not AppSettings).
 # ---------------------------------------------------------------------------
 # Singleton — imported once at module load time.
 # The .env file is read exactly once; subsequent imports use the cached object.

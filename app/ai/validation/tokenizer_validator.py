@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import statistics
 import threading
 from dataclasses import dataclass, field
@@ -498,6 +497,7 @@ class TokenizerValidator:
         provider: str = "default",
         sample_texts: Optional[List[str]] = None,
         soft_cap_factor_override: Optional[float] = None,
+        factory_backend: Optional[str] = None,
     ) -> "CalibrationResult":
         """
         Measure alignment between a model-native TokenizerContract and the
@@ -523,10 +523,12 @@ class TokenizerValidator:
         ───────
         CalibrationResult with ratio_p95, delta_p95, soft_cap, and more.
         """
-        from app.ai.chunking.token_counter import _DEFAULT_SOFT_CAP_FACTORS
+        from app.ai.chunking.token_counter import current_soft_cap_factors
 
-        factory_backend = os.getenv("DEFAULT_TOKENIZER_BACKEND", "huggingface")
-        cache_key = (model_id, factory_backend)
+        resolved_backend = (
+            (factory_backend or "huggingface").strip().lower()
+        )
+        cache_key = (model_id, resolved_backend)
 
         with _CALIBRATION_LOCK:
             cached = _CALIBRATION_CACHE.get(cache_key)
@@ -552,7 +554,7 @@ class TokenizerValidator:
                 model_id,
             )
             return _uncalibrated_result(
-                model_id, factory_backend, hard_cap, provider, soft_cap_factor_override
+                model_id, resolved_backend, hard_cap, provider, soft_cap_factor_override
             )
 
         ratios: List[float] = []
@@ -563,7 +565,7 @@ class TokenizerValidator:
             if not text.strip():
                 continue
             try:
-                factory_n = _factory_count(text)
+                factory_n = _factory_count(text, backend=resolved_backend)
                 model_n   = tokenizer.count_tokens(text, include_special_tokens=False)
                 if factory_n > 0:
                     ratios.append(model_n / factory_n)
@@ -582,7 +584,7 @@ class TokenizerValidator:
                 successes, len(sample_texts), model_id,
             )
             return _uncalibrated_result(
-                model_id, factory_backend, hard_cap, provider, soft_cap_factor_override
+                model_id, resolved_backend, hard_cap, provider, soft_cap_factor_override
             )
 
         ratios.sort()
@@ -598,9 +600,8 @@ class TokenizerValidator:
         if soft_cap_factor_override is not None:
             factor = max(0.01, min(1.0, soft_cap_factor_override))
         else:
-            default_factor = _DEFAULT_SOFT_CAP_FACTORS.get(
-                provider.lower(), _DEFAULT_SOFT_CAP_FACTORS["default"]
-            )
+            _factors = current_soft_cap_factors()
+            default_factor = _factors.get(provider.lower(), _factors["default"])
             # Never exceed the provider's default soft_cap_factor.
             # Also derive a factor from ratio_p95: factor_from_ratio = 1 / ratio_p95.
             # Use the MORE conservative of the two.
@@ -611,7 +612,7 @@ class TokenizerValidator:
 
         result = CalibrationResult(
             model_id=model_id,
-            factory_backend=factory_backend,
+            factory_backend=resolved_backend,
             ratio_p95=ratio_p95,
             delta_p95=delta_p95,
             ratio_mean=ratio_mean,
@@ -628,7 +629,7 @@ class TokenizerValidator:
             "[TokenizerValidator] Calibration complete | model=%r | backend=%r | "
             "ratio_p95=%.3f | delta_p95=%d | ratio_mean=%.3f | "
             "soft_cap=%d | hard_cap=%d | soft_cap_factor=%.3f | samples=%d",
-            model_id, factory_backend, ratio_p95, delta_p95, ratio_mean,
+            model_id, resolved_backend, ratio_p95, delta_p95, ratio_mean,
             soft_cap, hard_cap, factor, successes,
         )
         return result
@@ -638,6 +639,7 @@ class TokenizerValidator:
         bundle: EmbedderBundle,
         *,
         run_calibration: bool = True,
+        factory_backend: Optional[str] = None,
     ) -> "AlignmentMetrics":  # type: ignore[name-defined]
         """
         Return calibrated AlignmentMetrics for an EmbedderBundle.
@@ -660,8 +662,8 @@ class TokenizerValidator:
         from app.ai.chunking.token_counter import AlignmentMetrics, _default_alignment_metrics
 
         provider = bundle.provider.value if hasattr(bundle.provider, "value") else str(bundle.provider)
-        factory_backend = os.getenv("DEFAULT_TOKENIZER_BACKEND", "huggingface")
-        cache_key = (bundle.model_id, factory_backend)
+        resolved_fb = (factory_backend or "huggingface").strip().lower()
+        cache_key = (bundle.model_id, resolved_fb)
 
         calibration: Optional[CalibrationResult] = None
         if run_calibration:
@@ -675,6 +677,7 @@ class TokenizerValidator:
                         tokenizer=bundle.tokenizer,
                         hard_cap=bundle.embed_max_tokens,
                         provider=provider,
+                        factory_backend=resolved_fb,
                     )
                 except Exception as exc:
                     logger.warning(
@@ -699,7 +702,7 @@ class TokenizerValidator:
             provider=provider,
             hard_cap=bundle.embed_max_tokens,
             model_id=bundle.model_id,
-            factory_backend=factory_backend,
+            factory_backend=resolved_fb,
         )
 
 
@@ -885,11 +888,10 @@ def _uncalibrated_result(
     soft_cap_factor_override: Optional[float],
 ) -> CalibrationResult:
     """Construct a CalibrationResult from provider defaults without sampling."""
-    from app.ai.chunking.token_counter import _DEFAULT_SOFT_CAP_FACTORS
+    from app.ai.chunking.token_counter import current_soft_cap_factors
 
-    default_factor = _DEFAULT_SOFT_CAP_FACTORS.get(
-        provider.lower(), _DEFAULT_SOFT_CAP_FACTORS["default"]
-    )
+    _factors = current_soft_cap_factors()
+    default_factor = _factors.get(provider.lower(), _factors["default"])
     factor = soft_cap_factor_override if soft_cap_factor_override is not None else default_factor
     factor = max(0.01, min(1.0, factor))
     soft_cap = max(1, math.floor(hard_cap * factor))
@@ -917,11 +919,15 @@ def clear_calibration_cache() -> None:
         _CALIBRATION_CACHE.clear()
 
 
-def get_cached_calibration(model_id: str) -> Optional[CalibrationResult]:
-    """Return cached calibration for model_id+active backend, or None."""
-    factory_backend = os.getenv("DEFAULT_TOKENIZER_BACKEND", "huggingface")
+def get_cached_calibration(
+    model_id: str,
+    *,
+    factory_backend: Optional[str] = None,
+) -> Optional[CalibrationResult]:
+    """Return cached calibration for model_id+backend, or None."""
+    fb = (factory_backend or "huggingface").strip().lower()
     with _CALIBRATION_LOCK:
-        return _CALIBRATION_CACHE.get((model_id, factory_backend))
+        return _CALIBRATION_CACHE.get((model_id, fb))
 
 
 # ---------------------------------------------------------------------------

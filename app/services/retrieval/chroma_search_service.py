@@ -1,215 +1,150 @@
 """
-ChromaDB Search Service
-Extracted from retrieve_cli.py for reusability across CLI and API
+ChromaDB Search Service — tenant-scoped via ClientConfig + ingestion pipeline.
 
-Supports BOTH remote (HttpClient) and local (PersistentClient) modes:
-  - Remote: set CHROMA_HOST / CHROMA_PORT in .env
-  - Local:  leave CHROMA_HOST empty → uses CHROMA_PATH (default ./pluggable_db)
+All entrypoints require client_id (tenant slug). No process-wide env singletons.
 """
 
-import os
+from __future__ import annotations
+
 import asyncio
-import chromadb
-from chromadb.config import Settings
-from typing import List, Tuple
+import os
+from typing import Any, Dict, List, Optional, Tuple
+
+from app.core.config.client_config_resolver import get_client_config
+from app.core.config.client_config_schema import VectorDBType
+from app.core.vectordb.base import VectorHit
+from app.services.ingestion.ingestion_service_v2 import _get_ingestion_pipeline_for_client
 from app.utils.logger import log_debug, log_info, log_warning
+from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
 
 
-# =========================================================
-# CONFIGURATION
-# =========================================================
-
-CHROMA_PATH = os.getenv("CHROMA_PATH", "./pluggable_db")
-COLLECTION_NAME = os.getenv("MAI_COLLECTION", "ingested_content")
-
-_CHROMA_CLIENT = None
-_COLLECTION = None
+def _require_client_id(client_id: Optional[str]) -> str:
+    if not client_id or not str(client_id).strip():
+        raise ValueError(
+            "client_id is required for chroma_search_service operations. "
+            "Pass the tenant slug from ClientConfig."
+        )
+    return str(client_id).strip()
 
 
-# =========================================================
-# CHROMADB CONNECTION (SINGLETON)
-# =========================================================
+def _resolve_tenant_chroma(client_id: str):
+    cfg = get_client_config(client_id)
+    if cfg.vectordb.type != VectorDBType.CHROMA:
+        raise ValueError(
+            f"chroma_search_service: client_id={client_id!r} uses vectordb "
+            f"{cfg.vectordb.type.value}, not chroma"
+        )
+    coll = (cfg.vectordb.collection or "").strip()
+    if not coll:
+        raise ValueError(
+            f"vectordb.collection is required for client_id={client_id!r}"
+        )
+    pipeline = _get_ingestion_pipeline_for_client(client_id)
+    ch = cfg.vectordb.chroma
+    path = (ch.persist_directory if ch else None) or ""
+    return pipeline.vectordb, coll, path
 
-def get_chroma_collection():
+
+def get_chroma_collection(client_id: str):
     """
-    Get ChromaDB collection (singleton pattern).
-    Remote mode when CHROMA_HOST is set, local mode otherwise.
-    
-    Returns:
-        chromadb.Collection instance
+    Return raw chromadb.Collection for the tenant (Chroma backends only).
+
+    Prefer BaseVectorDB.search() via semantic_search() for tenant-filtered reads.
     """
-    global _CHROMA_CLIENT, _COLLECTION
-    
-    if _CHROMA_CLIENT is None:
-        chroma_host = os.getenv("CHROMA_HOST") or None
-        if chroma_host:
-            chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
-            use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
-            api_key = os.getenv("CHROMA_API_KEY") or None
-            log_info(f"[ChromaSearch] Connecting to remote ChromaDB at {chroma_host}:{chroma_port}")
-            _CHROMA_CLIENT = chromadb.HttpClient(
-                host=chroma_host,
-                port=chroma_port,
-                ssl=use_ssl,
-                headers={"Authorization": f"Bearer {api_key}"} if api_key else None,
-                settings=Settings(anonymized_telemetry=False),
-            )
-        else:
-            log_info(f"[ChromaSearch] Initializing local ChromaDB at {CHROMA_PATH}")
-            _CHROMA_CLIENT = chromadb.PersistentClient(
-                path=CHROMA_PATH,
-                settings=Settings(anonymized_telemetry=False),
-            )
-        _COLLECTION = _CHROMA_CLIENT.get_collection(COLLECTION_NAME)
-        log_info(f"[ChromaSearch] ✅ Connected to collection '{COLLECTION_NAME}'")
-    
-    return _COLLECTION
+    slug = _require_client_id(client_id)
+    vdb, coll_name, _path = _resolve_tenant_chroma(slug)
+    return vdb._get_collection(coll_name)  # type: ignore[attr-defined]
 
 
-def reset_chroma_collection():
-    """Reset ChromaDB connection (for testing)"""
-    global _CHROMA_CLIENT, _COLLECTION
-    _CHROMA_CLIENT = None
-    _COLLECTION = None
+def reset_chroma_collection() -> None:
+    """Test-only: clear ingestion pipeline cache for chroma clients."""
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        raise RuntimeError(
+            "reset_chroma_collection() is only available during pytest runs."
+        )
+    from app.services.ingestion.ingestion_service_v2 import clear_ingestion_pipeline_cache
 
+    clear_ingestion_pipeline_cache()
 
-# =========================================================
-# SEMANTIC SEARCH (PRODUCTION-GRADE, DEFENSIVE)
-# =========================================================
 
 async def semantic_search(
     query_embedding: List[float],
+    client_id: str,
     limit: int = 200,
-    where: dict = None,
-    where_document: dict = None
+    where: Optional[dict] = None,
+    where_document: Optional[dict] = None,
 ) -> List[Tuple[str, float]]:
     """
-    Search ChromaDB for semantically similar content.
-    
-    Args:
-        query_embedding: Query vector (1024-dim for BAAI/bge-large-en)
-        limit: Maximum results to return (default: 200)
-        where: Metadata filters (optional)
-        where_document: Document filters (optional)
-    
-    Returns:
-        List of (semantic_hash, similarity_score) tuples
-        Sorted by similarity (highest first)
-    
-    Note:
-        - Version-safe: handles both old and new ChromaDB response formats
-        - Defensive: validates all array structures before indexing
-        - Async-safe: runs ChromaDB query in thread pool
+    Tenant-isolated semantic search via BaseVectorDB.search().
     """
-    
-    # Validate input
-    if not query_embedding or len(query_embedding) == 0:
-        log_warning("[ChromaSearch] Empty query embedding provided")
-        return []
-    
-    collection = get_chroma_collection()
-    
-    # Log collection size (for debugging)
-    try:
-        count = collection.count()
-        log_debug(f"[ChromaSearch] Searching collection with {count:,} vectors")
-    except Exception as e:
-        log_debug(f"[ChromaSearch] Could not get count: {e}")
-    
-    # -------------------------------------------------
-    # Execute query in thread pool (ChromaDB is sync)
-    # -------------------------------------------------
-    loop = asyncio.get_running_loop()
-    
-    def _query():
-        query_params = {
-            "query_embeddings": [query_embedding],
-            "n_results": limit,
-        }
-        
-        # Add filters if provided
-        if where is not None:
-            query_params["where"] = where
-        if where_document is not None:
-            query_params["where_document"] = where_document
-        
-        return collection.query(**query_params)
-    
-    try:
-        result = await loop.run_in_executor(None, _query)
-    except Exception as e:
-        log_warning(f"[ChromaSearch] Query failed: {e}")
-        return []
-    
-    # -------------------------------------------------
-    # Parse results (defensive, version-safe)
-    # -------------------------------------------------
-    log_debug(f"[ChromaSearch] Raw result keys: {list(result.keys())}")
-    
-    # Get IDs (semantic hashes)
-    ids = result.get("ids") or []
-    distances = result.get("distances")
-    
-    # Handle nested list format (ChromaDB v0.4.x+)
-    if ids and isinstance(ids[0], list):
-        ids = ids[0]
-    
-    if distances and isinstance(distances, list) and isinstance(distances[0], list):
-        distances = distances[0]
-    
-    log_debug(f"[ChromaSearch] Found {len(ids)} results")
-    
-    # -------------------------------------------------
-    # Convert to (hash, score) tuples
-    # -------------------------------------------------
-    hits: List[Tuple[str, float]] = []
-    
-    for idx, semantic_hash in enumerate(ids):
-        # Convert L2 distance to similarity score
-        if distances and idx < len(distances):
-            # ChromaDB returns L2 distance (lower = more similar)
-            # Convert to similarity: 1.0 - distance (clamped to [0, 1])
-            distance = float(distances[idx])
-            similarity_score = max(0.0, min(1.0, 1.0 - distance))
-        else:
-            # Fallback if distance missing
-            similarity_score = 1.0
-        
-        hits.append((semantic_hash, similarity_score))
-    
-    # Log top result for debugging
-    if hits:
-        log_debug(
-            f"[ChromaSearch] Top result: hash={hits[0][0][:16]}..., "
-            f"score={hits[0][1]:.4f}"
+    slug = _require_client_id(client_id)
+    vdb, coll_name, _path = _resolve_tenant_chroma(slug)
+    tenant_key = storage_uuid_str_for_vectordb_metadata(slug)
+    filters: Dict[str, Any] = dict(where or {})
+    if where_document is not None:
+        log_warning(
+            "[ChromaSearch] where_document is not supported via BaseVectorDB; "
+            "ignored for tenant-scoped search."
         )
-    
-    return hits
 
+    loop = asyncio.get_running_loop()
 
-# =========================================================
-# HEALTH CHECK
-# =========================================================
+    def _search() -> List[VectorHit]:
+        return vdb.search(
+            collection=coll_name,
+            query_embedding=query_embedding,
+            top_k=limit,
+            tenant_id=tenant_key,
+            filters=filters or None,
+        )
 
-def health_check() -> dict:
-    """
-    Check ChromaDB health and return stats.
-    
-    Returns:
-        Dict with health status and stats
-    """
     try:
-        collection = get_chroma_collection()
+        hits = await loop.run_in_executor(None, _search)
+    except Exception as e:
+        log_warning(f"[ChromaSearch] Search failed for client_id={slug}: {e}")
+        return []
+
+    log_debug(f"[ChromaSearch] Found {len(hits)} results for tenant={slug}")
+
+    results: List[Tuple[str, float]] = []
+    for hit in hits:
+        doc_id = str(hit.id)
+        score = max(0.0, min(1.0, float(hit.score)))
+        results.append((doc_id, score))
+
+    if results:
+        log_debug(
+            f"[ChromaSearch] Top result: id={results[0][0][:16]}..., "
+            f"score={results[0][1]:.4f}"
+        )
+
+    return results
+
+
+def health_check(client_id: str) -> dict:
+    """Check ChromaDB health for a specific tenant."""
+    slug = _require_client_id(client_id)
+    try:
+        vdb, coll_name, path = _resolve_tenant_chroma(slug)
+        healthy = vdb.health_check()
+        if not healthy:
+            return {
+                "status": "unhealthy",
+                "client_id": slug,
+                "error": "vectordb.health_check() returned False",
+            }
+        collection = get_chroma_collection(slug)
         count = collection.count()
-        
         return {
             "status": "healthy",
-            "collection_name": COLLECTION_NAME,
+            "collection_name": coll_name,
             "total_vectors": count,
-            "storage_path": CHROMA_PATH
+            "storage_path": path,
+            "client_id": slug,
         }
     except Exception as e:
         return {
             "status": "unhealthy",
-            "error": str(e)
+            "client_id": slug,
+            "error": str(e),
         }

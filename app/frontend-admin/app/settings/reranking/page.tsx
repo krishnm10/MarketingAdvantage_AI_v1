@@ -1,14 +1,25 @@
 "use client";
 
 import { useEffect, useState, useCallback } from "react";
+import Link from "next/link";
 import {
   SlidersHorizontal, Zap, Filter, ShieldCheck, Brain, ChevronDown,
   ChevronUp, RefreshCw, CheckCircle2, XCircle, Info, Save, AlertTriangle,
-  Loader2, BarChart3, Layers, Search, Hash, Cpu, Cloud,
+  Loader2, BarChart3, Layers, Search, Hash, Cpu, Cloud, MessageSquare,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { useTenant } from "@/contexts/TenantContext";
+import type { EffectiveTenantRuntime } from "@/lib/effectiveTenantRuntime";
+import { RuntimeWarningBanner } from "@/components/runtime/RuntimeWarningBanner";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 /* ─── Types ─── */
 interface RerankerEntry {
@@ -65,22 +76,98 @@ interface PipelineConfig {
     type: string | null;
     model: string | null;
     top_k: number;
-    device: string;
+    device?: string;
   } | null;
+}
+
+/** UI-only sentinel — not stored on disk; maps to `retrieval.prompt_template_id: null`. */
+const SYSTEM_DEFAULT_SELECT_VALUE = "system_default";
+
+interface PromptTemplateListItem {
+  template_id: string;
+  name: string;
+  version?: string;
+  tags?: string[];
+  citation_style?: string;
+}
+
+function normalizePromptTemplateSelect(value: string | null | undefined): string {
+  if (!value || !String(value).trim()) {
+    return SYSTEM_DEFAULT_SELECT_VALUE;
+  }
+  return String(value).trim();
+}
+
+function persistPromptTemplateId(selectValue: string): string | null {
+  if (selectValue === SYSTEM_DEFAULT_SELECT_VALUE) {
+    return null;
+  }
+  return selectValue;
 }
 
 /* ─── Infer reranker metadata from catalog model_id ─── */
 function inferRerankerType(modelId: string | null): { type: string; provider?: string } {
   if (!modelId) return { type: "crossencoder" };
-  if (modelId.startsWith("llm-judge/")) {
-    if (modelId.includes("gemini")) return { type: "llm_judge", provider: "gemini" };
+  const id = modelId.trim();
+  const lower = id.toLowerCase();
+  if (id.startsWith("llm-judge/")) {
+    if (id.includes("gemini")) return { type: "llm_judge", provider: "gemini" };
     return { type: "llm_judge", provider: "openai" };
   }
-  if (modelId.startsWith("cohere/")) return { type: "cohere" };
-  if (modelId.startsWith("BAAI/bge-reranker")) return { type: "bge_reranker" };
-  if (modelId.startsWith("flashrank/")) return { type: "flashrank" };
-  if (modelId.startsWith("colbert/")) return { type: "colbert" };
+  if (
+    lower.startsWith("gpt-") ||
+    lower.startsWith("o1-") ||
+    lower.startsWith("o3-") ||
+    lower.startsWith("o4-") ||
+    lower.startsWith("chatgpt-") ||
+    lower.startsWith("claude-")
+  ) {
+    return { type: "llm_judge", provider: "openai" };
+  }
+  if (lower.startsWith("gemini-")) {
+    return { type: "llm_judge", provider: "gemini" };
+  }
+  if (id.startsWith("cohere/")) return { type: "cohere" };
+  if (id.startsWith("BAAI/bge-reranker")) return { type: "bge_reranker" };
+  if (id.startsWith("flashrank/")) return { type: "flashrank" };
+  if (id.startsWith("colbert/")) return { type: "colbert" };
   return { type: "crossencoder" };
+}
+
+const DEFAULT_MODEL_BY_TYPE: Record<string, string> = {
+  flashrank: "flashrank/ms-marco-MiniLM-L-12-v2",
+  crossencoder: "cross-encoder/ms-marco-MiniLM-L-12-v2",
+  llm_judge: "llm-judge/gpt-4o-mini",
+  cohere: "cohere/rerank-english-v3.0",
+  bge_reranker: "BAAI/bge-reranker-v2-m3",
+  colbert: "colbert/colbertv2.0",
+};
+
+const RERANKER_TYPE_OPTIONS: { value: string; label: string }[] = [
+  { value: "none", label: "None (skip reranking)" },
+  { value: "flashrank", label: "FlashRank (local, CPU)" },
+  { value: "crossencoder", label: "Cross-Encoder (local HF)" },
+  { value: "bge_reranker", label: "BGE Reranker" },
+  { value: "llm_judge", label: "LLM-as-Judge (cloud)" },
+  { value: "cohere", label: "Cohere Rerank (API)" },
+  { value: "colbert", label: "ColBERT" },
+];
+
+function isRerankerConfigDrift(
+  storedType: string | undefined | null,
+  modelId: string | null
+): boolean {
+  if (!modelId || !storedType || storedType === "none") {
+    return false;
+  }
+  return storedType !== inferRerankerType(modelId).type;
+}
+
+function defaultModelForType(rerankerType: string): string | null {
+  if (rerankerType === "none") {
+    return null;
+  }
+  return DEFAULT_MODEL_BY_TYPE[rerankerType] ?? null;
 }
 
 /* ─── Provider badge color ─── */
@@ -111,11 +198,11 @@ const RECALL_COLORS: Record<string, string> = {
 };
 
 export default function RerankingPage() {
+  const { clientId, clientIdInput, setClientId } = useTenant();
   const [rerankers,       setRerankers]       = useState<RerankerEntry[]>([]);
   const [transforms,      setTransforms]      = useState<QueryTransform[]>([]);
   const [rules,           setRules]           = useState<RuleEntry[]>([]);
   const [pipelineConfig,  setPipelineConfig]  = useState<PipelineConfig | null>(null);
-  const [clientId,        setClientId]        = useState("default");
   const [loading,         setLoading]         = useState(true);
   const [saving,          setSaving]          = useState(false);
   const [saveStatus,      setSaveStatus]      = useState<"idle"|"ok"|"err">("idle");
@@ -135,8 +222,64 @@ export default function RerankingPage() {
   const [hybridAlpha,        setHybridAlpha]        = useState(0.7);
   const [topKRetrieval,      setTopKRetrieval]      = useState(20);
   const [topKFinal,          setTopKFinal]          = useState(5);
+  const [rerankerType,       setRerankerType]       = useState<string>("none");
   const [rerankerModel,      setRerankerModel]      = useState<string | null>(null);
   const [rerankerTopK,       setRerankerTopK]       = useState(5);
+  const [rerankerConfigDriftWarning, setRerankerConfigDriftWarning] = useState(false);
+  const [availableTemplates, setAvailableTemplates] = useState<PromptTemplateListItem[]>([]);
+  const [promptTemplateSelect, setPromptTemplateSelect] = useState<string>(
+    SYSTEM_DEFAULT_SELECT_VALUE
+  );
+  const [runtimeWarnings, setRuntimeWarnings] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!clientId) return;
+    const controller = new AbortController();
+    let cancelled = false;
+    apiClient
+      .get<EffectiveTenantRuntime>(API.MODELS.RUNTIME(clientId), {
+        signal: controller.signal,
+      })
+      .then((res) => {
+        if (!cancelled) setRuntimeWarnings(res.data.warnings ?? []);
+      })
+      .catch((err: unknown) => {
+        const canceled =
+          (err as { code?: string; name?: string })?.code === "ERR_CANCELED" ||
+          (err as { name?: string })?.name === "CanceledError";
+        if (!canceled && !cancelled) setRuntimeWarnings([]);
+      });
+    return () => {
+      cancelled = true;
+      controller.abort();
+    };
+  }, [clientId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await apiClient.get<PromptTemplateListItem[]>(API.PROMPT_TEMPLATES.LIST());
+        const rows = (res.data ?? [])
+          .filter((t): t is PromptTemplateListItem => Boolean(t?.template_id))
+          .sort((a, b) => a.template_id.localeCompare(b.template_id));
+        if (!cancelled) {
+          setAvailableTemplates(rows);
+        }
+      } catch (err) {
+        console.warn(
+          "[Reranking] Failed to load prompt templates from Prompt Library:",
+          err instanceof Error ? err.message : err
+        );
+        if (!cancelled) {
+          setAvailableTemplates([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -165,9 +308,29 @@ export default function RerankingPage() {
       setHybridAlpha(d.retrieval.hybrid_alpha);
       setTopKRetrieval(d.retrieval.top_k_retrieval);
       setTopKFinal(d.retrieval.top_k_final);
-      if (d.reranker) {
-        setRerankerModel(d.reranker.model);
+      setPromptTemplateSelect(
+        normalizePromptTemplateSelect(d.retrieval.prompt_template_id)
+      );
+      if (d.reranker?.model) {
+        const storedType = d.reranker.type ?? inferRerankerType(d.reranker.model).type;
+        const drift = isRerankerConfigDrift(storedType, d.reranker.model);
+        if (drift) {
+          const correctedType = inferRerankerType(d.reranker.model).type;
+          setRerankerType(correctedType);
+          setRerankerModel(
+            defaultModelForType(correctedType) ?? d.reranker.model
+          );
+          setRerankerConfigDriftWarning(true);
+        } else {
+          setRerankerType(storedType);
+          setRerankerModel(d.reranker.model);
+          setRerankerConfigDriftWarning(false);
+        }
         setRerankerTopK(d.reranker.top_k);
+      } else {
+        setRerankerType("none");
+        setRerankerModel(null);
+        setRerankerConfigDriftWarning(false);
       }
     } catch (e) {
       console.error(e);
@@ -178,11 +341,42 @@ export default function RerankingPage() {
 
   useEffect(() => { load(); }, [load]);
 
+  const onRerankerTypeChange = (type: string) => {
+    setRerankerConfigDriftWarning(false);
+    setRerankerType(type);
+    if (type === "none") {
+      setRerankerModel(null);
+      return;
+    }
+    const defaultId = defaultModelForType(type);
+    if (defaultId) {
+      setRerankerModel(defaultId);
+    }
+  };
+
+  const onRerankerModelChange = (modelId: string) => {
+    setRerankerConfigDriftWarning(false);
+    const id = modelId.trim() || null;
+    setRerankerModel(id);
+    if (id) {
+      setRerankerType(inferRerankerType(id).type);
+    } else {
+      setRerankerType("none");
+    }
+  };
+
+  const filteredRerankerModels = rerankers.filter((r) => {
+    if (rerankerType === "none") {
+      return false;
+    }
+    return inferRerankerType(r.model_id).type === rerankerType;
+  });
+
   const handleSave = async () => {
     setSaving(true);
     setSaveStatus("idle");
     try {
-      const inferred = inferRerankerType(rerankerModel);
+      const inferred = rerankerModel ? inferRerankerType(rerankerModel) : null;
       await apiClient.put(API.RAG_CONFIG.PUT_PIPELINE(clientId), {
         enable_hyde:           enableHyde,
         enable_multi_query:    enableMultiQuery,
@@ -194,10 +388,11 @@ export default function RerankingPage() {
         token_budget_fraction: budgetFraction,
         search_mode:           searchMode,
         hybrid_alpha:          hybridAlpha,
-        reranker_model_id:     rerankerModel,
+        prompt_template_id:    persistPromptTemplateId(promptTemplateSelect),
+        reranker_model_id:     rerankerType === "none" ? null : rerankerModel,
         reranker_top_k:        rerankerTopK,
-        reranker_type:         rerankerModel ? inferred.type : null,
-        ...(inferred.provider ? { judge_provider: inferred.provider } : {}),
+        reranker_type:         rerankerType === "none" ? null : rerankerType,
+        ...(inferred?.provider ? { judge_provider: inferred.provider } : {}),
       });
       setSaveStatus("ok");
       // Re-fetch so the UI reflects what is now persisted on disk
@@ -234,7 +429,7 @@ export default function RerankingPage() {
         </div>
         <div className="flex items-center gap-3">
           <input
-            value={clientId}
+            value={clientIdInput}
             onChange={e => setClientId(e.target.value)}
             placeholder="client_id"
             className="rounded-lg border border-slate-700 bg-slate-800 px-3 py-1.5 text-sm text-white placeholder-slate-500 focus:border-primary-500 focus:outline-none"
@@ -273,6 +468,8 @@ export default function RerankingPage() {
           </span>
         </div>
       )}
+
+      <RuntimeWarningBanner warnings={runtimeWarnings} />
 
       {/* Tabs */}
       <div className="flex gap-1 rounded-xl bg-slate-800/50 p-1 w-fit">
@@ -361,31 +558,44 @@ export default function RerankingPage() {
             </h2>
             <div className="space-y-3">
               <div>
-                <label className="block text-xs text-slate-400 mb-1">Reranker Model</label>
+                <label className="block text-xs text-slate-400 mb-1">Reranker engine</label>
                 <select
-                  value={rerankerModel ?? ""}
-                  onChange={e => setRerankerModel(e.target.value || null)}
+                  value={rerankerType}
+                  onChange={e => onRerankerTypeChange(e.target.value)}
                   className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white focus:border-primary-500 focus:outline-none"
                 >
-                  <option value="">— None (skip reranking) —</option>
-                  {(["local", "api"] as const).map(tier => {
-                    const group = rerankers.filter(r => r.tier === tier);
-                    if (!group.length) return null;
-                    return (
-                      <optgroup key={tier} label={tier === "local" ? "Local / GPU Models" : "API-based (Cloud)"}>
-                        {group.map(r => (
-                          <option key={r.model_id} value={r.model_id}>
-                            {r.display_name} {r.requires_gpu ? "⚡GPU" : ""}
-                            {r.provider === "gemini" ? " [Gemini]" :
-                             r.provider === "openai_llm" ? " [OpenAI LLM]" : ""}
-                          </option>
-                        ))}
-                      </optgroup>
-                    );
-                  })}
+                  {RERANKER_TYPE_OPTIONS.map(opt => (
+                    <option key={opt.value} value={opt.value}>{opt.label}</option>
+                  ))}
                 </select>
               </div>
-              {rerankerModel && (
+              {rerankerConfigDriftWarning && (
+                <p className="text-xs text-amber-400/90 border border-amber-500/30 bg-amber-500/10 rounded-lg px-3 py-2">
+                  Reranker config was auto-corrected for display (type/model mismatch). Save to persist the fix.
+                </p>
+              )}
+              <div>
+                <label className="block text-xs text-slate-400 mb-1">Reranker model</label>
+                <select
+                  value={rerankerModel ?? ""}
+                  onChange={e => onRerankerModelChange(e.target.value)}
+                  disabled={rerankerType === "none"}
+                  className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-white focus:border-primary-500 focus:outline-none disabled:opacity-50"
+                >
+                  <option value="">
+                    {rerankerType === "none"
+                      ? "— Select an engine above —"
+                      : "— Select a model —"}
+                  </option>
+                  {filteredRerankerModels.map(r => (
+                    <option key={r.model_id} value={r.model_id}>
+                      {r.display_name}
+                      {r.requires_gpu ? " ⚡GPU" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {rerankerType !== "none" && rerankerModel && (
                 <>
                   <div>
                     <label className="block text-xs text-slate-400 mb-1">Reranker Top-K</label>
@@ -408,6 +618,54 @@ export default function RerankingPage() {
                     ) : null;
                   })()}
                 </>
+              )}
+            </div>
+          </div>
+
+          {/* Prompt Library Customization */}
+          <div className="rounded-xl border border-slate-700/50 bg-slate-900 p-5 space-y-4 lg:col-span-2">
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <MessageSquare className="h-4 w-4 text-primary-400" />
+              Prompt Library Customization
+            </h2>
+            <p className="text-xs text-slate-400">
+              Prepends tenant-specific instructions from the Prompt Library before core grounding rules on chat RAG.
+              Manage templates in{" "}
+              <Link
+                href="/settings/prompt-builder"
+                className="text-primary-400 hover:text-primary-300 underline underline-offset-2"
+              >
+                Prompt Builder
+              </Link>
+              .
+            </p>
+            <div>
+              <label className="block text-xs text-slate-400 mb-1">Answer prompt template</label>
+              <Select
+                value={promptTemplateSelect}
+                onValueChange={setPromptTemplateSelect}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select a prompt template" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={SYSTEM_DEFAULT_SELECT_VALUE}>
+                    System Default (Core Grounding Only)
+                  </SelectItem>
+                  {availableTemplates.map((t) => (
+                    <SelectItem key={t.template_id} value={t.template_id}>
+                      <span className="flex flex-col items-start gap-0.5">
+                        <span>{t.name}</span>
+                        <span className="font-mono text-[10px] text-slate-500">{t.template_id}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              {promptTemplateSelect !== SYSTEM_DEFAULT_SELECT_VALUE && (
+                <p className="mt-2 text-[10px] text-slate-500 font-mono">
+                  retrieval.prompt_template_id → {promptTemplateSelect}
+                </p>
               )}
             </div>
           </div>

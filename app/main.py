@@ -247,7 +247,14 @@ async def lifespan(app: FastAPI):
         logger.info("✅ Environment validation passed (AI_PROFILE=%s)", _ai_profile)
 
     # ─────────────────────────────────────────────────────────────────
-    active_vectordb = os.getenv("MAI_VECTORDB", "chroma").lower()
+    try:
+        from app.core.config.client_config_resolver import get_client_config
+        from app.middleware.security_middleware import validate_business_id
+
+        _startup_cid = validate_business_id(os.getenv("MAI_DEFAULT_BUSINESS_ID"))
+        active_vectordb = get_client_config(_startup_cid).vectordb.type.value.lower()
+    except Exception:
+        active_vectordb = "chroma"
     pipeline_factory.invalidate_all()
     logger.info("[Startup] Cleared cached pipelines before initialization.")
 

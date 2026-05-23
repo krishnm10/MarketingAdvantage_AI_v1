@@ -32,7 +32,6 @@ USAGE:
 from __future__ import annotations
 
 import json
-import os
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union, Literal
@@ -133,6 +132,11 @@ class ChromaConfig(BaseModel):
         None,
         description="Env var NAME holding ChromaDB API key (for auth-enabled servers)."
     )
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the API key "
+        "(e.g. ARN or resource path). Unused at runtime unless a vault adapter is enabled.",
+    )
     tenant:       str            = "default_tenant"
     database:     str            = "default_database"
     anonymized_telemetry: bool   = False
@@ -157,6 +161,10 @@ class QdrantConfig(BaseModel):
         None,
         description="Env var NAME holding Qdrant API key. Never the key itself."
     )
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Qdrant API key.",
+    )
     host:         str   = "localhost"
     port:         int   = 6333
     transport:    Literal["auto", "http", "grpc"] = "auto"
@@ -176,6 +184,10 @@ class WeaviateConfig(BaseModel):
     api_key_env: Optional[str] = Field(
         None, description="Env var NAME for WCS API key."
     )
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Weaviate API key.",
+    )
     embedded:           bool             = False
     transport:          Literal["auto", "http", "grpc"] = "auto"
     grpc_host:          Optional[str]    = None
@@ -188,6 +200,10 @@ class PineconeConfig(BaseModel):
     """Pinecone — fully managed cloud VectorDB."""
     mode:           Literal["cloud", "local"] = "cloud"
     api_key_env:    Optional[str] = Field(None, description="Env var NAME for Pinecone API key.")
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Pinecone API key.",
+    )
     index_name:     str  = Field(..., description="Pinecone index name — unique per client.")
     namespace:      str  = "default"
     embedding_dim:  int  = Field(..., description="Must match embedder output dimension exactly.")
@@ -208,6 +224,10 @@ class MilvusConfig(BaseModel):
     """Milvus — standalone, cluster, or Zilliz Cloud."""
     uri:           Optional[str] = Field(None, description="Zilliz Cloud URI.")
     token_env:     Optional[str] = Field(None, description="Env var for Zilliz token.")
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Milvus / Zilliz token.",
+    )
     host:          str  = "localhost"
     port:          int  = 19530
     db_name:       str  = "default"
@@ -228,6 +248,10 @@ class RedisConfig(BaseModel):
     port:           int  = 6379
     password_env:   Optional[str] = Field(
         None, description="Env var NAME holding Redis password."
+    )
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Redis password.",
     )
     username:       Optional[str] = None
     db:             int  = 0
@@ -289,6 +313,10 @@ class OllamaEmbedderConfig(BaseModel):
 class OpenAIEmbedderConfig(BaseModel):
     model:            str            = Field(..., description="e.g. text-embedding-3-small")
     api_key_env:      str            = Field(..., description="Env var NAME for API key.")
+    secret_ref:       Optional[str]  = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the embedding API key.",
+    )
     organization_env: Optional[str] = None
     normalize:        bool           = True
 
@@ -304,6 +332,10 @@ class HuggingFaceEmbedderConfig(BaseModel):
 class CohereEmbedderConfig(BaseModel):
     model:       str = Field(..., description="e.g. embed-english-v3.0")
     api_key_env: str = Field(..., description="Env var NAME for Cohere API key.")
+    secret_ref:  Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Cohere API key.",
+    )
     normalize:   bool = True
 
 
@@ -316,6 +348,10 @@ class GeminiEmbedderConfig(BaseModel):
     api_key_env: str = Field(
         "GOOGLE_API_KEY",
         description="Env var NAME holding the Google AI API key.",
+    )
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the Google AI API key.",
     )
     normalize:   bool = True
 
@@ -335,6 +371,57 @@ class EmbedderConfig(BaseModel):
     huggingface: Optional[HuggingFaceEmbedderConfig] = None
     cohere:      Optional[CohereEmbedderConfig]       = None
     gemini:      Optional[GeminiEmbedderConfig]       = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def coerce_google_embedder_alias(cls, data: Any) -> Any:
+        """
+        Branding alias embedder.type 'google' / MAI_EMBEDDER=google.
+
+        - Migrates legacy nested key ``google`` → ``gemini`` when present.
+        - If ``gemini`` (or migrated) block exists, sets ``type`` to ``gemini``.
+        - If only another block exists (e.g. HuggingFace from JSON merged with a
+          mistaken env override ``google``), sets ``type`` to that provider so we
+          do not contradict the actual sub-config after deep-merge.
+        """
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+
+        if isinstance(out.get("google"), dict) and out.get("gemini") is None:
+            out["gemini"] = out.pop("google")
+        elif "google" in out:
+            out.pop("google", None)
+
+        raw_type = out.get("type")
+        if not isinstance(raw_type, str) or raw_type.strip().lower() != "google":
+            return out
+
+        has_gemini = isinstance(out.get("gemini"), dict)
+        siblings_with_dict = [
+            k
+            for k in ("ollama", "openai", "huggingface", "cohere")
+            if isinstance(out.get(k), dict)
+        ]
+
+        if has_gemini:
+            out["type"] = "gemini"
+            return out
+        if len(siblings_with_dict) == 1:
+            out["type"] = siblings_with_dict[0]
+            return out
+        if not siblings_with_dict:
+            raise ValueError(
+                "EmbedderConfig: type 'google' is not valid — use 'gemini' with an "
+                "embedder.gemini block for Gemini embeddings (MAI_EMBEDDER=gemini). "
+                "Remove MAI_EMBEDDER=google if your JSON specifies another embedder."
+            )
+
+        raise ValueError(
+            "EmbedderConfig: multiple embedder sub-configs conflict with "
+            "type 'google'; set embedder.type to one of "
+            "'ollama' | 'openai' | 'huggingface' | 'cohere' | 'gemini'."
+        )
 
     @model_validator(mode="after")
     def validate_sub_config_present(self) -> "EmbedderConfig":
@@ -363,6 +450,10 @@ class SingleLLMConfig(BaseModel):
     type:          LLMType       = Field(..., description="REQUIRED.")
     model:         str           = Field(..., description="Model name e.g. llama3.2")
     api_key_env:   Optional[str] = Field(None, description="Env var NAME for API key.")
+    secret_ref:    Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the LLM API key.",
+    )
     base_url:      str           = Field(..., description="LLM server URL — per client.")
     temperature:   float         = 0.3
     max_tokens:    int           = 1024
@@ -376,6 +467,10 @@ class ChainStepConfig(BaseModel):
     type:          LLMType       = Field(..., description="REQUIRED.")
     model:         str           = Field(..., description="Model name.")
     api_key_env:   Optional[str] = None
+    secret_ref:    Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for the LLM API key.",
+    )
     base_url:      str           = Field(..., description="LLM server URL.")
     system_prompt: Optional[str] = None
     temperature:   float         = 0.3
@@ -409,6 +504,10 @@ class RerankerConfig(BaseModel):
     type:        RerankerType  = Field(..., description="REQUIRED if reranker block present.")
     model:       Optional[str] = Field(None, description="Model path, HF model ID, or LLM model name for llm_judge.")
     api_key_env: Optional[str] = Field(None, description="Env var NAME for API key (Cohere, OpenAI LLM judge, Gemini LLM judge).")
+    secret_ref: Optional[str] = Field(
+        None,
+        description="Optional vault / secrets-manager reference for reranker / judge credentials.",
+    )
     device:      str           = "cpu"
     top_k:       int           = Field(5, description="Final results returned after reranking.")
     batch_size:  int           = 32
@@ -476,6 +575,16 @@ class RetrievalConfig(BaseModel):
         description="Always retain at least this many candidates even if below threshold.",
     )
 
+    answer_min_score: float = Field(
+        0.25,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum best retrieval score required before optional RAG answer generation. "
+            "Mirrors legacy RAG_ANSWER_MIN_SCORE — configured per tenant in JSON."
+        ),
+    )
+
     # ── Post-processing: Token Budget ─────────────────────────────────────────
     enable_token_budget:  bool                   = Field(
         True,
@@ -521,32 +630,104 @@ class DeduplicationConfig(BaseModel):
     similarity_threshold:   float = Field(
         0.95, description="Cosine similarity above which a chunk is a duplicate."
     )
-
-
-def _default_chunk_strategy() -> ChunkStrategy:
-    """Read CHUNKING_STRATEGY from env so .env drives the default."""
-    import os
-    raw = os.getenv("CHUNKING_STRATEGY", "semantic").strip().lower()
-    for member in ChunkStrategy:
-        if member.value == raw:
-            return member
-    return ChunkStrategy.SEMANTIC
+    l3_redis_threshold: int = Field(
+        500,
+        ge=0,
+        description="When L3 dedup embedding set exceeds this count, offload to Redis.",
+    )
+    l3_embed_batch_size: int = Field(64, ge=1, description="Batch size for L3 semantic dedup embedding.")
+    l3_search_concurrency: int = Field(32, ge=1, description="Parallel L3 similarity searches.")
 
 
 class ChunkConfig(BaseModel):
     """Text chunking settings per client."""
-    strategy:     ChunkStrategy = Field(default_factory=_default_chunk_strategy)
+    strategy:     ChunkStrategy = Field(default=ChunkStrategy.SEMANTIC)
     chunk_size:   int           = Field(512,  description="Max tokens per chunk.")
     chunk_overlap: int          = Field(64,   description="Overlap between consecutive chunks.")
     min_chunk_len: int          = Field(30,   description="Discard chunks shorter than this.")
 
 
+def _default_chunk_soft_cap_factors() -> Dict[str, float]:
+    """Conservative soft-cap factors per provider family (JSON-tunable per tenant)."""
+    return {
+        "google": 0.85,
+        "openai": 0.92,
+        "cohere": 0.88,
+        "huggingface": 0.98,
+        "ollama": 0.96,
+        "mistral": 0.92,
+        "default": 0.90,
+    }
+
+
+class TokenizationConfig(BaseModel):
+    """
+    Tokenizer / chunk token limits for ingestion and alignment (tenant JSON).
+    Replaces DEFAULT_TOKENIZER_BACKEND, HF_TOKENIZER_MODEL, CHUNKING_TOKEN_COUNTER_CACHE_SIZE,
+    and USE_MODEL_NATIVE_TOKENIZER_FOR_CHUNKING from .env for pipeline paths.
+    """
+    default_tokenizer_backend: Literal["whitespace", "huggingface", "spacy", "nltk"] = "huggingface"
+    hf_tokenizer_model: str = Field(
+        "bert-base-multilingual-cased",
+        description="HuggingFace tokenizer model id when default_tokenizer_backend=huggingface.",
+    )
+    use_model_native_tokenizer_for_chunking: bool = Field(
+        True,
+        description="When true and an EmbedderBundle exists, chunking uses the embedder native tokenizer.",
+    )
+    chunking_token_counter_cache_size: int = Field(512, ge=32, le=8192)
+
+
+class IngestionPhantomConfig(BaseModel):
+    """
+    PHANTOM hardware-tuning overrides (tenant JSON).
+    When ingestion runs, these override profile-derived defaults unless allow_legacy_env_overrides is true.
+    """
+    embed_batch_size: int = Field(64, ge=1)
+    embed_prefetch: int = Field(2, ge=1)
+    upsert_batch_size: int = Field(128, ge=1)
+    upsert_concurrency: int = Field(2, ge=1)
+    ingest_workers: int = Field(4, ge=1)
+    parse_workers: int = Field(4, ge=1)
+    io_thread_pool: int = Field(8, ge=1)
+    bloom_capacity: int = Field(2_000_000, ge=1000)
+    bloom_error_rate: float = Field(0.001, gt=0.0, le=0.1)
+    l2_dedup_batch: int = Field(32, ge=1)
+    gravity_clusters: int = Field(16, ge=1)
+    gravity_batch_size: int = Field(512, ge=1)
+    stage_collapse_concurrency: int = Field(4, ge=1)
+
+
 class IngestionConfig(BaseModel):
     """Controls the ingestion pipeline behaviour for this client."""
     batch_size:      int                 = Field(256, description="Vectors per VectorDB upsert.")
+    embed_parallelism: int = Field(
+        4,
+        ge=1,
+        le=64,
+        description="Max parallel embedding calls during ingestion for this tenant.",
+    )
     max_file_size_mb: int                = Field(100, description="Reject files larger than this.")
+    chunk_soft_cap_factors: Dict[str, float] = Field(
+        default_factory=_default_chunk_soft_cap_factors,
+        description="Per-provider soft_cap = floor(hard_cap * factor); keys match tokenizer provider slugs.",
+    )
     chunking:        ChunkConfig         = Field(default_factory=ChunkConfig)
     deduplication:   DeduplicationConfig = Field(default_factory=DeduplicationConfig)
+    phantom: IngestionPhantomConfig = Field(
+        default_factory=IngestionPhantomConfig,
+        description="PHANTOM tuning (embed/upsert batches, workers, bloom) for this tenant.",
+    )
+    allow_legacy_env_overrides: bool = Field(
+        False,
+        description="If true, PHANTOM_* and related process env vars may still override JSON.",
+    )
+    visual_llm_concurrency: int = Field(
+        4,
+        ge=1,
+        le=32,
+        description="Max concurrent visual/chart LLM explanation calls during ingestion.",
+    )
     enable_visual_llm_explanation: bool  = Field(
         True,
         description="Use LLM to explain charts/graphs/tables during ingestion."
@@ -583,6 +764,19 @@ class ParserConfig(BaseModel):
 # ══════════════════════════════════════════════════════════════
 # SECTION 8 — FEATURE FLAGS  ← NEW
 # ══════════════════════════════════════════════════════════════
+
+class CeleryDispatchConfig(BaseModel):
+    """
+    Per-tenant Celery routing hints used when enqueueing tasks (not broker URLs).
+    Workers must listen on the union of queue names used across tenants (see docs).
+    """
+    ingestion_queue: str = Field("ingestion", min_length=1)
+    validation_queue: str = Field("validation", min_length=1)
+    max_retries: int = Field(3, ge=0, le=50)
+    retry_delay_seconds: int = Field(60, ge=0)
+    soft_time_limit: int = Field(0, ge=0, description="0 = use worker default / disabled.")
+    hard_time_limit: int = Field(0, ge=0, description="0 = use worker default / disabled.")
+
 
 class FeatureFlags(BaseModel):
     """
@@ -689,6 +883,124 @@ class ContextWindowConfig(BaseModel):
 
 
 # ══════════════════════════════════════════════════════════════
+# EFFECTIVE TENANT RUNTIME — server-computed SSOT bridge (read-only)
+# ══════════════════════════════════════════════════════════════
+
+LLMSource = Literal["tenant_json", "system_default", "legacy_env_fallback"]
+RuntimeMode = Literal["authoritative_config", "legacy_env_fallback"]
+StackProfile = Literal["local_ollama", "cloud", "mixed"]
+PromptSSOTSource = Literal[
+    "library",
+    "preset_mapped",
+    "legacy_inline",
+    "default_builtin",
+    "emergency_fallback",
+]
+
+PROMPT_PREVIEW_MAX_CHARS = 240
+
+
+class LLMState(BaseModel):
+    """Configured vs effective LLM for a tenant."""
+    configured_provider: Optional[str] = Field(
+        None, description="Provider from tenant JSON (ollama, openai, …)."
+    )
+    configured_model: Optional[str] = Field(None, description="Model id from tenant JSON.")
+    effective_provider: str = Field(description="Provider used at runtime.")
+    effective_model: str = Field(description="Model id used at runtime.")
+    source: LLMSource = Field(description="Origin of effective LLM.")
+
+
+class RerankerState(BaseModel):
+    """Configured vs effective reranker (includes stack coercion)."""
+    configured_type: Optional[str] = Field(None, description="Raw reranker.type from tenant JSON.")
+    configured_model: Optional[str] = Field(None, description="Raw reranker.model from tenant JSON.")
+    effective_plugin: str = Field(description="Resolved plugin name (flashrank, none, …).")
+    effective_model: Optional[str] = Field(None, description="Normalized model for plugin build.")
+    coercion_applied: bool = Field(False, description="True when topology/rules changed reranker.")
+    coercion_reason: Optional[str] = Field(
+        None,
+        description="local_stack_boundary | type_model_coercion | reranking_disabled",
+    )
+
+
+class PromptSSOTState(BaseModel):
+    """Prompt Library resolution for generation (chat + RAG API)."""
+    effective_template_id: Optional[str] = Field(
+        None, description="Library id used for generation."
+    )
+    source: PromptSSOTSource = Field(description="How the effective template was chosen.")
+    configured_prompt_type: Optional[str] = Field(
+        None, description="Legacy pipeline preset key (cot, rag_context, …)."
+    )
+    library_found: bool = Field(False, description="True when library file exists and is non-empty.")
+    preview: Optional[str] = Field(
+        None, description="Truncated system_instructions preview (max 240 chars)."
+    )
+    legacy_inline_detected: bool = Field(
+        False, description="True when prompt.template is set without library id."
+    )
+
+
+class RetrievalState(BaseModel):
+    """Retrieval knobs plus prompt SSOT metadata."""
+    search_mode: str
+    top_k_retrieval: int
+    top_k_final: int
+    enable_hyde: bool
+    prompt_template_id: Optional[str] = Field(
+        None, description="Configured Prompt Library id (generation SSOT)."
+    )
+    prompt_ssot: PromptSSOTState
+
+
+class EmbedderState(BaseModel):
+    """Ingestion-bound embedder (must match indexed vectors)."""
+    type: str
+    model: str
+    locked: bool = Field(True, description="Embedder is fixed to ingestion pipeline.")
+
+
+class PromptNodeState(BaseModel):
+    """Advanced pipeline prompt node vs library SSOT."""
+    enabled: bool
+    configured_prompt_type: Optional[str] = Field(
+        None, description="prompt.prompt_type from tenant JSON."
+    )
+    effective_template_id: Optional[str] = Field(
+        None, description="Same effective library id as retrieval SSOT when resolved."
+    )
+
+
+class FeatureFlagsSnapshot(BaseModel):
+    """Subset of FeatureFlags exposed on runtime DTO."""
+    enable_rag: bool = True
+    enable_reranking: bool = True
+    enable_hybrid_search: bool = False
+    enable_pii_middleware: bool = False
+    enable_advanced_nodes: bool = False
+
+
+class EffectiveTenantRuntime(BaseModel):
+    """
+    Single server-computed view of tenant pipeline state.
+
+    Built by ``build_effective_tenant_runtime(client_id)`` — not persisted.
+    """
+    client_id: str
+    fingerprint: str
+    runtime_mode: RuntimeMode
+    stack_profile: StackProfile
+    embedder: EmbedderState
+    llm: LLMState
+    reranker: RerankerState
+    retrieval: RetrievalState
+    prompt_node: PromptNodeState
+    features: FeatureFlagsSnapshot
+    warnings: List[str] = Field(default_factory=list)
+
+
+# ══════════════════════════════════════════════════════════════
 # ROOT — ClientConfig  (single source of truth)
 # ══════════════════════════════════════════════════════════════
 
@@ -724,6 +1036,14 @@ class ClientConfig(BaseModel):
     # ── Behaviour configs ───────────────────────────────────
     retrieval:  RetrievalConfig = Field(default_factory=RetrievalConfig)
     ingestion:  IngestionConfig = Field(default_factory=IngestionConfig)
+    tokenization: TokenizationConfig = Field(
+        default_factory=TokenizationConfig,
+        description="Tokenizer backend and chunking token counter settings (tenant JSON).",
+    )
+    celery_dispatch: CeleryDispatchConfig = Field(
+        default_factory=CeleryDispatchConfig,
+        description="Celery queue names and retry policy for tasks enqueued for this tenant.",
+    )
     parsers:    ParserConfig    = Field(default_factory=ParserConfig)
     features:   FeatureFlags    = Field(default_factory=FeatureFlags)
 

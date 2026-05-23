@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useCallback, type ComponentType } from "react";
 import apiClient from "@/lib/apiClient";
 import {
   Send,
@@ -24,8 +24,17 @@ import {
   Trash2,
   Info,
   FileText,
+  Building2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useTenant } from "@/contexts/TenantContext";
+import { API } from "@/lib/apiRoutes";
+import type { EffectiveTenantRuntime } from "@/lib/effectiveTenantRuntime";
+import { parseChatDebugInfo } from "@/lib/chatDebugInfo";
+import { EffectiveThisTurnStrip } from "@/components/runtime/EffectiveThisTurnStrip";
+
+/** RAG chat can chain rewrite + HyDE + hybrid retrieve + answer; default apiClient 30s trips first on slow local LLMs. */
+const CHAT_RETRIEVE_TIMEOUT_MS = 5 * 60 * 1000;
 
 /* ─── Types ─────────────────────────────────────────────────── */
 
@@ -68,7 +77,7 @@ interface ChatResponse {
   answer_model?: string | null;
   answer_latency_ms?: number | null;
   answer_error?: string | null;
-  debug_info?: Record<string, any> | null;
+  debug_info?: Record<string, unknown> | null;
 }
 
 interface Turn {
@@ -88,7 +97,15 @@ function TrustBadge({ state }: { state?: string | null }) {
   return <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700 border border-amber-200">Unvalidated</span>;
 }
 
-function DebugChip({ icon: Icon, label, value }: { icon: any; label: string; value: string }) {
+function DebugChip({
+  icon: Icon,
+  label,
+  value,
+}: {
+  icon: ComponentType<{ className?: string }>;
+  label: string;
+  value: string;
+}) {
   return (
     <span className="inline-flex items-center gap-1 text-[11px] bg-white border border-slate-200 text-slate-700 px-2 py-1 rounded-md">
       <Icon className="w-3 h-3 text-slate-400" />
@@ -98,9 +115,38 @@ function DebugChip({ icon: Icon, label, value }: { icon: any; label: string; val
   );
 }
 
+/** Map API provider id to dropdown option value (global catalog uses gemini not google). */
+function normalizeLlmProvider(provider: string): string {
+  const p = (provider || "").trim().toLowerCase();
+  if (p === "google") return "gemini";
+  return p || "none";
+}
+
+function applyRuntimeToSession(
+  rt: EffectiveTenantRuntime,
+  setters: {
+    setTenantRuntime: (v: EffectiveTenantRuntime) => void;
+    setRuntimeWarnings: (v: string[]) => void;
+    setSelectedLLM: (v: string) => void;
+    setSelectedReranker: (v: string) => void;
+    setTopK: (v: number) => void;
+    setSearchMode: (v: string) => void;
+    setEnableHyde: (v: boolean) => void;
+  }
+) {
+  setters.setTenantRuntime(rt);
+  setters.setRuntimeWarnings(rt.warnings ?? []);
+  setters.setSelectedLLM(normalizeLlmProvider(rt.llm.effective_provider));
+  setters.setSelectedReranker(rt.reranker.effective_plugin || "none");
+  setters.setTopK(rt.retrieval.top_k_final);
+  setters.setSearchMode(rt.retrieval.search_mode);
+  setters.setEnableHyde(rt.retrieval.enable_hyde);
+}
+
 /* ─── Main Page ─────────────────────────────────────────────── */
 
 export default function ChatRetrievePage() {
+  const { clientId } = useTenant();
   const [sessionId] = useState(() => crypto.randomUUID());
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
@@ -117,22 +163,83 @@ export default function ChatRetrievePage() {
   const [generateAnswer, setGenerateAnswer] = useState(true);
   const [showConfig, setShowConfig] = useState(true);
   const [expandedDebug, setExpandedDebug] = useState<Set<string>>(new Set());
+  const [runtimeWarnings, setRuntimeWarnings] = useState<string[]>([]);
+  const [tenantRuntime, setTenantRuntime] = useState<EffectiveTenantRuntime | null>(null);
+  const [sessionConfigReady, setSessionConfigReady] = useState(false);
+  const [sessionConfigLoading, setSessionConfigLoading] = useState(false);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const runtimeFetchGenRef = useRef(0);
 
-  // Fetch available models on mount
+  // Global catalogs — options only; never set selectedLLM from this list.
   useEffect(() => {
-    apiClient.get<LLMProvider[]>("/api/v2/models/llm").then((r) => {
-      setLlmProviders(r.data);
-      const def = r.data.find((p) => p.recommended && p.api_key_set) || r.data.find((p) => p.api_key_set);
-      if (def) setSelectedLLM(def.provider);
-    }).catch(() => {});
-
-    apiClient.get<RerankerOption[]>("/api/v2/models/reranker").then((r) => {
-      setRerankers(r.data);
-    }).catch(() => {});
+    let cancelled = false;
+    (async () => {
+      try {
+        const [llmRes, rrRes] = await Promise.all([
+          apiClient.get<LLMProvider[]>(API.MODELS.LLM()),
+          apiClient.get<RerankerOption[]>(API.MODELS.RERANKER()),
+        ]);
+        if (cancelled) return;
+        setLlmProviders(llmRes.data);
+        setRerankers(rrRes.data);
+      } catch {
+        /* dropdowns stay empty until retry */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  // Hydrate session controls from tenant SSOT (debounced clientId from TenantContext).
+  useEffect(() => {
+    if (!clientId) return;
+
+    const fetchGen = ++runtimeFetchGenRef.current;
+    const controller = new AbortController();
+
+    setSessionConfigReady(false);
+    setSessionConfigLoading(true);
+
+    apiClient
+      .get<EffectiveTenantRuntime>(API.MODELS.RUNTIME(clientId), {
+        signal: controller.signal,
+      })
+      .then((r) => {
+        if (fetchGen !== runtimeFetchGenRef.current) return;
+        applyRuntimeToSession(r.data, {
+          setTenantRuntime,
+          setRuntimeWarnings,
+          setSelectedLLM,
+          setSelectedReranker,
+          setTopK,
+          setSearchMode,
+          setEnableHyde,
+        });
+        setSessionConfigReady(true);
+      })
+      .catch((err: unknown) => {
+        if (fetchGen !== runtimeFetchGenRef.current) return;
+        const canceled =
+          (err as { code?: string; name?: string })?.code === "ERR_CANCELED" ||
+          (err as { name?: string })?.name === "CanceledError";
+        if (canceled) return;
+        setTenantRuntime(null);
+        setRuntimeWarnings([]);
+        setSessionConfigReady(false);
+      })
+      .finally(() => {
+        if (fetchGen === runtimeFetchGenRef.current) {
+          setSessionConfigLoading(false);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [clientId]);
 
   // Auto-scroll on new turns
   useEffect(() => {
@@ -170,17 +277,22 @@ export default function ChatRetrievePage() {
       }));
 
     try {
-      const res = await apiClient.post<ChatResponse>("/api/v2/retrieve/chat", {
-        session_id: sessionId,
-        messages,
-        llm_provider: selectedLLM || undefined,
-        reranker: selectedReranker === "none" ? undefined : selectedReranker,
-        intent: "answer",
-        top_k: topK,
-        search_mode: searchMode,
-        enable_hyde: enableHyde,
-        generate_answer: generateAnswer,
-      });
+      const res = await apiClient.post<ChatResponse>(
+        "/api/v2/retrieve/chat",
+        {
+          session_id: sessionId,
+          messages,
+          client_id: clientId,
+          llm_provider: selectedLLM || undefined,
+          reranker: selectedReranker,
+          intent: "answer",
+          top_k: topK,
+          search_mode: searchMode,
+          enable_hyde: enableHyde,
+          generate_answer: generateAnswer,
+        },
+        { timeout: CHAT_RETRIEVE_TIMEOUT_MS }
+      );
 
       setTurns((prev) =>
         prev.map((t) =>
@@ -189,15 +301,20 @@ export default function ChatRetrievePage() {
             : t
         )
       );
-    } catch (err: any) {
-      const errMsg = err?.response?.data?.detail || err?.message || "Request failed";
+    } catch (err: unknown) {
+      const ax = err as {
+        response?: { data?: { detail?: string } };
+        message?: string;
+      };
+      const errMsg =
+        ax?.response?.data?.detail || ax?.message || "Request failed";
       setTurns((prev) =>
         prev.map((t) => (t.id === asstId ? { ...t, content: "", error: errMsg } : t))
       );
     } finally {
       setLoading(false);
     }
-  }, [input, loading, turns, sessionId, selectedLLM, selectedReranker, topK, searchMode, enableHyde, generateAnswer]);
+  }, [input, loading, turns, sessionId, selectedLLM, selectedReranker, topK, searchMode, enableHyde, generateAnswer, clientId]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -227,17 +344,48 @@ export default function ChatRetrievePage() {
         </div>
 
         <div className="p-4 space-y-4 overflow-y-auto flex-1">
+          {runtimeWarnings.length > 0 && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900 space-y-1">
+              {runtimeWarnings.map((w, i) => (
+                <p key={i}>{w}</p>
+              ))}
+            </div>
+          )}
+          {tenantRuntime?.reranker.coercion_applied && (
+            <p className="text-[10px] text-slate-500">
+              Reranker effective:{" "}
+              <span className="font-semibold">{tenantRuntime.reranker.effective_plugin}</span>
+              {tenantRuntime.reranker.configured_type
+                ? ` (configured: ${tenantRuntime.reranker.configured_type})`
+                : null}
+            </p>
+          )}
+          {sessionConfigLoading && (
+            <p className="text-[10px] text-slate-500 flex items-center gap-1">
+              <Loader2 className="h-3 w-3 animate-spin" />
+              Loading tenant session config…
+            </p>
+          )}
+          {sessionConfigReady && tenantRuntime && (
+            <p className="text-[10px] text-slate-500">
+              SSOT: {tenantRuntime.llm.effective_provider} / {tenantRuntime.reranker.effective_plugin}
+            </p>
+          )}
           {/* LLM Provider */}
           <div>
             <label className="text-xs font-medium text-slate-500 block mb-1">LLM Provider</label>
             <select
               value={selectedLLM}
               onChange={(e) => setSelectedLLM(e.target.value)}
-              className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none"
+              disabled={!sessionConfigReady || sessionConfigLoading}
+              className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none disabled:opacity-60"
             >
+              {!sessionConfigReady && (
+                <option value="">Loading tenant defaults…</option>
+              )}
               {llmProviders.map((p) => (
                 <option key={p.provider} value={p.provider} disabled={!p.api_key_set}>
-                  {p.display_name} {p.api_key_set ? `(${p.default_model})` : "(no API key)"}{p.recommended ? " *" : ""}
+                  {p.display_name} {p.api_key_set ? `(${p.default_model})` : "(no API key)"}{p.recommended ? " (catalog)" : ""}
                 </option>
               ))}
             </select>
@@ -249,7 +397,8 @@ export default function ChatRetrievePage() {
             <select
               value={selectedReranker}
               onChange={(e) => setSelectedReranker(e.target.value)}
-              className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none"
+              disabled={!sessionConfigReady || sessionConfigLoading}
+              className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none disabled:opacity-60"
             >
               {rerankers.map((r) => (
                 <option key={r.name} value={r.name}>
@@ -340,6 +489,10 @@ export default function ChatRetrievePage() {
           <Bot className="w-5 h-5 text-primary-500" />
           <h2 className="text-sm font-semibold text-slate-700">RAG Chat Console</h2>
           <span className="text-[10px] text-slate-400 ml-2">Multi-turn retrieval-augmented generation</span>
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 text-[10px] ml-2">
+            <Building2 className="w-3 h-3" />
+            {clientId}
+          </span>
         </div>
 
         {/* Messages */}
@@ -388,6 +541,13 @@ export default function ChatRetrievePage() {
                       <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{turn.response.answer}</p>
                     )}
 
+                    {turn.response?.debug_info &&
+                      !turn.error &&
+                      (() => {
+                        const dbg = parseChatDebugInfo(turn.response.debug_info);
+                        return dbg ? <EffectiveThisTurnStrip debug={dbg} /> : null;
+                      })()}
+
                     {turn.response?.answer_error && !turn.response?.answer && (
                       <div className="flex items-start gap-2 text-amber-700 text-xs bg-amber-50 rounded-lg p-2 border border-amber-200">
                         <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
@@ -416,18 +576,30 @@ export default function ChatRetrievePage() {
                         {expandedDebug.has(turn.id) && (
                           <div className="mt-2 space-y-2">
                             {/* Debug chips */}
-                            {turn.response.debug_info && (
+                            {(() => {
+                              const dbg = parseChatDebugInfo(turn.response.debug_info);
+                              if (!dbg) return null;
+                              return (
                               <div className="flex flex-wrap gap-1 mb-2">
-                                <DebugChip icon={Brain} label="Embedder" value={turn.response.debug_info.embedder} />
-                                <DebugChip icon={Bot} label="LLM" value={`${turn.response.debug_info.llm_provider}/${turn.response.debug_info.llm_model || ""}`} />
-                                <DebugChip icon={Layers} label="Reranker" value={turn.response.debug_info.reranker_used || "none"} />
-                                <DebugChip icon={Search} label="Search" value={turn.response.debug_info.search_mode} />
-                                <DebugChip icon={Database} label="VectorDB" value={turn.response.debug_info.vectordb} />
-                                {turn.response.debug_info.query_rewritten && (
+                                {dbg.embedder && (
+                                  <DebugChip icon={Brain} label="Embedder" value={dbg.embedder} />
+                                )}
+                                {dbg.llm_provider && (
+                                  <DebugChip icon={Bot} label="LLM" value={`${dbg.llm_provider}/${dbg.llm_model || ""}`} />
+                                )}
+                                <DebugChip icon={Layers} label="Reranker" value={dbg.reranker_used || "none"} />
+                                {dbg.search_mode && (
+                                  <DebugChip icon={Search} label="Search" value={dbg.search_mode} />
+                                )}
+                                {dbg.vectordb && (
+                                  <DebugChip icon={Database} label="VectorDB" value={dbg.vectordb} />
+                                )}
+                                {dbg.query_rewritten && (
                                   <DebugChip icon={Zap} label="Rewrite" value="yes" />
                                 )}
                               </div>
-                            )}
+                              );
+                            })()}
 
                             {/* Sources */}
                             {turn.response.results.map((r) => (
