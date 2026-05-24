@@ -378,6 +378,26 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  Pluggable RAG unavailable — existing Chroma RAG still works")
 
     # ─────────────────────────────────────────────────────────────────
+    # STEP 4b: L0 Query Router (semantic prototypes at startup)
+    # ─────────────────────────────────────────────────────────────────
+    logger.info("\n[Startup] STEP 4b: L0 Query Router...")
+    try:
+        import asyncio
+
+        from app.services.query_routing import get_orchestrator, init_orchestrator
+        from app.services.retrieval.query_embedder import embed_query
+
+        async def _embed_for_router(text: str) -> list:
+            return await asyncio.to_thread(embed_query, text)
+
+        init_orchestrator(embed_fn=_embed_for_router)
+        await get_orchestrator().startup()
+        logger.info("✅ L0 Query Router ready (semantic prototypes built)")
+    except Exception as e:
+        logger.warning("⚠️  L0 Query Router startup failed: %s", e)
+        logger.warning("⚠️  Chat routing falls back to rule layer + KNOWLEDGE default")
+
+    # ─────────────────────────────────────────────────────────────────
     # STEP 5: PHANTOM Hardware Profiler (NEW — Phase 0)
     #
     # Probes the host hardware (AMD ROCm → CUDA → CPU fallback) and

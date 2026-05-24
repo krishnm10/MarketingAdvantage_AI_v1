@@ -87,6 +87,9 @@ class RagChatTrace:
     events: List[Dict[str, Any]] = field(default_factory=list)
     error_state: Optional[Dict[str, Any]] = None
     request_path: str = "/api/v2/retrieve/chat"
+    route_decision: Optional[Dict[str, Any]] = None
+    retrieval_skipped: bool = False
+    route_latency_ms: float = 0.0
 
     def add_event(
         self,
@@ -151,6 +154,9 @@ class RagChatTrace:
             "total_duration_ms": total_ms,
             "layers": self.events,
             "error_state": self.error_state,
+            "route_decision": self.route_decision,
+            "retrieval_skipped": self.retrieval_skipped,
+            "route_latency_ms": round(float(self.route_latency_ms), 3),
         }
         try:
             line = json.dumps(blob, ensure_ascii=False)

@@ -48,6 +48,7 @@ rg "RAG_CHAT_TRACE" logs/app.log | rg "error_state"
 
 | Layer | Stages | Highlights |
 |-------|--------|------------|
+| L0 | query_route | `route`, `layer_used`, `retrieval_allowed`, `reason_code`, `route_latency_ms`; top-level `route_decision`, `retrieval_skipped` on composite trace. |
 | L1 | preprocess, embed_query | `hash_raw_query`, `hash_embed_text`, `embedding_model_id`, `vector_dimension`, `vector_l2_norm` (no embedding-vector hash). |
 | L2 | retrieve_pipeline, context_injection | chunk `chunk_id`, `score`, `text_chars`, `text_digest`; `hash_context_post_pii`. |
 | L3 | llm_skipped_grounding_gate OR llm_generate | `prompt_tokens`, `completion_tokens`, `finish_reason`, optional `hash_rag_prompt`; optional `prompt_template_source`, `prompt_template_id_effective`. |

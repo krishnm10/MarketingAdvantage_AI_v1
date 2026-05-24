@@ -21,6 +21,7 @@ import logging
 import re
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -38,6 +39,8 @@ from app.observability.rag_chat_trace import (
 from app.db.session_v2 import get_db
 from app.auth.guards import require_role
 from app.services.ingestion.ingestion_service_v2 import get_embedder
+from app.services.query_routing import build_direct_response, get_orchestrator
+from app.services.query_routing.types import RouteDecision
 from app.retrieval.types_retrieve import RankedResult
 
 logger = logging.getLogger(__name__)
@@ -431,6 +434,68 @@ class ChatRetrieveResponse(BaseModel):
     debug_info: Optional[Dict[str, Any]] = None
 
 
+@dataclass
+class _ChatSessionCtx:
+    chat_history: List[ChatMessage]
+
+
+def _build_direct_chat_response(
+    *,
+    req: ChatRetrieveRequest,
+    raw_query: str,
+    scan_result: Any,
+    route_decision: RouteDecision,
+    direct_answer: str,
+    retrieve_cid: str,
+    rc: Any,
+    trace: Any,
+    start: float,
+    search_mode: str,
+) -> ChatRetrieveResponse:
+    elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    debug_info: Dict[str, Any] = {
+        "client_id": retrieve_cid,
+        "embedder": rc.embedder_type,
+        "vectordb": rc.vectordb_type,
+        "collection": rc.collection,
+        "search_mode": search_mode,
+        "intent": req.intent,
+        "route_decision": route_decision.to_trace_dict(),
+        "retrieval_skipped": True,
+        "query_route": route_decision.route.value,
+        "route_layer": route_decision.layer_used.value,
+        "estimated_tokens_saved": route_decision.estimated_tokens_saved,
+        "rag_tracing": trace is not None,
+        "rag_trace_id": trace.trace_id if trace else None,
+        "security_scan": {
+            "pii_detected": scan_result.has_pii,
+            "injection_detected": scan_result.injection_detected,
+        },
+    }
+    logger.info(
+        "[ChatRetrieve] L0 direct response route=%s session=%s latency=%.0fms",
+        route_decision.route.value,
+        req.session_id,
+        elapsed_ms,
+    )
+    return ChatRetrieveResponse(
+        session_id=req.session_id,
+        query=raw_query,
+        rewritten_query=None,
+        intent=req.intent,
+        search_mode=search_mode,
+        total_results=0,
+        total_dropped=0,
+        latency_ms=elapsed_ms,
+        results=[],
+        answer=direct_answer,
+        answer_model=None,
+        answer_latency_ms=0.0,
+        answer_error=None,
+        debug_info=debug_info,
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LLM Resolver (shared by rewrite + answer generation)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -604,10 +669,60 @@ async def chat_retrieve(
         except Exception:
             logger.debug("[ChatRetrieve] log_runtime_telemetry failed", exc_info=True)
 
+        # ── Security scan on last user message ───────────────────────────────────
+        last_user_msg = req.messages[-1].content
+        scan_result = _security_scan_text(last_user_msg, context="chat_retrieve")
+        if scan_result.injection_detected:
+            raise HTTPException(400, "Query rejected: potential prompt injection detected.")
+
+        raw_query = scan_result.redacted_text
+        search_mode = req.search_mode.lower()
+        effective_top_k = req.top_k if req.top_k is not None else rc.top_k_final
+
+        # ── L0 Query Router (before embed / retrieve / LLM) ─────────────────────
+        session_ctx = _ChatSessionCtx(chat_history=req.messages)
+        tenant_config = _cfg_chat
+        _route_decision = await get_orchestrator().route(
+            raw_query=raw_query,
+            top_k=effective_top_k,
+            session_ctx=session_ctx,
+            tenant_config=tenant_config,
+        )
+        if trace:
+            trace.route_decision = _route_decision.to_trace_dict()
+            trace.retrieval_skipped = not _route_decision.retrieval_allowed
+            trace.route_latency_ms = _route_decision.route_latency_ms
+            trace.add_event(
+                "L0",
+                "query_route",
+                _trace_lap(),
+                _route_decision.to_trace_dict(),
+            )
+
+        if not _route_decision.retrieval_allowed:
+            _dr = build_direct_response(_route_decision, raw_query, tenant_config)
+            return _build_direct_chat_response(
+                req=req,
+                raw_query=raw_query,
+                scan_result=scan_result,
+                route_decision=_route_decision,
+                direct_answer=_dr.answer,
+                retrieve_cid=retrieve_cid,
+                rc=rc,
+                trace=trace,
+                start=start,
+                search_mode=search_mode,
+            )
+
+        _recall_limit = _route_decision.max_recall_candidates
+        _rewrite_enabled = _route_decision.rewrite_allowed
+        _hyde_enabled = _route_decision.hyde_allowed
+        _rerank_enabled = _route_decision.rerank_allowed
+
         cfg_llm = (rc.llm_provider or "openai").lower()
         if cfg_llm == "google":
             cfg_llm = "gemini"
-    
+
         # ── Resolve LLM (for rewrite + answer) ───────────────────────────────────
         llm_provider = (req.llm_provider or cfg_llm).lower()
         llm_model_name: Optional[str] = req.llm_model or rc.llm_model
@@ -622,17 +737,10 @@ async def chat_retrieve(
             raise
         except Exception as e:
             raise HTTPException(400, f"Failed to initialize LLM ({llm_provider}): {e}")
-    
-        # ── Security scan on last user message ───────────────────────────────────
-        last_user_msg = req.messages[-1].content
-        scan_result = _security_scan_text(last_user_msg, context="chat_retrieve")
-        if scan_result.injection_detected:
-            raise HTTPException(400, "Query rejected: potential prompt injection detected.")
-    
+
         # ── Query rewrite (multi-turn → standalone) ──────────────────────────────
-        raw_query = scan_result.redacted_text
         rewritten_query: Optional[str] = None
-        if len(req.messages) > 1:
+        if _rewrite_enabled and len(req.messages) > 1:
             rewritten_query = _rewrite_query(req.messages, llm, llm_model_name)
             # Security scan on rewritten query too
             rw_scan = _security_scan_text(rewritten_query, context="chat_rewrite")
@@ -647,7 +755,7 @@ async def chat_retrieve(
         hyde_skipped_for_identifier = False
     
         # ── Optional HyDE ────────────────────────────────────────────────────────
-        if req.enable_hyde:
+        if _hyde_enabled and req.enable_hyde:
             if detail_focus_token:
                 hyde_skipped_for_identifier = True
                 logger.info(
@@ -733,6 +841,7 @@ async def chat_retrieve(
                 max_results_override=req.top_k,
                 tenant_id=retrieve_cid,           # Tenant slug for logging
                 storage_uuid=_storage_uuid_str,   # Storage UUID for filtering
+                recall_limit_override=_recall_limit,
             )
         except Exception as e:
             raise HTTPException(500, f"Retrieval failed: {e}")
@@ -747,7 +856,8 @@ async def chat_retrieve(
         reranker_fallback_reason: Optional[str] = None
 
         if (
-            reranker_name not in ("none", "", "disabled")
+            _rerank_enabled
+            and reranker_name not in ("none", "", "disabled")
             and ranked_results
             and _cfg_chat is not None
         ):
@@ -786,7 +896,6 @@ async def chat_retrieve(
                 )
     
         # ── BM25 / Hybrid re-ranking ────────────────────────────────────────────
-        search_mode = req.search_mode.lower()
         if search_mode in ("hybrid", "keyword") and ranked_results:
             try:
                 from app.core.search.bm25_index import BM25Index
@@ -1227,6 +1336,10 @@ async def chat_retrieve(
             "prompt_template_resolved": prompt_template_resolved,
             "prompt_template_source": prompt_template_source,
             "query_rewritten": rewritten_query is not None,
+            "route_decision": _route_decision.to_trace_dict(),
+            "retrieval_skipped": False,
+            "query_route": _route_decision.route.value,
+            "route_layer": _route_decision.layer_used.value,
             "rag_tracing": trace is not None,
             "rag_trace_id": trace.trace_id if trace else None,
             "security_scan": {

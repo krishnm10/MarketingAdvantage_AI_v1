@@ -42,6 +42,7 @@ class RetrievalRuntime:
         tenant_id: Optional[str] = None,
         storage_uuid: Optional[str] = None,
         filters: Optional[Dict[str, Any]] = None,
+        recall_limit_override: Optional[int] = None,
     ) -> Tuple[List[RankedResult], List[RetrievalCandidate]]:
         """
         Retrieval entry point with tenant isolation.
@@ -98,7 +99,10 @@ class RetrievalRuntime:
         # -------------------------------------------------
         # 2. Determine recall size
         # -------------------------------------------------
-        recall_limit = max(effective_max_results * 40, 200)
+        if recall_limit_override is not None:
+            recall_limit = max(1, int(recall_limit_override))
+        else:
+            recall_limit = max(effective_max_results * 40, 200)
 
         # -------------------------------------------------
         # 3. Semantic recall + hydration (with tenant filter)
