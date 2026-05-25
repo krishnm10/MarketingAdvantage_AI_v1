@@ -3,5 +3,10 @@
   "name": "System (preset)",
   "system_instructions": "You are a helpful assistant. Answer using only the provided context.",
   "version": "1.0.0",
-  "tags": ["preset", "system"]
+  "tags": [
+    "preset",
+    "system"
+  ],
+  "examples": [],
+  "examples_note": "Authoring reference only. Never injected into LLM."
 }

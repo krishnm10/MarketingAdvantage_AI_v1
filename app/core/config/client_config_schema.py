@@ -616,6 +616,10 @@ class RetrievalConfig(BaseModel):
             "None uses the system default RAG prompt."
         ),
     )
+    rewrite_enabled:      bool                   = Field(
+        False,
+        description="Allow multi-turn query rewrite before retrieval (chat UI toggle).",
+    )
 
 
 # ══════════════════════════════════════════════════════════════

@@ -171,7 +171,7 @@ def structured_decision(
         confidence=confidence,
         layer_used=layer,
         retrieval_allowed=True,
-        rewrite_allowed=True,
+        rewrite_allowed=False,
         hyde_allowed=False,
         max_recall_candidates=max(tk * 8, 40),
         rerank_allowed=True,

@@ -18,6 +18,10 @@
   },
   "embedder": {
     "type": "ollama",
+    "gemini": {
+      "model": "gemini-embedding-2",
+      "api_key_env": "GOOGLE_API_KEY"
+    },
     "ollama": {
       "model": "nomic-embed-text",
       "base_url": "http://localhost:11434"
@@ -31,11 +35,13 @@
     "threshold_min_score": 0.0,
     "threshold_min_results": 1,
     "answer_min_score": 0.25,
-    "enable_hyde": true,
+    "enable_hyde": false,
     "enable_multi_query": true,
     "multi_query_count": 3,
     "hybrid_alpha": 0.7,
-    "prompt_template_id": "preset-chain-of-thought"
+    "prompt_template_id": "preset-rag-context",
+    "top_k_retrieval": 3,
+    "top_k_final": 1
   },
   "ingestion": {
     "batch_size": 256,
@@ -100,6 +106,7 @@
     "single": {
       "type": "ollama",
       "model": "llama3.2:1b",
+      "api_key_env": "GOOGLE_API_KEY",
       "base_url": "http://localhost:11434",
       "temperature": 0.3,
       "max_tokens": 1024

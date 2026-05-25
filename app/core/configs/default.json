@@ -35,7 +35,7 @@
     "enable_multi_query": true,
     "multi_query_count": 3,
     "hybrid_alpha": 0.7,
-    "prompt_template_id": "preset-rag-context"
+    "prompt_template_id": "preset-chain-of-thought"
   },
   "ingestion": {
     "batch_size": 256,

@@ -86,6 +86,7 @@ class RetrievalCandidate:
     trust: TrustSignals
 
     final_score: Optional[float] = None
+    file_id: Optional[str] = None
 
 
 # ---------------------------------------------------------
@@ -118,3 +119,4 @@ class RankedResult:
     explanation: Dict
     # 🔒 Governance decision (TRUSTED / PROVISIONAL / REJECTED)
     trust_decision: Optional[str] = None
+    file_id: Optional[str] = None

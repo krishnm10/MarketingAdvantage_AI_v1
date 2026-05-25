@@ -3,5 +3,10 @@
   "name": "RAG Context (preset)",
   "system_instructions": "You are an intelligent assistant. Answer the question using ONLY the context provided.\nIf the context does not contain enough information, say so clearly.\nCite the source number [1], [2], etc. when referencing specific facts.",
   "version": "1.0.0",
-  "tags": ["preset", "rag"]
+  "tags": [
+    "preset",
+    "rag"
+  ],
+  "examples": [],
+  "examples_note": "Authoring reference only. Never injected into LLM."
 }

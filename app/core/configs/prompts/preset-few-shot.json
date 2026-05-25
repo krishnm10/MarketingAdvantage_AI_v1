@@ -3,5 +3,10 @@
   "name": "Few Shot (preset)",
   "system_instructions": "You are a helpful assistant. Use the provided examples and context to answer accurately.",
   "version": "1.0.0",
-  "tags": ["preset", "few_shot"]
+  "tags": [
+    "preset",
+    "few_shot"
+  ],
+  "examples": [],
+  "examples_note": "Authoring reference only. Never injected into LLM."
 }

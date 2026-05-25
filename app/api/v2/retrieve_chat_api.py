@@ -21,6 +21,7 @@ import logging
 import re
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -40,8 +41,10 @@ from app.db.session_v2 import get_db
 from app.auth.guards import require_role
 from app.services.ingestion.ingestion_service_v2 import get_embedder
 from app.services.query_routing import build_direct_response, get_orchestrator
-from app.services.query_routing.types import RouteDecision
+from app.services.query_routing.types import QueryRoute, RouteDecision
 from app.retrieval.types_retrieve import RankedResult
+from app.core.prompts.library_loader import strip_and_verify
+from app.services.faithfulness_verifier import verify_or_refuse
 
 logger = logging.getLogger(__name__)
 
@@ -301,6 +304,77 @@ def _prioritize_ranked_for_identifier(
     return sorted(ranked, key=lambda r: (needle not in r.text.upper(), -float(r.score)))
 
 
+_AMOUNT_CONFLICT_RE = re.compile(r"\$[\d,]+(?:\.\d{2})?")
+
+
+def _normalize_focus_id(focus_id: Optional[str]) -> str:
+    if not focus_id:
+        return ""
+    return focus_id.replace("-", "").replace(" ", "").lower()
+
+
+def _chunk_mentions_focus(chunk: RankedResult, focus_id: Optional[str]) -> bool:
+    if not focus_id:
+        return False
+    blob = _normalize_focus_id(chunk.text or "")
+    needle = _normalize_focus_id(focus_id)
+    return bool(needle and needle in blob)
+
+
+def _filter_to_dominant_file(
+    chunks: List[RankedResult],
+    focus_id: Optional[str],
+    max_chunks: int = 2,
+) -> List[RankedResult]:
+    """
+    STRUCTURED route only: keep chunks from the dominant file_id that mentions focus_id.
+    Safe fallbacks when file_id or focus matches are missing.
+    """
+    if not chunks:
+        return chunks
+
+    if focus_id:
+        matching = [c for c in chunks if _chunk_mentions_focus(c, focus_id)]
+    else:
+        matching = list(chunks)
+
+    if not matching:
+        logger.warning(
+            "[ChatRetrieve] No chunk mentions focus_id=%r; falling back to top-1",
+            focus_id,
+        )
+        return chunks[:1]
+
+    file_counts = Counter(c.file_id for c in matching if c.file_id)
+    if not file_counts:
+        logger.warning(
+            "[ChatRetrieve] file_id missing on matching chunks; falling back to top-%d",
+            max_chunks,
+        )
+        return chunks[:max_chunks]
+
+    dominant_file_id = file_counts.most_common(1)[0][0]
+    filtered = [c for c in chunks if c.file_id == dominant_file_id]
+    return filtered[:max_chunks]
+
+
+def _detect_amount_conflicts(chunks: List[RankedResult]) -> bool:
+    """True when two+ chunks contain disjoint dollar amount sets (STRUCTURED pre-LLM)."""
+    amount_sets: List[set] = []
+    for chunk in chunks:
+        found = set(_AMOUNT_CONFLICT_RE.findall(chunk.text or ""))
+        if found:
+            amount_sets.append(found)
+    if len(amount_sets) < 2:
+        return False
+    for i in range(len(amount_sets)):
+        for j in range(i + 1, len(amount_sets)):
+            left, right = amount_sets[i], amount_sets[j]
+            if left and right and left.isdisjoint(right):
+                return True
+    return False
+
+
 def _dedupe_identifier_lines(answer: str) -> Tuple[str, bool]:
     """
     Collapse duplicate list lines keyed by structured IDs (P2).
@@ -406,6 +480,14 @@ class ChatRetrieveRequest(BaseModel):
     enable_hyde: bool = Field(False)
     max_context_chunks: int = Field(5, ge=1, le=15)
     generate_answer: bool = Field(True)
+    rewrite_enabled: Optional[bool] = Field(
+        None,
+        description="Override tenant rewrite toggle for this request. None uses route + tenant config.",
+    )
+    system_prompt_override: Optional[str] = Field(
+        None,
+        description="Session-only system instruction text override (not persisted).",
+    )
 
 
 class ChatResultItem(BaseModel):
@@ -453,6 +535,12 @@ def _build_direct_chat_response(
     search_mode: str,
 ) -> ChatRetrieveResponse:
     elapsed_ms = round((time.perf_counter() - start) * 1000, 2)
+    _, _direct_verification = verify_or_refuse(
+        answer=direct_answer or "",
+        source_texts=[],
+        focus_id=None,
+        route=route_decision.route.value,
+    )
     debug_info: Dict[str, Any] = {
         "client_id": retrieve_cid,
         "embedder": rc.embedder_type,
@@ -470,6 +558,18 @@ def _build_direct_chat_response(
         "security_scan": {
             "pii_detected": scan_result.has_pii,
             "injection_detected": scan_result.injection_detected,
+        },
+        "faithfulness_verifier": {
+            "status": _direct_verification.status.value,
+            "checks": [
+                {
+                    "id": c.check_id,
+                    "status": c.status.value,
+                    "detail": c.detail,
+                }
+                for c in _direct_verification.checks
+            ],
+            "fail_reason": _direct_verification.fail_reason,
         },
     }
     logger.info(
@@ -664,6 +764,12 @@ async def chat_retrieve(
         else:
             rc = resolve_runtime_components_legacy()
 
+        _active_template_id: Optional[str] = None
+        if _cfg_chat is not None and _cfg_chat.retrieval:
+            _active_template_id = _cfg_chat.retrieval.prompt_template_id
+        effective_max_context_chunks = req.max_context_chunks
+        matched_pattern: Optional[str] = None
+
         try:
             log_runtime_telemetry(rc, "/api/v2/retrieve/chat")
         except Exception:
@@ -714,8 +820,16 @@ async def chat_retrieve(
                 search_mode=search_mode,
             )
 
+        matched_pattern = _route_decision.matched_pattern
+        if _route_decision.route == QueryRoute.STRUCTURED:
+            effective_max_context_chunks = 2
+
         _recall_limit = _route_decision.max_recall_candidates
         _rewrite_enabled = _route_decision.rewrite_allowed
+        if req.rewrite_enabled is False:
+            _rewrite_enabled = False
+        elif req.rewrite_enabled is True:
+            _rewrite_enabled = _route_decision.rewrite_allowed
         _hyde_enabled = _route_decision.hyde_allowed
         _rerank_enabled = _route_decision.rerank_allowed
 
@@ -750,8 +864,24 @@ async def chat_retrieve(
                 rewritten_query = rw_scan.redacted_text
     
         embed_text = rewritten_query or raw_query
+        if _route_decision.route == QueryRoute.STRUCTURED:
+            if matched_pattern:
+                embed_text = matched_pattern
+            else:
+                logger.warning(
+                    "[ChatRetrieve] STRUCTURED route without matched_pattern; "
+                    "embed_text falls back to raw_query",
+                )
+                embed_text = raw_query
+
         detail_focus_token = _extract_detail_focus_token(raw_query, rewritten_query or "")
         strict_detail_grounding_keys = _strict_detail_grounding_keys(raw_query, rewritten_query or "")
+        if (
+            not strict_detail_grounding_keys
+            and _route_decision.route == QueryRoute.STRUCTURED
+            and matched_pattern
+        ):
+            strict_detail_grounding_keys = [matched_pattern]
         hyde_skipped_for_identifier = False
     
         # ── Optional HyDE ────────────────────────────────────────────────────────
@@ -792,6 +922,11 @@ async def chat_retrieve(
                     "detail_focus_token": detail_focus_token,
                     "strict_detail_grounding_keys": strict_detail_grounding_keys,
                     "embed_focus_differs_from_raw": embed_text.strip() != raw_query.strip(),
+                    "prompt_locked": True,
+                    "prompt_template_id": _active_template_id,
+                    "prompt_source": "tenant_config",
+                    "matched_pattern": matched_pattern,
+                    "effective_max_context_chunks": effective_max_context_chunks,
                 },
             )
     
@@ -928,6 +1063,18 @@ async def chat_retrieve(
                 "[ChatRetrieve] Identifier-focused reorder applied | token=%s",
                 detail_focus_token,
             )
+
+        if _route_decision.route == QueryRoute.STRUCTURED:
+            ranked_results = _filter_to_dominant_file(
+                ranked_results,
+                focus_id=matched_pattern or detail_focus_token,
+                max_chunks=effective_max_context_chunks,
+            )
+            logger.info(
+                "[ChatRetrieve] STRUCTURED dominant-file filter | focus=%s | chunks=%d",
+                matched_pattern or detail_focus_token,
+                len(ranked_results),
+            )
     
         # ── Build results ────────────────────────────────────────────────────────
         results: List[ChatResultItem] = []
@@ -961,6 +1108,12 @@ async def chat_retrieve(
                     "request_top_k": req.top_k,
                     "results_count": len(results),
                     "detail_focus_token": detail_focus_token,
+                    "structured_file_filter_applied": (
+                        _route_decision.route == QueryRoute.STRUCTURED
+                    ),
+                    "chunk_file_ids": [
+                        r.file_id for r in ranked_results[:effective_max_context_chunks]
+                    ],
                 },
             )
     
@@ -983,6 +1136,7 @@ async def chat_retrieve(
         context_chunks_sent_to_llm = 0
         skipped_llm_grounding_miss = False
         tokens_missing_from_passages: List[str] = []
+        _verification = None
     
         if req.generate_answer:
             if not results:
@@ -999,17 +1153,22 @@ async def chat_retrieve(
                         gen_start = time.perf_counter()
 
                         tenant_prompt_prefix = ""
+                        _structured_system_instructions = ""
                         if _cfg_chat is not None:
                             from app.core.prompts.ssot import resolve_prompt_ssot
 
                             _ps = resolve_prompt_ssot(_cfg_chat)
                             prompt_template_id_effective = (
-                                _cfg_chat.retrieval.prompt_template_id
-                                if _cfg_chat.retrieval
-                                else None
-                            ) or _ps.effective_template_id
+                                _active_template_id or _ps.effective_template_id
+                            )
                             if _ps.instructions:
-                                tenant_prompt_prefix = _ps.instructions + "\n\n---\n\n"
+                                _structured_system_instructions = _ps.instructions
+                                instruction_text = _ps.instructions
+                                if req.system_prompt_override:
+                                    instruction_text = req.system_prompt_override
+                                tenant_prompt_prefix = (
+                                    strip_and_verify(instruction_text) + "\n\n---\n\n"
+                                )
                                 prompt_template_resolved = _ps.library_found or _ps.source in (
                                     "legacy_inline",
                                     "preset_mapped",
@@ -1020,6 +1179,12 @@ async def chat_retrieve(
                                     if _ps.source in ("library", "preset_mapped")
                                     else _ps.source
                                 )
+                            elif req.system_prompt_override:
+                                tenant_prompt_prefix = (
+                                    strip_and_verify(req.system_prompt_override)
+                                    + "\n\n---\n\n"
+                                )
+                                prompt_template_source = "session_override_text"
                             elif prompt_template_id_effective:
                                 logger.warning(
                                     "[ChatRetrieve] prompt SSOT id=%r not resolved; "
@@ -1027,13 +1192,24 @@ async def chat_retrieve(
                                     prompt_template_id_effective,
                                 )
 
-                        top_chunks = results[:req.max_context_chunks]
+                        top_chunks = results[:effective_max_context_chunks]
                         context_chunks_sent_to_llm = len(top_chunks)
+                        llm_ranked = ranked_results[:effective_max_context_chunks]
                         context_parts = [
                             f"[Source {i}] (score={c.score:.3f})\n{c.text.strip()}"
                             for i, c in enumerate(top_chunks, 1)
                         ]
                         context_str = "\n\n---\n\n".join(context_parts)
+
+                        if (
+                            _route_decision.route == QueryRoute.STRUCTURED
+                            and _detect_amount_conflicts(llm_ranked)
+                        ):
+                            context_str = (
+                                "WARNING: Retrieved passages contain potentially conflicting "
+                                "amounts. Only report values that appear in the passage "
+                                "explicitly cited. Do not blend values across passages.\n\n"
+                            ) + context_str
     
                         # ── Context sanitization: PII redaction on retrieved text ─
                         _ctx_scan = _security_scan_text(
@@ -1093,7 +1269,7 @@ async def chat_retrieve(
                                 "context_injection",
                                 _trace_lap(),
                                 {
-                                    "max_context_chunks": req.max_context_chunks,
+                                    "max_context_chunks": effective_max_context_chunks,
                                     "chunks_sent": len(top_chunks),
                                     "hash_context_post_pii": text_digest_utf8(context_str),
                                     "pii_redacted_from_context": _ctx_pii_redacted,
@@ -1104,6 +1280,7 @@ async def chat_retrieve(
                                     "skipped_llm_grounding_miss": skipped_llm_grounding_miss,
                                     "request_top_k": req.top_k,
                                     "max_semantic_score": round(max_score, 5),
+                                    "chunk_file_ids": [r.file_id for r in llm_ranked],
                                 },
                             )
     
@@ -1237,6 +1414,15 @@ async def chat_retrieve(
                                             )
                                 else:
                                     answer_error = "LLM returned an empty response."
+
+                        final_answer = answer if answer is not None else ""
+                        _llm_answer, _verification = verify_or_refuse(
+                            answer=final_answer,
+                            source_texts=[c.text for c in top_chunks if c.text],
+                            focus_id=matched_pattern,
+                            route=_route_decision.route.value,
+                        )
+                        answer = _llm_answer
     
                         if trace:
                             if skipped_llm_grounding_miss:
@@ -1299,6 +1485,24 @@ async def chat_retrieve(
                                     "detail_focus_token": detail_focus_token,
                                 },
                             )
+                            if _verification is not None:
+                                trace.add_event(
+                                    "L5",
+                                    "faithfulness_verifier",
+                                    _trace_lap(),
+                                    {
+                                        "status": _verification.status.value,
+                                        "checks": [
+                                            {
+                                                "id": c.check_id,
+                                                "status": c.status.value,
+                                                "detail": c.detail,
+                                            }
+                                            for c in _verification.checks
+                                        ],
+                                        "fail_reason": _verification.fail_reason,
+                                    },
+                                )
     
                         answer_latency_ms = round((time.perf_counter() - gen_start) * 1000, 2)
                     except Exception as e:
@@ -1325,12 +1529,32 @@ async def chat_retrieve(
             "strict_detail_grounding_keys": strict_detail_grounding_keys,
             "request_top_k": req.top_k,
             "max_context_chunks": req.max_context_chunks,
+            "effective_max_context_chunks": effective_max_context_chunks,
+            "prompt_locked": True,
+            "prompt_template_id_locked": _active_template_id,
+            "matched_pattern": matched_pattern,
             "ranked_results_count": len(results),
             "context_chunks_sent_to_llm": context_chunks_sent_to_llm,
             "skipped_llm_grounding_miss": skipped_llm_grounding_miss,
             "tokens_missing_from_passages": tokens_missing_from_passages,
             "identifier_dedupe_applied": identifier_dedupe_applied,
             "focus_fallback_used": focus_fallback_used,
+            "faithfulness_verifier": (
+                {
+                    "status": _verification.status.value,
+                    "checks": [
+                        {
+                            "id": c.check_id,
+                            "status": c.status.value,
+                            "detail": c.detail,
+                        }
+                        for c in _verification.checks
+                    ],
+                    "fail_reason": _verification.fail_reason,
+                }
+                if _verification is not None
+                else None
+            ),
             "llm_transport_error": transport_exc_name,
             "prompt_template_id_effective": prompt_template_id_effective,
             "prompt_template_resolved": prompt_template_resolved,

@@ -149,6 +149,7 @@ class RetrievalRuntime:
                 score=final_score,
                 explanation={},          # temporary context only
                 trust_decision=decision,
+                file_id=candidate.file_id,
             )
 
             # -------------------------------------------------
@@ -170,6 +171,7 @@ class RetrievalRuntime:
                     score=final_score,
                     explanation=explanation,
                     trust_decision=decision,
+                    file_id=candidate.file_id,
                 )
             )
 

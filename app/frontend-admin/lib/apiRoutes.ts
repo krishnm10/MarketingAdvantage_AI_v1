@@ -98,10 +98,20 @@ export const API = {
   PROMPT_TEMPLATES: {
     LIST:    () => "/api/v2/prompt-templates",
     CREATE:  () => "/api/v2/prompt-templates",
-    GET:     (id: string) => `/api/v2/prompt-templates/${encodeURIComponent(id)}`,
+    GET:     (id: string, raw?: boolean) =>
+      `/api/v2/prompt-templates/${encodeURIComponent(id)}${
+        raw ? "?raw=true" : ""
+      }`,
     UPDATE:  (id: string) => `/api/v2/prompt-templates/${encodeURIComponent(id)}`,
     DELETE:  (id: string) => `/api/v2/prompt-templates/${encodeURIComponent(id)}`,
     PREVIEW: (id: string) => `/api/v2/prompt-templates/${encodeURIComponent(id)}/preview`,
+  },
+
+  TENANT_PROMPT_CONFIG: {
+    GET:   (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/prompt-config`,
+    PATCH: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/prompt-config`,
   },
 
   // Phase 2 — RAG Evaluation

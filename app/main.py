@@ -161,6 +161,7 @@ from app.api.v2.pipeline_recommendation_api import router as pipeline_recommenda
 # ─────────────────────────────────────────────────────────────────────────────
 from app.api.v2.rag_config_api       import router as rag_config_router
 from app.api.v2.prompt_template_api  import router as prompt_template_router
+from app.api.v2.tenant_prompt_config_api import router as tenant_prompt_config_router
 
 # ─────────────────────────────────────────────────────────────────────────────
 # New Kafka Management Router (NEW — additive only)
@@ -691,6 +692,10 @@ app.include_router(
 app.include_router(
     prompt_template_router,
     tags=["Prompt Templates"],
+)
+app.include_router(
+    tenant_prompt_config_router,
+    tags=["Tenant Prompt Config"],
 )
 
 from app.api.v2.rag_eval_api import router as rag_eval_router

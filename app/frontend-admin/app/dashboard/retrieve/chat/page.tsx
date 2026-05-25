@@ -29,6 +29,7 @@ import {
 import { cn } from "@/lib/utils";
 import { useTenant } from "@/contexts/TenantContext";
 import { API } from "@/lib/apiRoutes";
+import { useAuth } from "@/lib/useAuth";
 import type { EffectiveTenantRuntime } from "@/lib/effectiveTenantRuntime";
 import { parseChatDebugInfo } from "@/lib/chatDebugInfo";
 import { EffectiveThisTurnStrip } from "@/components/runtime/EffectiveThisTurnStrip";
@@ -89,6 +90,27 @@ interface Turn {
   error?: string | null;
 }
 
+interface PromptTemplateListItem {
+  template_id: string;
+  name: string;
+  description?: string;
+  has_examples: boolean;
+}
+
+interface TenantPromptConfig {
+  client_id: string;
+  prompt_template_id: string | null;
+  rewrite_enabled: boolean;
+}
+
+interface PromptTemplatePreview {
+  template_id: string;
+  name: string;
+  system_instructions: string;
+  has_examples: boolean;
+  examples_note?: string;
+}
+
 /* ─── Mini Components ───────────────────────────────────────── */
 
 function TrustBadge({ state }: { state?: string | null }) {
@@ -147,6 +169,8 @@ function applyRuntimeToSession(
 
 export default function ChatRetrievePage() {
   const { clientId } = useTenant();
+  const { role } = useAuth();
+  const isAdmin = role === "admin";
   const [sessionId] = useState(() => crypto.randomUUID());
   const [turns, setTurns] = useState<Turn[]>([]);
   const [input, setInput] = useState("");
@@ -167,6 +191,20 @@ export default function ChatRetrievePage() {
   const [tenantRuntime, setTenantRuntime] = useState<EffectiveTenantRuntime | null>(null);
   const [sessionConfigReady, setSessionConfigReady] = useState(false);
   const [sessionConfigLoading, setSessionConfigLoading] = useState(false);
+
+  const [showPromptPanel, setShowPromptPanel] = useState(false);
+  const [templateList, setTemplateList] = useState<PromptTemplateListItem[]>([]);
+  const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>("");
+  const [previewInstructions, setPreviewInstructions] = useState("");
+  const [promptPanelLoading, setPromptPanelLoading] = useState(false);
+  const [sessionEditEnabled, setSessionEditEnabled] = useState(false);
+  const [sessionPromptOverride, setSessionPromptOverride] = useState<string | null>(null);
+  const [autoRewrite, setAutoRewrite] = useState(false);
+  const [promptSaveToast, setPromptSaveToast] = useState<{
+    type: "success" | "error";
+    msg: string;
+  } | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -241,6 +279,84 @@ export default function ChatRetrievePage() {
     };
   }, [clientId]);
 
+  const loadTemplatePreview = useCallback(async (templateId: string) => {
+    if (!templateId) {
+      setPreviewInstructions("");
+      return;
+    }
+    try {
+      const res = await apiClient.get<PromptTemplatePreview>(
+        API.PROMPT_TEMPLATES.GET(templateId)
+      );
+      setPreviewInstructions(res.data.system_instructions || "");
+    } catch {
+      setPreviewInstructions("");
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!clientId) return;
+    let cancelled = false;
+    setPromptPanelLoading(true);
+
+    (async () => {
+      try {
+        const [cfgRes, listRes] = await Promise.all([
+          apiClient.get<TenantPromptConfig>(API.TENANT_PROMPT_CONFIG.GET(clientId)),
+          apiClient.get<PromptTemplateListItem[]>(API.PROMPT_TEMPLATES.LIST()),
+        ]);
+        if (cancelled) return;
+        setTemplateList(listRes.data);
+        const tid = cfgRes.data.prompt_template_id || "";
+        setActiveTemplateId(cfgRes.data.prompt_template_id);
+        setSelectedTemplateId(tid);
+        if (tid) {
+          await loadTemplatePreview(tid);
+        } else {
+          setPreviewInstructions("");
+        }
+      } catch {
+        if (!cancelled) {
+          setTemplateList([]);
+          setPreviewInstructions("");
+        }
+      } finally {
+        if (!cancelled) setPromptPanelLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId, loadTemplatePreview]);
+
+  useEffect(() => {
+    if (!selectedTemplateId) return;
+    void loadTemplatePreview(selectedTemplateId);
+  }, [selectedTemplateId, loadTemplatePreview]);
+
+  useEffect(() => {
+    if (!promptSaveToast) return;
+    const t = setTimeout(() => setPromptSaveToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [promptSaveToast]);
+
+  const handleSaveDefaultTemplate = useCallback(async () => {
+    if (!clientId || !selectedTemplateId) return;
+    try {
+      await apiClient.patch(API.TENANT_PROMPT_CONFIG.PATCH(clientId), {
+        prompt_template_id: selectedTemplateId,
+      });
+      setActiveTemplateId(selectedTemplateId);
+      setPromptSaveToast({ type: "success", msg: "Default prompt template saved." });
+    } catch (err: unknown) {
+      const ax = err as { response?: { data?: { detail?: string } } };
+      const msg =
+        ax?.response?.data?.detail || "Failed to save default prompt template.";
+      setPromptSaveToast({ type: "error", msg: String(msg) });
+    }
+  }, [clientId, selectedTemplateId]);
+
   // Auto-scroll on new turns
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -277,20 +393,25 @@ export default function ChatRetrievePage() {
       }));
 
     try {
+      const body: Record<string, unknown> = {
+        session_id: sessionId,
+        messages,
+        client_id: clientId,
+        llm_provider: selectedLLM || undefined,
+        reranker: selectedReranker,
+        intent: "answer",
+        top_k: topK,
+        search_mode: searchMode,
+        rewrite_enabled: autoRewrite,
+        generate_answer: generateAnswer,
+      };
+      if (sessionPromptOverride) {
+        body.system_prompt_override = sessionPromptOverride;
+      }
+
       const res = await apiClient.post<ChatResponse>(
         "/api/v2/retrieve/chat",
-        {
-          session_id: sessionId,
-          messages,
-          client_id: clientId,
-          llm_provider: selectedLLM || undefined,
-          reranker: selectedReranker,
-          intent: "answer",
-          top_k: topK,
-          search_mode: searchMode,
-          enable_hyde: enableHyde,
-          generate_answer: generateAnswer,
-        },
+        body,
         { timeout: CHAT_RETRIEVE_TIMEOUT_MS }
       );
 
@@ -314,7 +435,20 @@ export default function ChatRetrievePage() {
     } finally {
       setLoading(false);
     }
-  }, [input, loading, turns, sessionId, selectedLLM, selectedReranker, topK, searchMode, enableHyde, generateAnswer, clientId]);
+  }, [
+    input,
+    loading,
+    turns,
+    sessionId,
+    selectedLLM,
+    selectedReranker,
+    topK,
+    searchMode,
+    generateAnswer,
+    autoRewrite,
+    sessionPromptOverride,
+    clientId,
+  ]);
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -638,8 +772,175 @@ export default function ChatRetrievePage() {
         </div>
 
         {/* Input */}
-        <div className="border-t border-slate-200 bg-white p-4">
+        <div className="border-t border-slate-200 bg-white p-4 space-y-3">
+          {promptSaveToast && (
+            <div
+              className={cn(
+                "max-w-4xl mx-auto flex items-center gap-2 rounded-lg border px-3 py-2 text-xs",
+                promptSaveToast.type === "success"
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-800"
+                  : "border-red-200 bg-red-50 text-red-800"
+              )}
+            >
+              {promptSaveToast.type === "success" ? (
+                <Check className="w-3.5 h-3.5" />
+              ) : (
+                <AlertCircle className="w-3.5 h-3.5" />
+              )}
+              <span>{promptSaveToast.msg}</span>
+            </div>
+          )}
+
+          {/* Prompt panel — collapsed by default */}
+          <div className="max-w-4xl mx-auto rounded-xl border border-slate-200 bg-slate-50/80 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setShowPromptPanel((v) => !v)}
+              className="w-full flex items-center justify-between px-4 py-2.5 text-left hover:bg-slate-100/80 transition-colors"
+            >
+              <span className="flex items-center gap-2 text-sm font-medium text-slate-700">
+                Prompt
+                {sessionPromptOverride !== null && (
+                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">
+                    Modified
+                  </span>
+                )}
+              </span>
+              {showPromptPanel ? (
+                <ChevronUp className="w-4 h-4 text-slate-400" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-400" />
+              )}
+            </button>
+
+            {showPromptPanel && (
+              <div className="px-4 pb-4 space-y-3 border-t border-slate-200 bg-white">
+                {promptPanelLoading ? (
+                  <p className="text-xs text-slate-500 flex items-center gap-1 pt-3">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Loading prompt config…
+                  </p>
+                ) : (
+                  <>
+                    <div className="pt-3">
+                      <label className="text-xs font-medium text-slate-500 block mb-1">
+                        Template
+                      </label>
+                      <select
+                        value={selectedTemplateId}
+                        onChange={(e) => {
+                          setSelectedTemplateId(e.target.value);
+                          if (sessionEditEnabled) {
+                            setSessionPromptOverride(null);
+                          }
+                        }}
+                        className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none"
+                      >
+                        <option value="">System default</option>
+                        {templateList.map((t) => (
+                          <option key={t.template_id} value={t.template_id}>
+                            {t.name}
+                            {t.has_examples ? " (contains examples)" : ""}
+                          </option>
+                        ))}
+                      </select>
+                      {templateList
+                        .filter((t) => t.template_id === selectedTemplateId && t.has_examples)
+                        .map((t) => (
+                          <span
+                            key={t.template_id}
+                            className="inline-flex mt-1.5 text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200"
+                          >
+                            Contains examples
+                          </span>
+                        ))}
+                    </div>
+
+                    <div>
+                      <label className="text-xs font-medium text-slate-500 block mb-1">
+                        Preview as seen by LLM (examples removed)
+                      </label>
+                      <textarea
+                        readOnly={!sessionEditEnabled}
+                        value={
+                          sessionEditEnabled
+                            ? sessionPromptOverride ?? previewInstructions
+                            : previewInstructions
+                        }
+                        onChange={(e) => {
+                          if (sessionEditEnabled) {
+                            setSessionPromptOverride(e.target.value);
+                          }
+                        }}
+                        rows={5}
+                        className={cn(
+                          "w-full rounded-md border px-3 py-2 text-xs font-mono leading-relaxed outline-none resize-y",
+                          sessionEditEnabled
+                            ? "border-primary-200 bg-white text-slate-700 focus:border-primary-300 focus:ring-2 focus:ring-primary-100"
+                            : "border-slate-200 bg-slate-50 text-slate-600"
+                        )}
+                      />
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      <label
+                        className="flex items-center gap-2 cursor-pointer"
+                        title="Edit prompt text for this session only (not saved to tenant config)"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={sessionEditEnabled}
+                          onChange={(e) => {
+                            const on = e.target.checked;
+                            setSessionEditEnabled(on);
+                            if (on) {
+                              setSessionPromptOverride(previewInstructions);
+                            } else {
+                              setSessionPromptOverride(null);
+                            }
+                          }}
+                          className="rounded border-slate-300 text-primary-600 focus:ring-primary-500 w-3.5 h-3.5"
+                        />
+                        <span className="text-xs text-slate-600">Edit for this session</span>
+                      </label>
+
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => void handleSaveDefaultTemplate()}
+                          disabled={!selectedTemplateId}
+                          className={cn(
+                            "text-xs px-3 py-1.5 rounded-md border transition-colors",
+                            selectedTemplateId
+                              ? "border-primary-200 bg-primary-50 text-primary-700 hover:bg-primary-100"
+                              : "border-slate-200 text-slate-400 cursor-not-allowed"
+                          )}
+                        >
+                          Save as default
+                        </button>
+                      )}
+                      {activeTemplateId && selectedTemplateId === activeTemplateId && (
+                        <span className="text-[10px] text-emerald-700">Tenant default</span>
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+
           <div className="flex items-end gap-3 max-w-4xl mx-auto">
+            <label
+              className="flex items-center gap-2 cursor-pointer shrink-0 pb-2"
+              title="When ON, rewrites your query for better recall in multi-turn conversations. Turn OFF for precise lookups like invoice IDs."
+            >
+              <input
+                type="checkbox"
+                checked={autoRewrite}
+                onChange={(e) => setAutoRewrite(e.target.checked)}
+                className="rounded border-slate-300 text-primary-600 focus:ring-primary-500 w-3.5 h-3.5"
+              />
+              <span className="text-xs text-slate-600 whitespace-nowrap">Auto-rewrite</span>
+            </label>
             <div className="flex-1 relative">
               <textarea
                 ref={textareaRef}

@@ -53,3 +53,58 @@ def test_chat_compliance_block_uses_grounding_phrase() -> None:
     blob = chat_api._chat_rag_compliance_block()
     assert chat_api._GROUNDING_REFUSAL_PHRASE in blob
     assert "Rules:" in blob and "  9. " in blob
+
+
+def test_validate_all_templates_passes_on_repo_prompts() -> None:
+    library_loader.validate_all_templates()
+
+
+def test_load_template_ignores_examples_field(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(library_loader, "PROMPTS_DIR", tmp_path)
+    (tmp_path / "with-examples.json").write_text(
+        json.dumps(
+            {
+                "template_id": "with-examples",
+                "system_instructions": "Answer using ONLY the provided context.",
+                "examples": [
+                    {
+                        "label": "Example C",
+                        "input": "total?",
+                        "output": "Total Due: $4,537.50",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert library_loader.load_template("with-examples") == (
+        "Answer using ONLY the provided context."
+    )
+
+
+def test_strip_is_noop_on_migrated_instructions() -> None:
+    inst = library_loader.load_template("preset-chain-of-thought")
+    assert inst is not None
+    assert library_loader.strip_examples_from_instructions(inst) == inst.strip()
+    assert "4537.50" not in inst
+    assert "Example C" not in inst
+
+
+def test_preset_rag_context_unchanged_instructions() -> None:
+    inst = library_loader.load_template("preset-rag-context")
+    assert inst is not None
+    assert "ONLY the context provided" in inst
+    raw = library_loader.load_prompt_library_raw("preset-rag-context")
+    assert raw is not None
+    assert raw.get("examples") == []
+    assert raw.get("examples_note")
+
+
+def test_cot_examples_accessible_for_editor() -> None:
+    raw = library_loader.load_prompt_library_raw("preset-chain-of-thought")
+    assert raw is not None
+    examples = raw.get("examples") or []
+    assert len(examples) == 3
+    labels = [ex["label"] for ex in examples]
+    assert any("Example C" in label for label in labels)
+    assert any("4,537.50" in ex.get("output", "") for ex in examples)

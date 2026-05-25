@@ -9,8 +9,28 @@ import {
 import { cn } from "@/lib/utils";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
+import { useTenant } from "@/contexts/TenantContext";
 
 /* ─── Types ─── */
+interface PromptTemplateListItem {
+  template_id: string;
+  name: string;
+  description?: string;
+  has_examples?: boolean;
+}
+
+interface TenantPromptConfig {
+  client_id: string;
+  prompt_template_id: string | null;
+  rewrite_enabled: boolean;
+}
+
+interface PromptExample {
+  label?: string;
+  input?: string;
+  output?: string;
+}
+
 interface PromptTemplate {
   template_id: string;
   name: string;
@@ -22,6 +42,8 @@ interface PromptTemplate {
   max_context_chars: number | null;
   version: string;
   tags: string[];
+  examples?: PromptExample[];
+  examples_note?: string;
   created_at?: number;
   updated_at?: number;
 }
@@ -93,7 +115,11 @@ function slugify(text: string): string {
 }
 
 export default function PromptBuilderPage() {
-  const [templates,       setTemplates]       = useState<PromptTemplate[]>([]);
+  const { clientId } = useTenant();
+  const [templates,       setTemplates]       = useState<PromptTemplateListItem[]>([]);
+  const [activeTemplateId, setActiveTemplateId] = useState<string | null>(null);
+  const [settingActiveId, setSettingActiveId]   = useState<string | null>(null);
+  const [activeStatus,    setActiveStatus]    = useState<"idle" | "ok" | "err">("idle");
   const [selected,        setSelected]        = useState<PromptTemplate | null>(null);
   const [mode,            setMode]            = useState<"list" | "edit" | "create">("list");
   const [loading,         setLoading]         = useState(true);
@@ -115,12 +141,14 @@ export default function PromptBuilderPage() {
   const [editMaxChars,    setEditMaxChars]    = useState<number | null>(null);
   const [editVersion,     setEditVersion]     = useState("1.0.0");
   const [editTags,        setEditTags]        = useState("");
+  const [editExamplesJson, setEditExamplesJson] = useState("[]");
+  const [examplesJsonError, setExamplesJsonError] = useState("");
   const [idError,         setIdError]         = useState("");
 
   const loadTemplates = useCallback(async () => {
     setLoading(true);
     try {
-      const resp = await apiClient.get(API.PROMPT_TEMPLATES.LIST());
+      const resp = await apiClient.get<PromptTemplateListItem[]>(API.PROMPT_TEMPLATES.LIST());
       setTemplates(resp.data);
     } catch (e) {
       console.error(e);
@@ -129,7 +157,22 @@ export default function PromptBuilderPage() {
     }
   }, []);
 
-  useEffect(() => { loadTemplates(); }, [loadTemplates]);
+  const loadActiveTemplate = useCallback(async () => {
+    if (!clientId) return;
+    try {
+      const resp = await apiClient.get<TenantPromptConfig>(
+        API.TENANT_PROMPT_CONFIG.GET(clientId)
+      );
+      setActiveTemplateId(resp.data.prompt_template_id);
+    } catch {
+      setActiveTemplateId(null);
+    }
+  }, [clientId]);
+
+  useEffect(() => {
+    void loadTemplates();
+    void loadActiveTemplate();
+  }, [loadTemplates, loadActiveTemplate]);
 
   const populateForm = (t: Partial<PromptTemplate> & { template_id?: string }) => {
     setEditId(t.template_id ?? "");
@@ -142,6 +185,12 @@ export default function PromptBuilderPage() {
     setEditMaxChars(t.max_context_chars ?? null);
     setEditVersion(t.version ?? "1.0.0");
     setEditTags((t.tags ?? []).join(", "));
+    setEditExamplesJson(
+      t.examples && t.examples.length > 0
+        ? JSON.stringify(t.examples, null, 2)
+        : "[]"
+    );
+    setExamplesJsonError("");
     setIdError("");
   };
 
@@ -151,16 +200,39 @@ export default function PromptBuilderPage() {
     setMode("create");
   };
 
-  const handleEdit = async (tmpl: PromptTemplate) => {
+  const handleEdit = async (tmpl: PromptTemplateListItem) => {
     try {
-      const resp = await apiClient.get(API.PROMPT_TEMPLATES.GET(tmpl.template_id));
+      const resp = await apiClient.get<PromptTemplate>(
+        API.PROMPT_TEMPLATES.GET(tmpl.template_id, true)
+      );
       populateForm(resp.data);
+      setSelected(resp.data);
     } catch {
       populateForm(tmpl);
+      setSelected(tmpl as unknown as PromptTemplate);
     }
-    setSelected(tmpl);
     setPreview(null);
     setMode("edit");
+  };
+
+  const handleSetActive = async (templateId: string) => {
+    if (!clientId) return;
+    setSettingActiveId(templateId);
+    setActiveStatus("idle");
+    try {
+      await apiClient.patch(API.TENANT_PROMPT_CONFIG.PATCH(clientId), {
+        prompt_template_id: templateId,
+      });
+      setActiveTemplateId(templateId);
+      setActiveStatus("ok");
+      await loadActiveTemplate();
+      setTimeout(() => setActiveStatus("idle"), 2500);
+    } catch {
+      setActiveStatus("err");
+      setTimeout(() => setActiveStatus("idle"), 2500);
+    } finally {
+      setSettingActiveId(null);
+    }
   };
 
   const handleStarterTemplate = (starter: typeof STARTER_TEMPLATES[0]) => {
@@ -185,6 +257,21 @@ export default function PromptBuilderPage() {
 
   const handleSave = async () => {
     if (mode === "create" && !validateId(editId)) return;
+
+    let parsedExamples: PromptExample[] = [];
+    try {
+      const parsed = JSON.parse(editExamplesJson || "[]");
+      if (!Array.isArray(parsed)) {
+        setExamplesJsonError("Examples must be a JSON array.");
+        return;
+      }
+      parsedExamples = parsed;
+      setExamplesJsonError("");
+    } catch {
+      setExamplesJsonError("Examples must be valid JSON.");
+      return;
+    }
+
     setSaving(true);
     setSaveStatus("idle");
     const payload = {
@@ -198,6 +285,7 @@ export default function PromptBuilderPage() {
       max_context_chars:   editMaxChars,
       version:             editVersion,
       tags:                editTags.split(",").map(t => t.trim()).filter(Boolean),
+      examples:            parsedExamples,
     };
     try {
       if (mode === "create") {
@@ -275,6 +363,17 @@ export default function PromptBuilderPage() {
           </div>
         </div>
 
+        {activeStatus === "ok" && (
+          <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-400">
+            <CheckCircle2 className="h-4 w-4" /> Active template updated for tenant.
+          </div>
+        )}
+        {activeStatus === "err" && (
+          <div className="flex items-center gap-2 rounded-lg border border-rose-500/30 bg-rose-500/10 px-3 py-2 text-sm text-rose-400">
+            <XCircle className="h-4 w-4" /> Failed to set active template.
+          </div>
+        )}
+
         {/* Starter templates */}
         {templates.length === 0 && !loading && (
           <div className="rounded-xl border border-dashed border-slate-700 p-6 space-y-4">
@@ -309,25 +408,49 @@ export default function PromptBuilderPage() {
               <div key={tmpl.template_id} className="rounded-xl border border-slate-700/50 bg-slate-900 p-4 space-y-3">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0">
-                    <p className="text-sm font-semibold text-white truncate">{tmpl.name}</p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="text-sm font-semibold text-white truncate">{tmpl.name}</p>
+                      {activeTemplateId === tmpl.template_id && (
+                        <span className="rounded-full bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 px-2 py-0.5 text-[10px] font-medium">
+                          Active
+                        </span>
+                      )}
+                    </div>
                     <p className="text-[10px] text-slate-500 font-mono mt-0.5 truncate">{tmpl.template_id}</p>
                   </div>
-                  <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-400 font-mono flex-shrink-0">v{tmpl.version}</span>
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {(tmpl.tags || []).map(t => (
-                    <span key={t} className="rounded-full bg-primary-500/10 text-primary-400 border border-primary-500/20 px-2 py-0.5 text-[10px]">{t}</span>
-                  ))}
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="text-[10px] text-slate-500">{CITATION_OPTIONS.find(c => c.value === tmpl.citation_style)?.label}</span>
-                </div>
+                {tmpl.has_examples && (
+                  <p className="text-[10px] text-amber-400/90 flex items-center gap-1">
+                    <AlertTriangle className="h-3 w-3 shrink-0" />
+                    Contains examples — stripped before LLM use
+                  </p>
+                )}
+                {tmpl.description ? (
+                  <p className="text-[11px] text-slate-500 line-clamp-2">{tmpl.description}</p>
+                ) : null}
                 <div className="flex gap-2">
                   <button
                     onClick={() => handleEdit(tmpl)}
                     className="flex-1 flex items-center justify-center gap-1.5 rounded-lg bg-slate-800 py-1.5 text-xs text-slate-300 hover:bg-slate-700 hover:text-white transition-colors"
                   >
                     <Edit3 className="h-3.5 w-3.5" /> Edit
+                  </button>
+                  <button
+                    onClick={() => void handleSetActive(tmpl.template_id)}
+                    disabled={!clientId || settingActiveId === tmpl.template_id}
+                    className={cn(
+                      "flex-1 flex items-center justify-center gap-1.5 rounded-lg py-1.5 text-xs transition-colors",
+                      activeTemplateId === tmpl.template_id
+                        ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/30"
+                        : "bg-primary-600/20 text-primary-300 border border-primary-500/30 hover:bg-primary-600/30"
+                    )}
+                  >
+                    {settingActiveId === tmpl.template_id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <CheckCircle2 className="h-3.5 w-3.5" />
+                    )}
+                    Set as active
                   </button>
                   <button
                     onClick={() => handleDelete(tmpl.template_id)}
@@ -460,6 +583,36 @@ Cite [1], [2] when referencing passages.`}
               <Hash className="h-3 w-3" />
               <span>~{Math.round(editSystem.length / 4)} tokens</span>
             </div>
+          </div>
+
+          {/* Few-shot examples (authoring reference; not injected into LLM) */}
+          <div className="rounded-xl border border-slate-700/50 bg-slate-900 p-5 space-y-3">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 text-amber-400" /> Few-shot Examples
+              </h2>
+              <span className="text-[10px] text-amber-400/90">
+                Authoring reference — stripped before LLM use
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              JSON array of objects with <code className="text-slate-400">label</code>,{" "}
+              <code className="text-slate-400">input</code>, and{" "}
+              <code className="text-slate-400">output</code>. Stored separately from system instructions.
+            </p>
+            <textarea
+              value={editExamplesJson}
+              onChange={e => {
+                setEditExamplesJson(e.target.value);
+                setExamplesJsonError("");
+              }}
+              rows={8}
+              className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-white font-mono leading-relaxed focus:border-primary-500 focus:outline-none resize-y"
+              placeholder={'[\n  {\n    "label": "Example A",\n    "input": "...",\n    "output": "..."\n  }\n]'}
+            />
+            {examplesJsonError ? (
+              <p className="text-[11px] text-rose-400">{examplesJsonError}</p>
+            ) : null}
           </div>
 
           {/* Advanced format */}

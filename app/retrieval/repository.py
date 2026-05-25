@@ -686,6 +686,7 @@ class RetrievalRepository:
                 temporal_decay=float(temporal_decay),
                 trust_state=_trust_state,
             ),
+            file_id=str(content.file_id) if content.file_id else None,
         )
         
         log_debug(

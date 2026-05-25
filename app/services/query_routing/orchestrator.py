@@ -58,6 +58,7 @@ class QueryOrchestrator:
             decision = self._rule_router.route(
                 raw_query,
                 has_chat_history=has_history,
+                top_k=top_k,
             )
             if decision is not None:
                 decision.route_latency_ms = round(
@@ -109,9 +110,23 @@ def init_orchestrator(
     return _ORCHESTRATOR
 
 
+async def _noop_embed_fn(text: str) -> list:  # type: ignore[type-arg]
+    """No-op embed used when real embedder is unavailable at startup."""
+    return []
+
+
 def get_orchestrator() -> QueryOrchestrator:
+    global _ORCHESTRATOR
     if _ORCHESTRATOR is None:
-        raise RuntimeError(
-            "QueryOrchestrator not initialized — call init_orchestrator() at startup"
+        logger.warning(
+            "[QueryOrchestrator] Lazy init — startup embed unavailable. "
+            "Semantic routing disabled; deterministic rule routing only."
         )
+        _ORCHESTRATOR = QueryOrchestrator(
+            embed_fn=_noop_embed_fn,
+            llm_judge_fn=None,
+        )
+        # Do NOT call startup() — embed is unavailable.
+        # SemanticRouter.ready stays False; all unmatched queries fall
+        # through to knowledge_decision fallback via orchestrator.
     return _ORCHESTRATOR

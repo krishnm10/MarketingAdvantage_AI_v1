@@ -116,6 +116,7 @@ class RuleRouter:
         self,
         raw_query: str,
         has_chat_history: bool = False,
+        top_k: int = 5,
     ) -> Optional[RouteDecision]:
         q = (raw_query or "").strip()
         if not q:
@@ -161,6 +162,7 @@ class RuleRouter:
         id_m = _STRUCTURED_ID_RE.search(q.upper())
         if id_m:
             return structured_decision(
+                top_k,
                 matched_pattern=id_m.group(0),
                 reason_code="structured_id",
             )

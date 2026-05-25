@@ -29,10 +29,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel, Field, field_validator
 
 from app.ai.contracts.generator_contract import CitationStyle, PromptTemplate
+from app.auth.generate_token import verify_access_token
+from app.core.prompts.library_loader import (
+    PROMPTS_DIR,
+    strip_and_verify,
+    system_instructions_from_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +100,10 @@ class PromptTemplateCreate(BaseModel):
     version:              str   = Field("1.0.0")
     tags:                 List[str] = Field(default_factory=list)
     metadata:             Dict[str, Any] = Field(default_factory=dict)
+    examples:             List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Few-shot authoring reference; never injected into LLM paths.",
+    )
 
     @field_validator("template_id")
     @classmethod
@@ -124,6 +135,7 @@ class PromptTemplateUpdate(BaseModel):
     version:              Optional[str]  = None
     tags:                 Optional[List[str]] = None
     metadata:             Optional[Dict[str, Any]] = None
+    examples:             Optional[List[Dict[str, Any]]] = None
 
 
 class PreviewRequest(BaseModel):
@@ -176,6 +188,70 @@ def _save_template(data: dict) -> None:
     tmp.replace(path)
 
 
+def _has_examples(data: dict) -> bool:
+    examples = data.get("examples")
+    return isinstance(examples, list) and len(examples) > 0
+
+
+def _template_description(data: dict) -> str:
+    meta = data.get("metadata")
+    if isinstance(meta, dict) and meta.get("description"):
+        return str(meta["description"])
+    desc = data.get("description")
+    return str(desc) if desc else ""
+
+
+_oauth2_optional = OAuth2PasswordBearer(tokenUrl="/api/v2/auth/token", auto_error=False)
+
+
+def _require_admin_token(token: Optional[str]) -> dict:
+    """Same role gate as PATCH tenant prompt-config (admin only)."""
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_access_token(token)
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    if payload.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Access forbidden: insufficient role privileges",
+        )
+    return payload
+
+
+def _examples_list(data: dict) -> List[Dict[str, Any]]:
+    examples = data.get("examples")
+    return examples if isinstance(examples, list) else []
+
+
+def _build_raw_template_response(data: dict, template_id: str) -> dict:
+    """Full on-disk record for Prompt Library authoring (no strip_and_verify)."""
+    instructions = system_instructions_from_record(data) or ""
+    return {
+        "template_id": data.get("template_id", template_id),
+        "name": data.get("name"),
+        "system_instructions": instructions,
+        "context_format": data.get(
+            "context_format", "[{index}] {text}\n  [Source: {source}]"
+        ),
+        "question_prefix": data.get("question_prefix", "Question:"),
+        "answer_prefix": data.get("answer_prefix", "Answer:"),
+        "citation_style": data.get("citation_style", "inline_numeric"),
+        "max_context_chars": data.get("max_context_chars"),
+        "version": data.get("version", "1.0.0"),
+        "tags": data.get("tags", []),
+        "metadata": data.get("metadata", {}),
+        "examples": _examples_list(data),
+        "examples_note": data.get(
+            "examples_note",
+            "Authoring reference only. Never injected into LLM.",
+        ),
+        "has_examples": _has_examples(data),
+        "created_at": data.get("created_at"),
+        "updated_at": data.get("updated_at"),
+    }
+
+
 def _build_prompt_template(data: dict) -> PromptTemplate:
     return PromptTemplate(
         template_id=data["template_id"],
@@ -200,18 +276,15 @@ def _build_prompt_template(data: dict) -> PromptTemplate:
 async def list_templates():
     """List all prompt templates in the library."""
     results = []
-    for path in sorted(_TEMPLATES_DIR.glob("*.json")):
+    for path in sorted(PROMPTS_DIR.glob("*.json")):
         try:
-            with path.open() as f:
+            with path.open(encoding="utf-8") as f:
                 data = json.load(f)
             results.append({
-                "template_id":   data.get("template_id"),
-                "name":          data.get("name"),
-                "version":       data.get("version"),
-                "tags":          data.get("tags", []),
-                "citation_style": data.get("citation_style"),
-                "created_at":    data.get("created_at"),
-                "updated_at":    data.get("updated_at"),
+                "template_id": data.get("template_id"),
+                "name": data.get("name"),
+                "description": _template_description(data),
+                "has_examples": _has_examples(data),
             })
         except Exception as e:
             logger.warning("Skipping malformed template %s: %s", path.name, e)
@@ -242,9 +315,35 @@ async def create_template(req: PromptTemplateCreate):
 
 
 @router.get("/{template_id}", response_model=dict)
-async def get_template(template_id: str):
-    """Get a prompt template by ID."""
-    return _load_template(template_id)
+async def get_template(
+    template_id: str,
+    raw: bool = Query(
+        False,
+        description="Admin-only: return full on-disk template including examples.",
+    ),
+    token: Optional[str] = Depends(_oauth2_optional),
+):
+    """Get a prompt template by ID.
+
+    Default (``raw=false``): stripped ``system_instructions`` for LLM preview; no examples.
+    ``raw=true``: admin auth required; full authoring record including ``examples``.
+    """
+    data = _load_template(template_id)
+    if raw:
+        _require_admin_token(token)
+        return _build_raw_template_response(data, template_id)
+
+    instructions = system_instructions_from_record(data) or ""
+    return {
+        "template_id": data.get("template_id", template_id),
+        "name": data.get("name"),
+        "system_instructions": strip_and_verify(instructions),
+        "has_examples": _has_examples(data),
+        "examples_note": data.get(
+            "examples_note",
+            "Authoring reference only. Never injected into LLM.",
+        ),
+    }
 
 
 @router.put("/{template_id}", response_model=dict)

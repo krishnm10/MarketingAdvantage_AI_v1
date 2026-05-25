@@ -106,6 +106,8 @@ def _score_and_rank(
     Apply governance decision, score, build explanation, and sort.
 
     Stateless — operates purely on the provided inputs.
+
+    DEAD PATH for POST /api/v2/retrieve/chat — chat uses RetrievalRuntime.retrieve() directly.
     """
     ranked: List[RankedResult] = []
     dropped: List[RetrievalCandidate] = []
@@ -128,6 +130,7 @@ def _score_and_rank(
             score=final_score,
             explanation={},
             trust_decision=decision,
+            file_id=candidate.file_id,
         )
 
         explanation = build_explanation(
@@ -143,6 +146,7 @@ def _score_and_rank(
                 score=final_score,
                 explanation=explanation,
                 trust_decision=decision,
+                file_id=candidate.file_id,
             )
         )
 
