@@ -505,6 +505,9 @@ export default function ChatRetrievePage() {
               SSOT: {tenantRuntime.llm.effective_provider} / {tenantRuntime.reranker.effective_plugin}
             </p>
           )}
+          <p className="text-[10px] text-slate-500">
+            Session-only — changes here apply to this console only and do not alter tenant defaults in Settings → Reranking & Rules.
+          </p>
           {/* LLM Provider */}
           <div>
             <label className="text-xs font-medium text-slate-500 block mb-1">LLM Provider</label>
@@ -544,7 +547,12 @@ export default function ChatRetrievePage() {
 
           {/* Top K */}
           <div>
-            <label className="text-xs font-medium text-slate-500 block mb-1">Top K: {topK}</label>
+            <label
+              className="text-xs font-medium text-slate-500 block mb-1"
+              title="This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules."
+            >
+              Top K: {topK}
+            </label>
             <input
               type="range" min={1} max={20} value={topK}
               onChange={(e) => setTopK(Number(e.target.value))}
@@ -554,7 +562,12 @@ export default function ChatRetrievePage() {
 
           {/* Search Mode */}
           <div>
-            <label className="text-xs font-medium text-slate-500 block mb-1">Search Mode</label>
+            <label
+              className="text-xs font-medium text-slate-500 block mb-1"
+              title="This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules."
+            >
+              Search Mode
+            </label>
             <select
               value={searchMode}
               onChange={(e) => setSearchMode(e.target.value)}
@@ -568,7 +581,10 @@ export default function ChatRetrievePage() {
 
           {/* Toggles */}
           <div className="space-y-2">
-            <label className="flex items-center gap-2 cursor-pointer">
+            <label
+              className="flex items-center gap-2 cursor-pointer"
+              title="This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules."
+            >
               <input
                 type="checkbox" checked={enableHyde}
                 onChange={(e) => setEnableHyde(e.target.checked)}
@@ -576,7 +592,10 @@ export default function ChatRetrievePage() {
               />
               <span className="text-xs text-slate-600">HyDE Expansion</span>
             </label>
-            <label className="flex items-center gap-2 cursor-pointer">
+            <label
+              className="flex items-center gap-2 cursor-pointer"
+              title="This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules."
+            >
               <input
                 type="checkbox" checked={generateAnswer}
                 onChange={(e) => setGenerateAnswer(e.target.checked)}

@@ -113,6 +113,7 @@ opentelemetry-exporter-otlp-proto-grpc==1.38.0
 opentelemetry-proto==1.38.0
 opentelemetry-sdk==1.38.0
 opentelemetry-semantic-conventions==0.59b0
+prometheus-client==0.21.0
 orjson==3.11.4
 overrides==7.7.0
 packaging==25.0

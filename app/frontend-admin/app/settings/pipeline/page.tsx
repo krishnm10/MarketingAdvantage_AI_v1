@@ -157,6 +157,36 @@ interface AdvancedConfig {
   context_window: ContextWindowConfig;
 }
 
+interface ParserConfigDraft {
+  enable_pdf: boolean;
+  enable_docx: boolean;
+  enable_xlsx: boolean;
+  enable_csv: boolean;
+  enable_pptx: boolean;
+  enable_html: boolean;
+  enable_json: boolean;
+  enable_txt: boolean;
+  enable_ocr: boolean;
+  enable_audio: boolean;
+  enable_video: boolean;
+  enable_image: boolean;
+}
+
+const DEFAULT_PARSER_DRAFT: ParserConfigDraft = {
+  enable_pdf: true,
+  enable_docx: true,
+  enable_xlsx: true,
+  enable_csv: true,
+  enable_pptx: true,
+  enable_html: true,
+  enable_json: true,
+  enable_txt: true,
+  enable_ocr: false,
+  enable_audio: false,
+  enable_video: false,
+  enable_image: false,
+};
+
 interface TemplateSummary {
   template_id: string;
   name: string;
@@ -219,6 +249,19 @@ const DEFAULT_ADVANCED_CONFIG: AdvancedConfig = {
     response_reserve_tokens: 1024,
   },
 };
+
+function mergeParserFromApi(raw: unknown): ParserConfigDraft {
+  const base: ParserConfigDraft = { ...DEFAULT_PARSER_DRAFT };
+  if (!raw || typeof raw !== "object") return base;
+  const obj = raw as Record<string, unknown>;
+  (Object.keys(base) as (keyof ParserConfigDraft)[]).forEach((key) => {
+    const val = obj[key];
+    if (typeof val === "boolean") {
+      base[key] = val;
+    }
+  });
+  return base;
+}
 
 /* ─── Quick presets ─── */
 const QUICK_PRESETS = [
@@ -633,6 +676,9 @@ export default function PipelineBuilderPage() {
     emptyVectordbDraft("chroma", clientId)
   );
   const [vdbApplyError, setVdbApplyError] = useState<string | null>(null);
+  const [parserDraft, setParserDraft] = useState<ParserConfigDraft>(() => ({
+    ...DEFAULT_PARSER_DRAFT,
+  }));
 
   /* Deep link: ?client=<tenant> from Customers & RAG dashboard */
   useEffect(() => {
@@ -685,9 +731,14 @@ export default function PipelineBuilderPage() {
       if (p) {
         setTokenizationDraft(mergeTokenizationFromApi(p.tokenization));
         setCeleryDispatchDraft(mergeCeleryDispatchFromApi(p.celery_dispatch));
+        // Parser config is merged on the backend; UI only controls enable_* booleans.
+        // Use schema-style defaults when parser is missing.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        setParserDraft(mergeParserFromApi((p as any).parser));
       } else {
         setTokenizationDraft({ ...DEFAULT_TOKENIZATION_DRAFT });
         setCeleryDispatchDraft({ ...DEFAULT_CELERY_DISPATCH_DRAFT });
+        setParserDraft({ ...DEFAULT_PARSER_DRAFT });
       }
       if (p && (p.vectordb != null || p.embedder != null || p.llm != null)) {
         setPipelineIdentitySnap({
@@ -989,6 +1040,7 @@ export default function PipelineBuilderPage() {
       ingestion,
       tokenization: { ...tokenizationDraft },
       celery_dispatch,
+      parser: { ...parserDraft },
     };
   }, [
     chunkingStrategy,
@@ -996,6 +1048,7 @@ export default function PipelineBuilderPage() {
     chunkOverlap,
     tokenizationDraft,
     celeryDispatchDraft,
+    parserDraft,
   ]);
 
   const buildPipelinePatchPayload = useCallback((): Record<string, unknown> => {
@@ -1051,12 +1104,16 @@ export default function PipelineBuilderPage() {
       if (tenantLogic.celery_dispatch && typeof tenantLogic.celery_dispatch === "object") {
         mergedPatch.celery_dispatch = tenantLogic.celery_dispatch;
       }
+       if (tenantLogic.parser && typeof tenantLogic.parser === "object") {
+         mergedPatch.parser = tenantLogic.parser;
+       }
 
       const hasPipelinePluggablePatch =
         Object.keys(topology).length > 0 ||
         (tenantLogic.ingestion != null && typeof tenantLogic.ingestion === "object") ||
         (tenantLogic.tokenization != null && typeof tenantLogic.tokenization === "object") ||
-        (tenantLogic.celery_dispatch != null && typeof tenantLogic.celery_dispatch === "object");
+        (tenantLogic.celery_dispatch != null && typeof tenantLogic.celery_dispatch === "object") ||
+        (tenantLogic.parser != null && typeof tenantLogic.parser === "object");
 
       if (hasPipelinePluggablePatch) {
         await apiClient.patch(API.RAG_CONFIG.PIPELINE_PLUGGABLE_PATCH(clientId), mergedPatch);
@@ -1238,6 +1295,154 @@ export default function PipelineBuilderPage() {
         tenantLogicPreview={tenantLogicPreview}
         disabled={applying}
       />
+
+      {/* Parser toggles — file types and multimodal parsers */}
+      <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-semibold text-slate-800 flex items-center gap-2">
+          <FileText className="h-4 w-4 text-primary-600" />
+          Parser &amp; file-type toggles
+        </h2>
+        <p className="mt-1 text-xs text-slate-500">
+          Control which parsers are active for this tenant. Basic text and document formats stay enabled by default; advanced multimodal parsers are opt-in.
+        </p>
+        <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2">
+          {/* Basic formats */}
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_pdf}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_pdf: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>PDF</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_docx}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_docx: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>DOCX</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_xlsx}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_xlsx: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>XLSX</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_csv}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_csv: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>CSV</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_pptx}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_pptx: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>PPTX</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_html}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_html: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>HTML</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_json}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_json: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>JSON</span>
+          </label>
+          <label className="flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_txt}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_txt: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>Plain text</span>
+          </label>
+
+          {/* Advanced / multimodal */}
+          <label className="mt-2 flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_ocr}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_ocr: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>OCR (scanned PDFs, images)</span>
+          </label>
+          <label className="mt-2 flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_audio}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_audio: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>Audio transcription</span>
+          </label>
+          <label className="mt-2 flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_video}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_video: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>Video parsing</span>
+          </label>
+          <label className="mt-2 flex items-center gap-2 text-xs text-slate-700">
+            <input
+              type="checkbox"
+              checked={parserDraft.enable_image}
+              onChange={(e) =>
+                setParserDraft((prev) => ({ ...prev, enable_image: e.target.checked }))
+              }
+              className="h-3.5 w-3.5 rounded border-slate-300 text-primary-600 focus:ring-primary-200"
+            />
+            <span>Image captioning</span>
+          </label>
+        </div>
+      </div>
 
       {/* ─── STEP 1: Choose Model ─── */}
       {step === 1 && (

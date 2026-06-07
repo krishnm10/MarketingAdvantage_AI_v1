@@ -19,6 +19,18 @@ class RetrievalIntent(str, Enum):
     AUDIT = "audit"        # no filtering
 
 
+class DomainType(str, Enum):
+    """
+    Coarse domain hint for L1 task classification (domain-agnostic platform).
+
+    Phase 1 uses invoice as the first production-targeted domain; additional
+    domains plug in via adapters in later phases without changing this enum's role.
+    """
+
+    INVOICE = "invoice"
+    GENERIC = "generic"
+
+
 # ---------------------------------------------------------
 # Query Context (Immutable)
 # ---------------------------------------------------------

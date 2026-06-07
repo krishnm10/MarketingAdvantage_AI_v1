@@ -4,6 +4,7 @@ from sqlalchemy import (
     Column,
     String,
     TIMESTAMP,
+    DateTime,
     JSON,
     Integer,
     Float,
@@ -61,6 +62,13 @@ class IngestedFileV2(Base):
     unique_chunks = Column(Integer, default=0)
     duplicate_chunks = Column(Integer, default=0)
     dedup_ratio = Column(Float, default=0.0)  # (duplicate_chunks / total_chunks) * 100
+
+    # -----------------------------------------------------------
+    # STREAMING CHECKPOINT (resume after micro-batch commit)
+    # -----------------------------------------------------------
+    last_processed_chunk_index = Column(Integer, nullable=False, server_default="0")
+    last_processed_page = Column(Integer, nullable=False, server_default="0")
+    last_processed_at = Column(DateTime(timezone=True), nullable=True)
 
     # -----------------------------------------------------------
     # STATUS LIFECYCLE

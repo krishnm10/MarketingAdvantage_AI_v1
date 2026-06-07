@@ -32,7 +32,18 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
+from opentelemetry import trace
+
 from app.utils.pipeline_logger import PipelineLogger
+from app.observability.metrics import (
+    inc_worker_active_jobs,
+    dec_worker_active_jobs,
+    record_ingestion_failure,
+    record_ingestion_started,
+    record_ingestion_completed,
+    set_worker_queue_depth,
+    set_worker_dlq_total,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,7 +116,6 @@ class InMemoryIngestionQueue:
 
     def __init__(self, maxsize: int = 1000):
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue(maxsize=maxsize)
-        self._dead_letter: List[IngestionCommand] = []
         self._enqueued: int = 0
         self._processed: int = 0
         self._failed: int = 0
@@ -132,17 +142,8 @@ class InMemoryIngestionQueue:
         self._queue.task_done()
         self._processed += 1
 
-    def send_to_dead_letter(self, command: IngestionCommand) -> None:
-        self._dead_letter.append(command)
+    def mark_permanent_failure(self) -> None:
         self._failed += 1
-        logger.error(
-            "Command sent to dead-letter queue after max retries",
-            extra={
-                "command_id": command.command_id,
-                "file_id": command.file_id,
-                "attempt": command.attempt,
-            },
-        )
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -150,12 +151,8 @@ class InMemoryIngestionQueue:
             "enqueued": self._enqueued,
             "processed": self._processed,
             "failed": self._failed,
-            "dead_letter": len(self._dead_letter),
             "pending": self._queue.qsize(),
         }
-
-    def dead_letter_items(self) -> List[Dict[str, Any]]:
-        return [cmd.to_dict() for cmd in self._dead_letter[-50:]]  # last 50 only
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -217,11 +214,20 @@ class IngestionWorker:
                 continue
 
             async with self._semaphore:
+                # Update queue depth gauge best-effort.
+                try:
+                    set_worker_queue_depth(self._queue.stats["pending"])
+                except Exception:
+                    pass
                 await self._process_command(command, worker_id=worker_id)
             self._queue.task_done()
 
     async def _process_command(self, command: IngestionCommand, worker_id: int) -> None:
         t0 = time.monotonic()
+
+        tracer = trace.get_tracer("mai.ingestion.worker")
+        inc_worker_active_jobs()
+        record_ingestion_started(kind="worker")
 
         # ── Tenant enforcement: validate before processing ────────────
         from app.core.config.pipeline_runtime import get_pipeline_identity
@@ -243,27 +249,45 @@ class IngestionWorker:
         )
         try:
             from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
-            plog.info(
-                "Processing ingestion command",
-                file_id=command.file_id,
-                worker_id=worker_id,
-                attempt=command.attempt,
-                source_type=command.source_type,
-                tenant_id=tenant_ctx.tenant_id,
-            )
-            await IngestionOrchestrator().ingest_file(
-                file_id=command.file_id,
-                client_id=tenant_ctx.tenant_id,
-                file_path=command.file_path,
-            )
-            elapsed_ms = (time.monotonic() - t0) * 1000
-            plog.info(
-                "Ingestion command completed",
-                file_id=command.file_id,
-                worker_id=worker_id,
-                duration_ms=round(elapsed_ms, 2),
-            )
+            with tracer.start_as_current_span("ingestion.worker.process_command") as span:
+                try:
+                    span.set_attribute("mai.stage", "worker.process_command")
+                    if command.source_type:
+                        span.set_attribute("mai.source_type", command.source_type)
+                    attempt_class = "first" if command.attempt == 0 else "retry"
+                    span.set_attribute("mai.attempt_class", attempt_class)
+                    plog.info(
+                        "Processing ingestion command",
+                        file_id=command.file_id,
+                        worker_id=worker_id,
+                        attempt=command.attempt,
+                        source_type=command.source_type,
+                        tenant_id=tenant_ctx.tenant_id,
+                    )
+                    await IngestionOrchestrator().ingest_file(
+                        file_id=command.file_id,
+                        client_id=tenant_ctx.tenant_id,
+                        file_path=command.file_path,
+                        # mark kind so orchestrator metrics can differentiate
+                        # worker-driven vs HTTP-driven ingestion
+                    )
+                    elapsed_ms = (time.monotonic() - t0) * 1000
+                    plog.info(
+                        "Ingestion command completed",
+                        file_id=command.file_id,
+                        worker_id=worker_id,
+                        duration_ms=round(elapsed_ms, 2),
+                    )
+                    record_ingestion_completed(kind="worker")
+                except Exception as e:
+                    span.record_exception(e)
+                    raise
         except Exception as e:
+            from app.services.ingestion.ingestion_failure_context import (
+                pop_ingestion_failure_context,
+            )
+
+            failure_ctx = pop_ingestion_failure_context()
             elapsed_ms = (time.monotonic() - t0) * 1000
             plog.error(
                 "Ingestion command failed",
@@ -293,7 +317,34 @@ class IngestionWorker:
                 )
                 await self._queue.enqueue(retry_cmd)
             else:
-                self._queue.send_to_dead_letter(command)
+                self._queue.mark_permanent_failure()
+                from app.services.ingestion.ingestion_dlq_service import (
+                    record_ingestion_failure as _record_dlq,
+                )
+
+                stage = (
+                    failure_ctx.stage
+                    if failure_ctx is not None
+                    else "worker.ingest_file"
+                )
+                window_index = (
+                    failure_ctx.window_index if failure_ctx is not None else None
+                )
+                payload = command.to_dict()
+                if failure_ctx is not None and failure_ctx.extra:
+                    payload["failure_context"] = failure_ctx.extra
+                record_ingestion_failure(stage=stage)
+                await _record_dlq(
+                    business_id=tenant_ctx.tenant_id,
+                    file_id=command.file_id,
+                    stage=stage,
+                    error=e,
+                    payload_snapshot=payload,
+                    retry_count=command.attempt,
+                    window_index=window_index,
+                )
+        finally:
+            dec_worker_active_jobs()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

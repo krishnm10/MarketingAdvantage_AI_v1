@@ -804,6 +804,172 @@ class FeatureFlags(BaseModel):
     enable_bundle_validation:  bool = Field(False, description="Enforce Phase 1 embedder bundle validation.")
     enable_pii_middleware:     bool = Field(False, description="Enable PII middleware pipeline integration.")
     enable_advanced_nodes:     bool = Field(False, description="Enable advanced pipeline node configuration.")
+    # L1 task classification + docset analysis flags (all default OFF; tenant-scoped).
+    enable_l1_task_classification: bool = Field(
+        False,
+        description=(
+            "Enable L1 task classification for retrieval/chat (read-only; "
+            "Phase 1 emits debug/trace metadata only)."
+        ),
+    )
+    enable_docset_analysis: bool = Field(
+        False,
+        description=(
+            "Enable document-set analysis execution for eligible chat queries. "
+            "When on, structured AnalysisResult / DocumentMatch objects are "
+            "available in-process for shaping, shadow, and golden evaluation."
+        ),
+    )
+    enable_docset_analysis_debug: bool = Field(
+        False,
+        description=(
+            "Emit debug-only document-set analysis metadata under "
+            "debug_info for eligible chat queries. Requires "
+            "enable_docset_analysis; observability only."
+        ),
+    )
+    enable_docset_invoice_adapter: bool = Field(
+        False,
+        description=(
+            "Enable invoice domain adapter for debug-only document-set analysis. "
+            "Core retrieval remains domain-agnostic."
+        ),
+    )
+    docset_max_docs_debug: int = Field(
+        20,
+        ge=1,
+        description=(
+            "Maximum number of distinct documents to include in debug-only docset "
+            "analysis. Does not affect retrieval/ranking."
+        ),
+    )
+    docset_max_chunks_per_doc_debug: int = Field(
+        3,
+        ge=1,
+        description=(
+            "Maximum number of chunks per document to surface in debug-only docset "
+            "analysis payloads."
+        ),
+    )
+    enable_docset_shadow_mode: bool = Field(
+        False,
+        description=(
+            "Enable Phase 3A shadow document-set analysis for eligible chat queries. "
+            "Shadow mode is observational only and never changes live behavior."
+        ),
+    )
+    enable_docset_shadow_debug: bool = Field(
+        False,
+        description=(
+            "When shadow mode is enabled, emit compact debug-only shadow metadata "
+            "under debug_info for retrieval/chat."
+        ),
+    )
+    enable_docset_golden_eval: bool = Field(
+        False,
+        description=(
+            "Enable Phase 3B golden evaluation for document-set shadow matches. "
+            "Evaluation is observational only and never changes live behavior."
+        ),
+    )
+    enable_docset_golden_debug: bool = Field(
+        False,
+        description=(
+            "When golden evaluation is enabled, emit compact debug-only docset "
+            "golden evaluation metadata under debug_info for retrieval/chat."
+        ),
+    )
+    docset_golden_set_ref: Optional[str] = Field(
+        None,
+        description=(
+            "Optional golden-set reference (under tests/golden_sets/) used for "
+            "Phase 3B docset golden evaluation for this tenant."
+        ),
+    )
+    enable_docset_result_shaping: bool = Field(
+        False,
+        description=(
+            "Enable Phase 4 active result shaping for eligible docset-style chat "
+            "queries. Shaping is a presentation/grounding layer only and does not "
+            "change retrieval, ranking, reranking, routing, or schemas."
+        ),
+    )
+    docset_max_docs_returned: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Maximum number of eligible documents to surface in shaped chat results "
+            "when result shaping is enabled. 0 means no additional document cap "
+            "beyond existing retrieval limits."
+        ),
+    )
+    enable_docset_summary: bool = Field(
+        False,
+        description=(
+            "Enable Phase 5A deterministic document-set summary generation for "
+            "eligible chat queries. Summaries are observability artifacts only and "
+            "must not be used as answer grounding."
+        ),
+    )
+    enable_docset_summary_debug: bool = Field(
+        False,
+        description=(
+            "When docset summary generation is enabled, emit compact summary "
+            "metadata (and optional summary text) under debug_info. "
+            "Observability only; does not affect answers."
+        ),
+    )
+    enable_chat_answer_polish: bool = Field(
+        False,
+        description=(
+            "Phase 5B scaffold: reserved for optional post-grounding answer polish. "
+            "Default OFF; no polish behavior is active in prerequisite hardening."
+        ),
+    )
+    enable_chat_answer_polish_debug: bool = Field(
+        False,
+        description=(
+            "When answer polish scaffold is enabled, emit observability-only "
+            "answer integrity snapshots under debug_info. Does not block requests."
+        ),
+    )
+    enable_knowledge_faithfulness_shadow: bool = Field(
+        False,
+        description=(
+            "Phase 6A: run KNOWLEDGE/docset claim-level verifier in shadow mode. "
+            "Observational only; does not change answers or trust-gate outcomes."
+        ),
+    )
+    enable_knowledge_faithfulness_gate: bool = Field(
+        False,
+        description=(
+            "Phase 6A: enable fail-closed KNOWLEDGE/docset verifier gating for "
+            "gated claim categories. Requires shadow calibration before production use."
+        ),
+    )
+    enable_knowledge_faithfulness_debug: bool = Field(
+        False,
+        description=(
+            "When KNOWLEDGE verifier runs, emit detailed per-claim trace under "
+            "debug_info['knowledge_verifier']. Subject to trace size caps."
+        ),
+    )
+    knowledge_indeterminate_policy: str = Field(
+        "pass_through",
+        description=(
+            "Phase 6A INDETERMINATE handling when gating is enabled: "
+            "'pass_through' leaves answer unchanged; 'treat_as_fail' uses refusal text."
+        ),
+    )
+    docset_max_chunks_per_doc_view: int = Field(
+        0,
+        ge=0,
+        description=(
+            "Optional cap on chunks per eligible document in shaped results, answer "
+            "context, and citations when result shaping is enabled. 0 disables the "
+            "per-document chunk cap (global context limits still apply)."
+        ),
+    )
 
 
 # ══════════════════════════════════════════════════════════════

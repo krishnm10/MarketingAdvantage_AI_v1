@@ -235,6 +235,7 @@ def _build_synthetic_pipeline_response(client_id: str) -> dict:
             "enable_threshold_gate":         False,
             "threshold_min_score":           0.0,
             "threshold_min_results":         1,
+            "answer_min_score":              0.25,
             "enable_token_budget":           True,
             "token_budget_context_fraction": 0.6,
             "prompt_template_id":            None,
@@ -256,6 +257,7 @@ class RerankerConfigUpdate(BaseModel):
     enable_threshold_gate:    Optional[bool]  = None
     threshold_min_score:      Optional[float] = Field(None, ge=0.0, le=1.0)
     threshold_min_results:    Optional[int]   = Field(None, ge=1)
+    answer_min_score:         Optional[float] = Field(None, ge=0.0, le=1.0)
     enable_token_budget:      Optional[bool]  = None
     token_budget_fraction:    Optional[float] = Field(None, ge=0.1, le=0.95)
     enable_hyde:              Optional[bool]  = None
@@ -302,6 +304,10 @@ class PipelinePluggablePatch(BaseModel):
     celery_dispatch: Optional[Dict[str, Any]] = Field(
         None,
         description="Deep-merge patch for celery_dispatch.*",
+    )
+    parser: Optional[Dict[str, Any]] = Field(
+        None,
+        description="Deep-merge patch for parsers.* (file-type and OCR toggles).",
     )
 
 
@@ -549,6 +555,7 @@ async def update_pipeline_config(
         "enable_threshold_gate":   "enable_threshold_gate",
         "threshold_min_score":     "threshold_min_score",
         "threshold_min_results":   "threshold_min_results",
+        "answer_min_score":        "answer_min_score",
         "enable_token_budget":     "enable_token_budget",
         "token_budget_fraction":   "token_budget_context_fraction",
         "enable_hyde":             "enable_hyde",
@@ -709,6 +716,7 @@ async def get_pipeline_config(client_id: str):
             "enable_threshold_gate":         retrieval.get("enable_threshold_gate", False),
             "threshold_min_score":           retrieval.get("threshold_min_score", 0.0),
             "threshold_min_results":         retrieval.get("threshold_min_results", 1),
+            "answer_min_score":              retrieval.get("answer_min_score", 0.25),
             "enable_token_budget":           retrieval.get("enable_token_budget", True),
             "token_budget_context_fraction": retrieval.get("token_budget_context_fraction", 0.6),
             "prompt_template_id":            retrieval.get("prompt_template_id"),
@@ -791,7 +799,22 @@ async def get_pipeline_pluggable(client_id: str):
     from app.core.config.pipeline_runtime import get_pipeline_identity
 
     cid = _validated_tenant_path(client_id, "get_pipeline_pluggable")
-    return get_pipeline_identity(cid)
+    identity = get_pipeline_identity(cid)
+
+    # Also expose raw parser settings for admin UI (deep-merged Client JSON).
+    try:
+        merged_raw = _merged_effective_client_dict(cid)
+        parsers_cfg = merged_raw.get("parsers") or merged_raw.get("parser") or {}
+        if isinstance(parsers_cfg, dict):
+            identity["parser"] = parsers_cfg
+    except Exception as e:
+        logger.warning(
+            "[rag_config_api] Failed to attach parser config for client '%s': %s",
+            cid,
+            e,
+        )
+
+    return identity
 
 
 @router.patch("/pipeline-pluggable/{client_id}")
@@ -889,6 +912,11 @@ async def patch_pipeline_pluggable(client_id: str, patch: PipelinePluggablePatch
         if not isinstance(base_cd, dict):
             base_cd = {}
         merged["celery_dispatch"] = _deep_merge(base_cd, patch.celery_dispatch)
+    if patch.parser is not None and isinstance(patch.parser, dict):
+        base_parsers = merged.get("parsers")
+        if not isinstance(base_parsers, dict):
+            base_parsers = {}
+        merged["parsers"] = _deep_merge(base_parsers, patch.parser)
 
     from app.core.prompts.ssot import enforce_library_first_prompt_persist
 

@@ -21,8 +21,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Optional, Set
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+
+from app.auth.guards import require_role
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +186,49 @@ async def eval_faithfulness(req: FaithfulnessRequest):
     except Exception as e:
         logger.error("[rag_eval_api] faithfulness eval failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class PipelineRunRequest(BaseModel):
+    """Run a golden-set file against live chat and/or RAG paths."""
+
+    set_ref: str = Field(..., description="Golden set path under tests/golden_sets/")
+    paths: List[str] = Field(
+        default_factory=lambda: ["chat", "rag"],
+        description="Paths to evaluate: chat, rag",
+    )
+    run_faithfulness: bool = Field(True, description="Run LLM-as-judge when API keys are set.")
+
+
+@router.post("/pipeline-run", response_model=dict)
+async def pipeline_run_golden_set(
+    req: PipelineRunRequest,
+    _user=Depends(require_role("admin")),
+):
+    """
+    Execute a golden-set evaluation harness server-side (admin only).
+    """
+    allowed = {"chat", "rag"}
+    paths = [p.strip().lower() for p in req.paths if p.strip().lower() in allowed]
+    if not paths:
+        raise HTTPException(status_code=422, detail="paths must include chat and/or rag")
+
+    try:
+        from app.ai.evaluation.golden_set_runner import GoldenSetRunner, check_thresholds
+
+        runner = GoldenSetRunner()
+        report = runner.run(
+            req.set_ref,
+            paths=paths,  # type: ignore[arg-type]
+            run_faithfulness=req.run_faithfulness,
+        )
+        payload = report.to_dict()
+        payload["threshold_violations"] = check_thresholds(report)
+        return payload
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except Exception as e:
+        logger.error("[rag_eval_api] pipeline-run failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @router.get("/evaluation-matrix", response_model=List[dict])

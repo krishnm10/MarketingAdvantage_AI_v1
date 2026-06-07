@@ -104,6 +104,30 @@ class RuntimeComponents:
     # ── Embedder sub-config model name (for telemetry) ─────────────
     embedder_model: str
 
+    # ── Feature flags snapshot (subset, read-only) ─────────────────
+    enable_l1_task_classification: bool = False
+    enable_docset_analysis: bool = False
+    enable_docset_analysis_debug: bool = False
+    enable_docset_invoice_adapter: bool = False
+    docset_max_docs_debug: int = 0
+    docset_max_chunks_per_doc_debug: int = 0
+    enable_docset_shadow_mode: bool = False
+    enable_docset_shadow_debug: bool = False
+    enable_docset_golden_eval: bool = False
+    enable_docset_golden_debug: bool = False
+    docset_golden_set_ref: Optional[str] = None
+    enable_docset_result_shaping: bool = False
+    docset_max_docs_returned: int = 0
+    docset_max_chunks_per_doc_view: int = 0
+    enable_docset_summary: bool = False
+    enable_docset_summary_debug: bool = False
+    enable_chat_answer_polish: bool = False
+    enable_chat_answer_polish_debug: bool = False
+    enable_knowledge_faithfulness_shadow: bool = False
+    enable_knowledge_faithfulness_gate: bool = False
+    enable_knowledge_faithfulness_debug: bool = False
+    knowledge_indeterminate_policy: str = "pass_through"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config resolution with controlled fallback
@@ -212,6 +236,8 @@ def resolve_runtime_components(config: ClientConfig) -> RuntimeComponents:
 
     _rr_resolved = resolve_reranker_runtime(config)
 
+    feats = config.features
+
     return RuntimeComponents(
         runtime_mode="authoritative_config",
         config_fingerprint=get_config_fingerprint(config),
@@ -235,6 +261,60 @@ def resolve_runtime_components(config: ClientConfig) -> RuntimeComponents:
         top_k_final=_retrieval.top_k_final,
         rag_min_score=float(_retrieval.answer_min_score),
         chunking_strategy=config.ingestion.chunking.strategy.value,
+        enable_l1_task_classification=getattr(
+            feats, "enable_l1_task_classification", False
+        ),
+        enable_docset_analysis=getattr(feats, "enable_docset_analysis", False),
+        enable_docset_analysis_debug=getattr(
+            feats, "enable_docset_analysis_debug", False
+        ),
+        enable_docset_invoice_adapter=getattr(
+            feats, "enable_docset_invoice_adapter", False
+        ),
+        docset_max_docs_debug=getattr(feats, "docset_max_docs_debug", 0),
+        docset_max_chunks_per_doc_debug=getattr(
+            feats, "docset_max_chunks_per_doc_debug", 0
+        ),
+        enable_docset_shadow_mode=getattr(
+            feats, "enable_docset_shadow_mode", False
+        ),
+        enable_docset_shadow_debug=getattr(
+            feats, "enable_docset_shadow_debug", False
+        ),
+        enable_docset_golden_eval=getattr(
+            feats, "enable_docset_golden_eval", False
+        ),
+        enable_docset_golden_debug=getattr(
+            feats, "enable_docset_golden_debug", False
+        ),
+        docset_golden_set_ref=getattr(feats, "docset_golden_set_ref", None),
+        enable_docset_result_shaping=getattr(
+            feats, "enable_docset_result_shaping", False
+        ),
+        docset_max_docs_returned=getattr(feats, "docset_max_docs_returned", 0),
+        docset_max_chunks_per_doc_view=getattr(
+            feats, "docset_max_chunks_per_doc_view", 0
+        ),
+        enable_docset_summary=getattr(feats, "enable_docset_summary", False),
+        enable_docset_summary_debug=getattr(
+            feats, "enable_docset_summary_debug", False
+        ),
+        enable_chat_answer_polish=getattr(feats, "enable_chat_answer_polish", False),
+        enable_chat_answer_polish_debug=getattr(
+            feats, "enable_chat_answer_polish_debug", False
+        ),
+        enable_knowledge_faithfulness_shadow=getattr(
+            feats, "enable_knowledge_faithfulness_shadow", False
+        ),
+        enable_knowledge_faithfulness_gate=getattr(
+            feats, "enable_knowledge_faithfulness_gate", False
+        ),
+        enable_knowledge_faithfulness_debug=getattr(
+            feats, "enable_knowledge_faithfulness_debug", False
+        ),
+        knowledge_indeterminate_policy=getattr(
+            feats, "knowledge_indeterminate_policy", "pass_through"
+        ),
     )
 
 
@@ -283,6 +363,28 @@ def resolve_runtime_components_legacy() -> RuntimeComponents:
             top_k_final=5,
             rag_min_score=0.25,
             chunking_strategy="unknown",
+            enable_l1_task_classification=False,
+            enable_docset_analysis=False,
+            enable_docset_analysis_debug=False,
+            enable_docset_invoice_adapter=False,
+            docset_max_docs_debug=0,
+            docset_max_chunks_per_doc_debug=0,
+            enable_docset_shadow_mode=False,
+            enable_docset_shadow_debug=False,
+            enable_docset_golden_eval=False,
+            enable_docset_golden_debug=False,
+            docset_golden_set_ref=None,
+            enable_docset_result_shaping=False,
+            docset_max_docs_returned=0,
+            docset_max_chunks_per_doc_view=0,
+            enable_docset_summary=False,
+            enable_docset_summary_debug=False,
+            enable_chat_answer_polish=False,
+            enable_chat_answer_polish_debug=False,
+            enable_knowledge_faithfulness_shadow=False,
+            enable_knowledge_faithfulness_gate=False,
+            enable_knowledge_faithfulness_debug=False,
+            knowledge_indeterminate_policy="pass_through",
         )
 
 

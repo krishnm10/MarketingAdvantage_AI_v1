@@ -4,15 +4,19 @@
 import pdfplumber
 import fitz  # PyMuPDF
 import asyncio
+import logging
 import os
-from typing import Dict, Any, List, Optional
+import re as _re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info, log_warning
 from app.services.ingestion.llm_rewriter import rewrite_batch  # ✅ Added LLM integration
 from app.config.ingestion_settings import ENABLE_LLM_NORMALIZATION  # ✅ Global flag
 
-import re as _re
+logger = logging.getLogger(__name__)
 
 # -------------------------------------------------------------------
 # CID CHARACTER RESOLUTION
@@ -88,7 +92,168 @@ def is_llm_enabled() -> bool:
 
 
 # -------------------------------------------------------------------
-# PDF EXTRACTION (PRIMARY)
+# Streaming page model (todo: pdf-parser-streaming)
+# char_offset advancement uses raw `text` length (same as _get_page_text_only_sync).
+# -------------------------------------------------------------------
+@dataclass
+class ParsedPage:
+    """One PDF page for streaming ingestion."""
+
+    page_number: int           # 0-based
+    text: str                  # raw extracted text (pre-cleaning)
+    cleaned_text: str          # after CID resolution and whitespace normalization
+    char_offset_start: int     # cumulative char offset at page start (raw-text space)
+    char_offset_end: int       # cumulative char offset at page end (raw-text space)
+    is_visual: bool            # True if image-heavy with low text density
+    is_continuation: bool      # True if page appears to start mid-sentence
+
+
+@dataclass
+class _StreamingPdfReader:
+    """Thin wrapper around an open PyMuPDF document."""
+
+    doc: Any
+    path: str
+
+    def close(self) -> None:
+        if self.doc is not None:
+            self.doc.close()
+            self.doc = None
+
+
+def _open_pdf_reader(file_path: Union[Path, str]) -> _StreamingPdfReader:
+    """Open PDF once via PyMuPDF (used by iter_pdf_pages)."""
+    path = str(file_path)
+    doc = fitz.open(path)
+    return _StreamingPdfReader(doc=doc, path=path)
+
+
+def _get_page_count(reader: _StreamingPdfReader) -> int:
+    return int(reader.doc.page_count)
+
+
+def _get_page_text_only_sync(reader: _StreamingPdfReader, page_index: int) -> str:
+    """
+    Raw text only — no cleaning, CID resolution, or heuristics.
+    Used for checkpoint offset pre-pass; must match raw `text` in ParsedPage.
+    """
+    page = reader.doc[page_index]
+    return page.get_text("text") or ""
+
+
+def _compute_initial_offset(reader: _StreamingPdfReader, start_page: int) -> int:
+    """Sum raw text lengths for pages [0, start_page) for checkpoint resume."""
+    initial_offset = 0
+    for p in range(0, start_page):
+        initial_offset += len(_get_page_text_only_sync(reader, p))
+    return initial_offset
+
+
+def _page_image_count(reader: _StreamingPdfReader, page_number: int) -> int:
+    try:
+        page = reader.doc[page_number]
+        return len(page.get_images())
+    except Exception as exc:
+        logger.debug(
+            "pdf_parser: cannot determine image count for page %d: %s",
+            page_number,
+            exc,
+        )
+        return 0
+
+
+def _is_continuation_page(cleaned_text: str) -> bool:
+    stripped = cleaned_text.strip()
+    if not stripped:
+        return False
+    first = stripped[0]
+    return first.islower()
+
+
+def _is_visual_page(cleaned_text: str, image_count: int) -> bool:
+    if len(cleaned_text.strip()) < 100 and image_count >= 1:
+        return True
+    return False
+
+
+def _parse_single_page_sync(
+    reader: _StreamingPdfReader,
+    page_number: int,
+    char_offset: int,
+) -> tuple[ParsedPage, int]:
+    """
+    CPU-bound per-page parse. Reader must already be open; never open/close here.
+    Offset advancement: len(raw text) — identical to _get_page_text_only_sync.
+    """
+    raw = _get_page_text_only_sync(reader, page_number)
+    cid_resolved = resolve_cid_characters(raw)
+    cleaned = clean_text(cid_resolved)
+    image_count = _page_image_count(reader, page_number)
+    is_visual = _is_visual_page(cleaned, image_count)
+    is_continuation = _is_continuation_page(cleaned)
+    end_offset = char_offset + len(raw)
+    page = ParsedPage(
+        page_number=page_number,
+        text=raw,
+        cleaned_text=cleaned,
+        char_offset_start=char_offset,
+        char_offset_end=end_offset,
+        is_visual=is_visual,
+        is_continuation=is_continuation,
+    )
+    return page, end_offset
+
+
+async def iter_pdf_pages(
+    file_path: Union[Path, str],
+    start_page: int = 0,
+) -> AsyncIterator[ParsedPage]:
+    """
+    Lazy async generator over PDF pages. One run_in_executor call per page.
+    """
+    reader = _open_pdf_reader(file_path)
+    try:
+        page_count = _get_page_count(reader)
+        if start_page >= page_count:
+            return
+
+        current_offset = 0
+        if start_page > 0:
+            current_offset = _compute_initial_offset(reader, start_page)
+
+        loop = asyncio.get_running_loop()
+        for page_num in range(start_page, page_count):
+            try:
+                page, current_offset = await loop.run_in_executor(
+                    None,
+                    _parse_single_page_sync,
+                    reader,
+                    page_num,
+                    current_offset,
+                )
+                yield page
+            except Exception as page_err:
+                logger.error(
+                    "pdf_parser: failed to parse page %d in %s: %s",
+                    page_num,
+                    file_path,
+                    page_err,
+                )
+                yield ParsedPage(
+                    page_number=page_num,
+                    text="",
+                    cleaned_text="",
+                    char_offset_start=current_offset,
+                    char_offset_end=current_offset,
+                    is_visual=False,
+                    is_continuation=False,
+                )
+    finally:
+        reader.close()
+
+
+# -------------------------------------------------------------------
+# PDF EXTRACTION (PRIMARY) — legacy bulk helpers (still used by parallel_extract_pdf)
 # -------------------------------------------------------------------
 def extract_with_pdfplumber(file_path: str) -> List[str]:
     """Extracts text page-by-page using pdfplumber (high accuracy for structured PDFs)."""
@@ -148,6 +313,9 @@ def build_page_map(pages: List[str]) -> List[Dict[str, Any]]:
     """
     Build deterministic page offset metadata against the merged raw_text buffer.
     Offsets are 0-based [start_char, end_char) within the merged text.
+
+    DEPRECATED for new streaming ingestion paths — use ParsedPage.char_offset_* instead.
+    Kept for parse_pdf backward compatibility. [todo: pdf-parser-streaming]
     """
     page_map: List[Dict[str, Any]] = []
     cursor = 0
@@ -191,6 +359,16 @@ async def parallel_extract_pdf(file_path: str) -> List[str]:
     raise ValueError(f"[pdf_parser_v2] No extractable text found in: {file_path}")
 
 
+async def _collect_pages_via_stream(file_path: str) -> List[str]:
+    """Aggregate non-empty header-stripped pages from iter_pdf_pages."""
+    pages_text: List[str] = []
+    async for page in iter_pdf_pages(file_path):
+        stripped = strip_page_headers_footers(page.text)
+        if stripped.strip():
+            pages_text.append(stripped)
+    return pages_text
+
+
 # -------------------------------------------------------------------
 # MAIN PARSER PIPELINE
 # -------------------------------------------------------------------
@@ -198,15 +376,20 @@ async def parse_pdf(file_path: str) -> Dict[str, Any]:
     """
     Hybrid PDF parser with async concurrency and optional LLM normalization.
     Steps:
-      1. Attempt parallel extraction (pdfplumber + PyMuPDF)
+      1. Stream pages via iter_pdf_pages (PyMuPDF per-page, run_in_executor)
       2. Merge and clean results
       3. (Optional) Normalize with LLM
       4. Return standardized ingestion output
     """
+    logger.warning(
+        "parse_pdf() is deprecated. Use iter_pdf_pages() for streaming ingestion. "
+        "Callers: migrate to iter_pdf_pages before the next major release. "
+        "[todo: pdf-parser-streaming]"
+    )
 
     log_info(f"[pdf_parser_v2] Reading PDF: {file_path}")
 
-    pages_text = await parallel_extract_pdf(file_path)
+    pages_text = await _collect_pages_via_stream(file_path)
 
     if not pages_text:
         raise ValueError(f"[pdf_parser_v2] Empty extraction result: {file_path}")
@@ -246,12 +429,6 @@ async def parse_pdf(file_path: str) -> Dict[str, Any]:
             log_warning(
                 f"[pdf_parser_v2] Visual interception failed (non-fatal): {e}"
             )
-
-    # ----------------------------------------------------------------
-    # Strip page headers / footers before merge
-    # ----------------------------------------------------------------
-    pages_text = [strip_page_headers_footers(p) for p in pages_text]
-    pages_text = [p for p in pages_text if p.strip()]
 
     is_slide_mode = _is_presentation_pdf(pages_text)
     if is_slide_mode:

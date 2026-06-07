@@ -68,6 +68,7 @@ interface PipelineConfig {
     enable_threshold_gate: boolean;
     threshold_min_score: number;
     threshold_min_results: number;
+    answer_min_score?: number;
     enable_token_budget: boolean;
     token_budget_context_fraction: number;
     prompt_template_id: string | null;
@@ -216,6 +217,7 @@ export default function RerankingPage() {
   const [enableThreshold,    setEnableThreshold]    = useState(false);
   const [thresholdScore,     setThresholdScore]     = useState(0.0);
   const [thresholdMinResults,setThresholdMinResults]= useState(1);
+  const [answerMinScore,     setAnswerMinScore]     = useState(0.25);
   const [enableTokenBudget,  setEnableTokenBudget]  = useState(true);
   const [budgetFraction,     setBudgetFraction]     = useState(0.6);
   const [searchMode,         setSearchMode]         = useState("semantic");
@@ -302,6 +304,11 @@ export default function RerankingPage() {
       setEnableThreshold(d.retrieval.enable_threshold_gate);
       setThresholdScore(d.retrieval.threshold_min_score);
       setThresholdMinResults(d.retrieval.threshold_min_results);
+      setAnswerMinScore(
+        typeof d.retrieval.answer_min_score === "number"
+          ? d.retrieval.answer_min_score
+          : 0.25
+      );
       setEnableTokenBudget(d.retrieval.enable_token_budget);
       setBudgetFraction(d.retrieval.token_budget_context_fraction);
       setSearchMode(d.retrieval.search_mode);
@@ -377,6 +384,7 @@ export default function RerankingPage() {
     setSaveStatus("idle");
     try {
       const inferred = rerankerModel ? inferRerankerType(rerankerModel) : null;
+      const clampedAnswerMinScore = Math.max(0, Math.min(1, answerMinScore));
       await apiClient.put(API.RAG_CONFIG.PUT_PIPELINE(clientId), {
         enable_hyde:           enableHyde,
         enable_multi_query:    enableMultiQuery,
@@ -384,6 +392,7 @@ export default function RerankingPage() {
         enable_threshold_gate: enableThreshold,
         threshold_min_score:   thresholdScore,
         threshold_min_results: thresholdMinResults,
+        answer_min_score:      clampedAnswerMinScore,
         enable_token_budget:   enableTokenBudget,
         token_budget_fraction: budgetFraction,
         search_mode:           searchMode,
@@ -825,6 +834,36 @@ export default function RerankingPage() {
                     </div>
                   </div>
                 )}
+              </div>
+              {/* Answer Min Score */}
+              <div className="pt-3 border-t border-slate-800/60">
+                <label className="block text-xs text-slate-400 mb-1">
+                  Minimum score to generate answer
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="number"
+                    min={0}
+                    max={1}
+                    step={0.01}
+                    value={answerMinScore}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      if (Number.isNaN(v)) {
+                        setAnswerMinScore(0);
+                      } else {
+                        setAnswerMinScore(v);
+                      }
+                    }}
+                    className="w-24 rounded border border-slate-700 bg-slate-800 px-2 py-1 text-sm text-white focus:border-primary-500 focus:outline-none"
+                  />
+                  <span className="text-[11px] text-slate-500">
+                    0.00 – 1.00
+                  </span>
+                </div>
+                <p className="mt-1 text-[11px] text-slate-500">
+                  If the best retrieved score is below this value, the system returns a refusal instead of generating an answer.
+                </p>
               </div>
             </div>
           </div>

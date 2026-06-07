@@ -559,11 +559,14 @@ export default function RetrievePage() {
           {/* Advanced settings */}
           {showSettings && (
             <div className="space-y-3 mb-4 p-4 rounded-lg bg-slate-50 border border-slate-100">
+              <p className="text-[10px] text-slate-500">
+                Session-only — changes here apply to this console only and do not alter tenant defaults in Settings → Reranking & Rules.
+              </p>
               {/* Row 1: Top K + Search Mode */}
               <div className="flex flex-wrap items-center gap-4">
                 <div className="flex items-center gap-2">
                   <label className="text-xs text-slate-500 font-medium">Top K:</label>
-                  <InfoTooltip text="Number of top matching chunks to retrieve. Higher values return more context but may include less relevant results." />
+                  <InfoTooltip text="Number of top matching chunks to retrieve. Higher values return more context but may include less relevant results. This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules." />
                   <input
                     type="number"
                     min={1}
@@ -576,7 +579,7 @@ export default function RetrievePage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <label className="text-xs text-slate-500 font-medium">Search Mode:</label>
-                  <InfoTooltip text="How to search the vector store. Semantic = meaning-based (best for questions); Hybrid = combines semantic + keyword BM25 (best overall); Keyword = exact text match only." />
+                  <InfoTooltip text="How to search the vector store. Semantic = meaning-based (best for questions); Hybrid = combines semantic + keyword BM25 (best overall); Keyword = exact text match only. This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules." />
                   <select
                     value={searchMode}
                     onChange={(e) => setSearchMode(e.target.value)}
@@ -589,7 +592,7 @@ export default function RetrievePage() {
                 </div>
                 <div className="flex items-center gap-2">
                   <label className="text-xs text-slate-500 font-medium">Min Score:</label>
-                  <InfoTooltip text="Minimum composite governance score (0.0–1.0). This is NOT raw cosine similarity — it combines semantic relevance, trust, and temporal signals. Typical useful values: 0.0 (no filter) to 0.5. Values above 0.6 will drop most results." />
+                  <InfoTooltip text="Minimum composite governance score (0.0–1.0). This is NOT raw cosine similarity — it combines semantic relevance, trust, and temporal signals. Typical useful values: 0.0 (no filter) to 0.5. Values above 0.6 will drop most results. This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules." />
                   <input
                     type="number"
                     min={0}
@@ -643,7 +646,7 @@ export default function RetrievePage() {
                   />
                   <span className="text-xs text-slate-500 font-medium">HyDE</span>
                 </label>
-                <InfoTooltip text="Hypothetical Document Embeddings — uses an LLM to generate a hypothetical answer first, then searches using that answer's embedding. Improves recall for complex questions but adds latency." />
+                <InfoTooltip text="Hypothetical Document Embeddings — uses an LLM to generate a hypothetical answer first, then searches using that answer's embedding. Improves recall for complex questions but adds latency. This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules." />
                 <span className="text-[10px] text-slate-400">
                   Generate a hypothetical answer to improve embedding quality (requires LLM)
                 </span>
@@ -663,7 +666,7 @@ export default function RetrievePage() {
                     Generate LLM Answer
                   </span>
                 </label>
-                <InfoTooltip text="After retrieval, send the top chunks as context to the LLM resolved from merged Client JSON (single_llm_provider / routing) to generate a grounded, cited answer. Requires a valid LLM API key or credential." />
+                <InfoTooltip text="After retrieval, send the top chunks as context to the LLM resolved from merged Client JSON (single_llm_provider / routing) to generate a grounded, cited answer. Requires a valid LLM API key or credential. This setting affects only the current request/session. To change tenant defaults, use Settings → Reranking & Rules." />
                 <span className="text-[10px] text-slate-400">
                   Full RAG: retrieve → ground → LLM generates a cited answer from your documents
                 </span>

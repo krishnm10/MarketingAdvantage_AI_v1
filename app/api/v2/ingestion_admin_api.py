@@ -243,7 +243,9 @@ async def retry_ingestion(
         raise HTTPException(status_code=404, detail=f"File not found: {file_id}")
     tenant_ctx = resolve_tenant_from_db_record(file_record, source="admin_retry")
     await IngestionOrchestrator().ingest_file(
-        file_id=file_id, client_id=tenant_ctx.tenant_id,
+        file_id=file_id,
+        client_id=tenant_ctx.tenant_id,
+        kind="http_async",
     )
     return {"status": "retry_started", "file_id": file_id, "tenant_id": tenant_ctx.tenant_id}
 

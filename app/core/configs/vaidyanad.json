@@ -39,7 +39,7 @@
     "enable_multi_query": true,
     "multi_query_count": 3,
     "hybrid_alpha": 0.7,
-    "prompt_template_id": "querysystem",
+    "prompt_template_id": "preset-chain-of-thought",
     "top_k_retrieval": 3,
     "top_k_final": 1
   },
@@ -105,7 +105,7 @@
   "llm": {
     "single": {
       "type": "ollama",
-      "model": "llama3.1:8b",
+      "model": "llama3.2:1b",
       "api_key_env": "GOOGLE_API_KEY",
       "base_url": "http://localhost:11434",
       "temperature": 0.3,

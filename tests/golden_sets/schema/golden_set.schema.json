@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marketingadvantage.ai/schemas/golden_set.schema.json",
+  "title": "MAI GoldenSetFile",
+  "type": "object",
+  "required": ["schema_version", "set_id", "domain", "tenant_id", "cases"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": { "type": "string", "const": "1.0" },
+    "set_id": { "type": "string", "minLength": 1 },
+    "domain": {
+      "type": "string",
+      "enum": ["invoice", "marketing", "knowledge", "general"]
+    },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "corpus_fingerprint": {
+      "type": "string",
+      "description": "Optional hash of ingested file_ids; mismatch warns relabel required."
+    },
+    "k_values": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 1 },
+      "minItems": 1
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/GoldenCase" }
+    }
+  },
+  "$defs": {
+    "GoldenCase": {
+      "type": "object",
+      "required": ["question_id", "question"],
+      "additionalProperties": false,
+      "properties": {
+        "question_id": { "type": "string", "minLength": 1 },
+        "question": { "type": "string", "minLength": 1 },
+        "relevant_chunk_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "relevant_file_ids": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "expected_answer": { "type": "string" },
+        "expected_answer_substrings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "forbidden_substrings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "route_hint": {
+          "type": "string",
+          "enum": ["structured", "knowledge", "chitchat", "meta_help", "any"]
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      }
+    }
+  }
+}

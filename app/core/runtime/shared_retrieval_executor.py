@@ -31,6 +31,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from opentelemetry import trace
+
 from app.core.vectordb.base import BaseVectorDB, VectorHit
 from app.core.embedders.base import BaseEmbedder
 from app.core.rerankers.base import BaseReranker, RerankCandidate
@@ -39,6 +41,7 @@ from app.core.runtime.runtime_context import RAGRuntimeContext
 from app.core.runtime.runtime_telemetry import emit_runtime_event
 from app.core.runtime.errors import RetrievalError
 from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
+from app.observability.metrics import record_retrieval
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +134,9 @@ class SharedRetrievalExecutor:
         retrieval_cfg = self._config.retrieval
         latency: Dict[str, float] = {}
 
+        tracer = trace.get_tracer("mai.retrieval")
+        t0 = time.perf_counter()
+
         # ── HyDE expansion ───────────────────────────────────────────────
         embed_base_text = user_query
         if hyde_expand_fn and retrieval_cfg.enable_hyde:
@@ -189,8 +195,10 @@ class SharedRetrievalExecutor:
             else:
                 candidates = [
                     RerankCandidate(
-                        id=c["id"], text=c["text"],
-                        score=c.get("score", 0.0), metadata=c.get("metadata", {}),
+                        id=c["id"],
+                        text=c["text"],
+                        vector_score=float(c.get("score", 0.0)),
+                        metadata=c.get("metadata", {}) or {},
                     )
                     for c in retrieved_chunks
                 ]
@@ -242,6 +250,13 @@ class SharedRetrievalExecutor:
             collection=collection,
             latency=latency,
         )
+
+        duration = time.perf_counter() - t0
+        search_mode_label = str(search_mode.value if hasattr(search_mode, "value") else search_mode)
+        try:
+            record_retrieval(route="rag", search_mode=search_mode_label, duration_seconds=duration)
+        except Exception:
+            pass
 
         return RetrievalResult(
             retrieved_chunks=retrieved_chunks,

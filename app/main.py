@@ -64,6 +64,13 @@ try:
 except ImportError:
     _slowapi_available = False
 
+from opentelemetry import trace
+from prometheus_client import make_asgi_app
+
+from app.observability.metrics import observe_http_request
+from app.observability.tracing import init_tracing
+from app.db.session_v2 import init_db_tracing, async_engine
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging — replace all print() with structured logger
 # ─────────────────────────────────────────────────────────────────────────────
@@ -256,6 +263,13 @@ async def lifespan(app: FastAPI):
         active_vectordb = get_client_config(_startup_cid).vectordb.type.value.lower()
     except Exception:
         active_vectordb = "chroma"
+
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 0.5: Initialize tracing + DB query spans (observability only)
+    # ─────────────────────────────────────────────────────────────────
+    init_tracing(service_name="marketing_advantage_ai")
+    init_db_tracing(async_engine)
+
     pipeline_factory.invalidate_all()
     logger.info("[Startup] Cleared cached pipelines before initialization.")
 
@@ -593,6 +607,79 @@ app.add_middleware(RequestIDMiddleware)
 
 
 # =============================================================================
+# HTTP TRACING + METRICS MIDDLEWARE
+# =============================================================================
+
+@app.middleware("http")
+async def _http_tracing_middleware(request: Request, call_next):
+    """
+    Per-request tracing and Prometheus metrics.
+
+    Relies on RequestIDMiddleware having already populated request.state.request_id.
+    """
+    tracer = trace.get_tracer("mai.http")
+    route_obj = request.scope.get("route")
+    route_template = getattr(route_obj, "path", request.url.path)
+    method = request.method
+
+    # Prefer inbound header, fall back to state for request id.
+    request_id_header = request.headers.get("X-Request-ID")
+    if request_id_header:
+        try:
+            setattr(
+                request.state,
+                "_observability_tracing_saw_request_id",
+                True,
+            )
+        except Exception:
+            pass
+
+    start = asyncio.get_event_loop().time()
+    status_code = 500
+
+    with tracer.start_as_current_span("http.request") as span:
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception as exc:  # business exceptions still propagate
+            try:
+                span.record_exception(exc)
+            except Exception:
+                pass
+            raise
+        finally:
+            duration = asyncio.get_event_loop().time() - start
+            try:
+                span.set_attribute("http.method", method)
+                span.set_attribute("http.route", route_template)
+                span.set_attribute("http.status_code", status_code)
+                # Prefer inbound header, fall back to request.state.request_id.
+                request_id = request.headers.get("X-Request-ID") or getattr(
+                    request.state, "request_id", None
+                )
+                if request_id:
+                    span.set_attribute("mai.request_id", request_id)
+                    try:
+                        setattr(
+                            request.state,
+                            "_observability_tracing_saw_request_id",
+                            True,
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                # Tracing must never break request handling.
+                pass
+            observe_http_request(
+                route=route_template,
+                method=method,
+                status_code=status_code,
+                duration_seconds=duration,
+            )
+
+
+# =============================================================================
 # CORS (env-driven for production safety)
 #
 # SECURITY FIX: The CORS spec forbids allow_origins=["*"] together with
@@ -638,6 +725,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# =============================================================================
+# PROMETHEUS METRICS ENDPOINT
+# =============================================================================
+
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
 
 # =============================================================================
@@ -1221,12 +1316,17 @@ async def ingestion_worker_stats():
     """
     try:
         from app.services.ingestion.ingestion_worker import get_ingestion_queue, get_ingestion_worker
+        from app.services.ingestion.ingestion_dlq_service import (
+            count_dlq_entries,
+            fetch_recent_dlq_entries,
+        )
         queue = get_ingestion_queue()
         worker = get_ingestion_worker()
+        dlq_total = await count_dlq_entries()
         return {
             "status": "running" if worker._running else "stopped",
-            "queue": queue.stats,
-            "dead_letter": queue.dead_letter_items(),
+            "queue": {**queue.stats, "dlq_total": dlq_total},
+            "dead_letter": await fetch_recent_dlq_entries(limit=50),
         }
     except Exception as e:
         return {"status": "error", "detail": str(e)[:200]}

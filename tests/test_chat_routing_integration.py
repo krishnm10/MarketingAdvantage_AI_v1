@@ -5,6 +5,7 @@ HTTP-level integration tests for L0 query routing on POST /api/v2/retrieve/chat.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,9 +14,10 @@ from httpx import ASGITransport, AsyncClient, Response
 import app.services.query_routing.orchestrator as orch_mod
 from app.auth.deps import get_current_user
 from app.db.session_v2 import get_db
+from app.api.v2.retrieve_chat_api import ChatRetrieveResponse
 from app.main import app
 from app.retrieval.components import RuntimeComponents
-from app.services.query_routing.types import QueryRoute
+from app.services.query_routing.types import QueryRoute, knowledge_decision
 
 
 @pytest.fixture
@@ -209,6 +211,127 @@ async def test_structured_query_is_not_short_circuited(minimal_runtime):
         assert debug.get("retrieval_skipped") is not True, (
             "STRUCTURED query was incorrectly short-circuited as chitchat/clarification"
         )
+
+
+@pytest.mark.anyio
+async def test_l1_task_plan_absent_when_flag_off(minimal_runtime):
+    """
+    Phase 1 non-regression: with enable_l1_task_classification off, debug_info must
+    not include task_plan; response schema and L0 route behavior stay unchanged.
+    """
+    assert minimal_runtime.enable_l1_task_classification is False
+
+    mock_route = knowledge_decision(top_k=5)
+    mock_orch = MagicMock()
+    mock_orch.route = AsyncMock(return_value=mock_route)
+    mock_llm, model_name = _mock_llm_tuple()
+    mock_trace = MagicMock()
+
+    with (
+        _tenant_patches(minimal_runtime),
+        patch("app.api.v2.retrieve_chat_api.get_orchestrator", return_value=mock_orch),
+        patch(
+            "app.api.v2.retrieve_chat_api.maybe_start_rag_chat_trace",
+            return_value=mock_trace,
+        ),
+        patch(
+            "app.api.v2.retrieve_chat_api._embed_in_thread",
+            new_callable=AsyncMock,
+            return_value=[0.1] * 384,
+        ),
+        patch(
+            "app.api.v2.retrieve_chat_api._resolve_llm",
+            return_value=(mock_llm, model_name),
+        ),
+        patch(
+            "app.services.ingestion.ingestion_service_v2.get_query_pipeline_for_client",
+            return_value=MagicMock(vectordb=MagicMock()),
+        ),
+        patch(
+            "app.retrieval.runtime.RetrievalRuntime.retrieve",
+            new_callable=AsyncMock,
+            return_value=([], []),
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await _post_chat(
+                client,
+                "show me invoices with late payment penalties",
+            )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    ChatRetrieveResponse.model_validate(body)
+
+    debug = body.get("debug_info") or {}
+    assert "task_plan" not in debug
+    assert debug.get("query_route") == QueryRoute.KNOWLEDGE.value
+    assert debug.get("retrieval_skipped") is False
+
+    classified_stages = [
+        call.args[1]
+        for call in mock_trace.add_event.call_args_list
+        if len(call.args) >= 2
+    ]
+    assert "task.classified" not in classified_stages
+
+
+@pytest.mark.anyio
+async def test_l1_task_plan_present_when_flag_on_knowledge(minimal_runtime):
+    """Phase 1: task_plan debug payload only when L1 flag is on and route is KNOWLEDGE."""
+    runtime_l1 = replace(minimal_runtime, enable_l1_task_classification=True)
+    assert runtime_l1.enable_l1_task_classification is True
+
+    mock_route = knowledge_decision(top_k=5)
+    mock_orch = MagicMock()
+    mock_orch.route = AsyncMock(return_value=mock_route)
+    mock_llm, model_name = _mock_llm_tuple()
+
+    with (
+        _tenant_patches(runtime_l1),
+        patch("app.api.v2.retrieve_chat_api.get_orchestrator", return_value=mock_orch),
+        patch(
+            "app.api.v2.retrieve_chat_api._embed_in_thread",
+            new_callable=AsyncMock,
+            return_value=[0.1] * 384,
+        ),
+        patch(
+            "app.api.v2.retrieve_chat_api._resolve_llm",
+            return_value=(mock_llm, model_name),
+        ),
+        patch(
+            "app.services.ingestion.ingestion_service_v2.get_query_pipeline_for_client",
+            return_value=MagicMock(vectordb=MagicMock()),
+        ),
+        patch(
+            "app.retrieval.runtime.RetrievalRuntime.retrieve",
+            new_callable=AsyncMock,
+            return_value=([], []),
+        ),
+    ):
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+        ) as client:
+            resp = await _post_chat(
+                client,
+                "show me invoices with late payment penalties",
+            )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    ChatRetrieveResponse.model_validate(body)
+
+    debug = body.get("debug_info") or {}
+    assert debug.get("query_route") == QueryRoute.KNOWLEDGE.value
+    task_plan = debug.get("task_plan")
+    assert isinstance(task_plan, dict)
+    assert task_plan.get("route") == QueryRoute.KNOWLEDGE.value
+    assert task_plan.get("task_type") == "docset_filter"
+    assert task_plan.get("domain") == "invoice"
 
 
 @pytest.mark.anyio

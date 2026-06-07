@@ -29,10 +29,17 @@ import json as _json_module
 import logging
 from typing import Any, Dict, FrozenSet, List, Optional
 
+from opentelemetry import trace
+
 from app.core.config.client_config_schema import ClientConfig
 from app.core.config.client_config_resolver import get_config_fingerprint
 from app.utils.pipeline_logger import PipelineLogger
 from app.services.security.ingestion_security import sanitize_ingestion_chunks
+from app.observability.metrics import (
+    observe_ingestion_duration,
+    record_ingestion_completed,
+    record_ingestion_started,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +158,30 @@ class IngestionOrchestrator:
         3. PII redaction before data leaves the service boundary.
     """
 
+    _tenant_ingest_semaphores: Dict[str, tuple[int, asyncio.Semaphore]] = {}
+    _tenant_semaphore_lock: Optional[asyncio.Lock] = None
+
+    @classmethod
+    def _semaphore_lock(cls) -> asyncio.Lock:
+        if cls._tenant_semaphore_lock is None:
+            cls._tenant_semaphore_lock = asyncio.Lock()
+        return cls._tenant_semaphore_lock
+
+    @classmethod
+    async def _get_tenant_ingest_semaphore(
+        cls,
+        client_id: str,
+        max_parallel: int,
+    ) -> asyncio.Semaphore:
+        """Shared per-tenant ingest concurrency (initialized once per limit)."""
+        limit = max(1, int(max_parallel))
+        async with cls._semaphore_lock():
+            entry = cls._tenant_ingest_semaphores.get(client_id)
+            if entry is None or entry[0] != limit:
+                entry = (limit, asyncio.Semaphore(limit))
+                cls._tenant_ingest_semaphores[client_id] = entry
+            return entry[1]
+
     # ------------------------------------------------------------------
     # Embedding policy — fail fast before any data is processed
     # ------------------------------------------------------------------
@@ -249,6 +280,7 @@ class IngestionOrchestrator:
         client_id: str = "default",
         *,
         file_path: Optional[str] = None,
+        kind: Optional[str] = None,
     ) -> None:
         """
         Ingest a file through the full pipeline with PII sanitization.
@@ -267,26 +299,46 @@ class IngestionOrchestrator:
         )
         plog.info("Orchestrator: file ingestion started", file_id=file_id)
 
-        config = _resolve_config(client_id)
-        _log_resolved_config(config, plog=plog)
+        tracer = trace.get_tracer("mai.ingestion.orchestrator")
+        effective_kind = kind or "unknown"
+        record_ingestion_started(effective_kind)
 
-        self._enforce_embedding_policy(config, plog=plog)
+        t0 = asyncio.get_event_loop().time()
 
-        hook = self._make_pii_hook(
-            config,
-            file_id=file_id,
-            client_id=client_id,
-            plog=plog,
-        )
+        with tracer.start_as_current_span("ingestion.orchestrator.ingest_file") as span:
+            span.set_attribute("mai.kind", effective_kind)
+            try:
+                config = _resolve_config(client_id)
+                _log_resolved_config(config, plog=plog)
 
-        await IngestionServiceV2.process_file(
-            file_id=file_id,
-            file_path=file_path,
-            business_id=client_id,
-            pre_embed_hook=hook,
-        )
+                self._enforce_embedding_policy(config, plog=plog)
 
-        plog.info("Orchestrator: file ingestion completed", file_id=file_id)
+                max_parallel = config.features.max_concurrent_ingestions
+                ingest_sem = await self._get_tenant_ingest_semaphore(client_id, max_parallel)
+
+                async with ingest_sem:
+                    hook = self._make_pii_hook(
+                        config,
+                        file_id=file_id,
+                        client_id=client_id,
+                        plog=plog,
+                    )
+
+                    await IngestionServiceV2.process_file(
+                        file_id=file_id,
+                        file_path=file_path,
+                        business_id=client_id,
+                        pre_embed_hook=hook,
+                    )
+
+                plog.info("Orchestrator: file ingestion completed", file_id=file_id)
+                record_ingestion_completed(effective_kind)
+            except Exception as exc:
+                span.record_exception(exc)
+                raise
+            finally:
+                duration = asyncio.get_event_loop().time() - t0
+                observe_ingestion_duration(effective_kind, duration)
 
     # ------------------------------------------------------------------
     # Pre-parsed ingestion (RSS, API connector, Kafka)

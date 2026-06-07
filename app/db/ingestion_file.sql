@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS public.ingested_file
     ingestion_notes character varying(255) COLLATE pg_catalog."default",
     error_message character varying(255) COLLATE pg_catalog."default",
     media_hash character varying(64) COLLATE pg_catalog."default",
+    last_processed_chunk_index integer NOT NULL DEFAULT 0,
+    last_processed_page integer NOT NULL DEFAULT 0,
+    last_processed_at timestamp with time zone,
     CONSTRAINT ingested_file_pkey PRIMARY KEY (id),
     CONSTRAINT uq_ingested_file_media_hash UNIQUE (media_hash),
     CONSTRAINT ingested_file_status_check CHECK (status = ANY (ARRAY['uploaded'::text, 'pending'::text, 'processing'::text, 'processed'::text, 'failed'::text]))

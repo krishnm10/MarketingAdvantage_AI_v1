@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "set_id": "mini_smoke_fixture",
+  "domain": "general",
+  "tenant_id": "default",
+  "description": "Synthetic IDs for offline metric unit tests (no live server).",
+  "k_values": [1, 3],
+  "cases": [
+    {
+      "question_id": "q1",
+      "question": "What is the refund policy?",
+      "relevant_chunk_ids": ["chunk-a", "chunk-b"],
+      "expected_answer": "Refunds within 30 days.",
+      "expected_answer_substrings": ["30 days"],
+      "route_hint": "knowledge",
+      "metadata": {}
+    }
+  ]
+}

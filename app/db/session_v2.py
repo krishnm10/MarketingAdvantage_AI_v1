@@ -2,12 +2,15 @@
 
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy import text
+
 from app.utils.logger import log_info, log_warning
+from opentelemetry import trace
 
 # -----------------------------------------------------------
 # DATABASE CONFIGURATION
@@ -125,3 +128,79 @@ async def get_async_session():
         "No async session factory found. "
         "Please expose AsyncSessionLocal or get_session()."
     )
+
+
+# -----------------------------------------------------------
+# DB TRACING (SQLAlchemy) — manual OTel spans
+# -----------------------------------------------------------
+
+_DB_TRACING_INITIALIZED: bool = False
+
+
+def init_db_tracing(engine=None) -> None:
+    """
+    Attach lightweight SQLAlchemy event listeners for DB query spans.
+
+    Safe to call multiple times; registration is idempotent.
+    """
+    global _DB_TRACING_INITIALIZED
+    if _DB_TRACING_INITIALIZED:
+        return
+
+    from sqlalchemy.engine import Engine
+
+    eng: Engine
+    if engine is None:
+        # Use module-level async_engine by default
+        eng = async_engine.sync_engine
+    else:
+        try:
+            eng = engine.sync_engine  # type: ignore[attr-defined]
+        except AttributeError:
+            # Fallback: assume a synchronous Engine was provided
+            eng = engine  # type: ignore[assignment]
+
+    tracer = trace.get_tracer("mai.db")
+
+    @event.listens_for(eng, "before_cursor_execute")
+    def _before_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        try:
+            # Very small parsing: first word of the statement only.
+            op = (statement or "").strip().split(None, 1)[0].upper() if statement else ""
+            span = tracer.start_span("db.query")
+            span.set_attribute("db.system", "postgresql")
+            if op:
+                span.set_attribute("db.operation", op)
+            conn.info.setdefault("otel_db_span_stack", []).append(span)
+        except Exception:
+            # Tracing must never break DB operations.
+            pass
+
+    @event.listens_for(eng, "after_cursor_execute")
+    def _after_cursor_execute(conn, cursor, statement, parameters, context, executemany):
+        stack = conn.info.get("otel_db_span_stack")
+        if not stack:
+            return
+        try:
+            span = stack.pop()
+            span.end()
+        except Exception:
+            pass
+
+    @event.listens_for(eng, "handle_error")
+    def _handle_error(exception_context):
+        conn = exception_context.connection
+        stack = getattr(conn, "info", {}).get("otel_db_span_stack")  # type: ignore[attr-defined]
+        if not stack:
+            return
+        try:
+            span = stack.pop()
+            exc = exception_context.original_exception
+            if exc is not None:
+                span.record_exception(exc)
+            span.end()
+        except Exception:
+            pass
+
+    _DB_TRACING_INITIALIZED = True
+    log_info("[session_v2] DB tracing initialized for SQLAlchemy engine.")

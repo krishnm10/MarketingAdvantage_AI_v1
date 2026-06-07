@@ -16,6 +16,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
+from opentelemetry import trace as otel_trace
 
 from app.observability.rag_chat_trace import (
     chunk_text_digest,
@@ -37,7 +39,7 @@ from app.observability.rag_chat_trace import (
     text_digest_utf8,
     vector_l2_norm,
 )
-from app.db.session_v2 import get_db
+from app.db.session_v2 import get_db, get_async_session
 from app.auth.guards import require_role
 from app.services.ingestion.ingestion_service_v2 import get_embedder
 from app.services.query_routing import build_direct_response, get_orchestrator
@@ -45,6 +47,33 @@ from app.services.query_routing.types import QueryRoute, RouteDecision
 from app.retrieval.types_retrieve import RankedResult
 from app.core.prompts.library_loader import strip_and_verify
 from app.services.faithfulness_verifier import verify_or_refuse
+from app.observability.metrics import (
+    record_retrieval,
+    record_trust_gate,
+    record_docset_summary_generated,
+    record_docset_summary_failure,
+    record_chat_answer_polish_scaffold,
+    record_chat_answer_polish_scaffold_failure,
+    record_knowledge_verifier,
+    record_knowledge_verifier_error,
+)
+from app.retrieval.answer_integrity import build_answer_integrity_snapshot
+from app.retrieval.verification_evidence import build_verification_evidence_bundle
+from app.services.knowledge_faithfulness_verifier import (
+    KNOWLEDGE_VERIFIER_VERSION,
+    trust_gate_outcome,
+    verify_knowledge_answer,
+)
+from app.retrieval.document_set_analysis import run_docset_analysis_structured
+from app.retrieval.shadow_analysis import run_shadow_docset_analysis
+from app.retrieval.golden_evaluation import evaluate_docset_golden
+from app.retrieval.task_classifier import TaskPlan, classify_task
+from app.retrieval.docset_result_shaper import shape_docset_results
+from app.retrieval.deterministic_summary import (
+    SUMMARY_FORMAT_VERSION,
+    build_docset_summary,
+    build_docset_summary_metadata,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +91,29 @@ _QUERY_REWRITE_MAX_TOKENS = 200
 _GROUNDING_REFUSAL_PHRASE = (
     "I could not find a reliable answer in the available documents."
 )
+
+# ── Answer mutation contract (Phase 5B prerequisite; enforcement via tests/observability)
+#
+# Mutators in this module (pre-verification unless noted):
+#   - _strip_contradictory_refusal: removes contradictory refusal lines only
+#   - _dedupe_identifier_lines: collapses duplicate structured-ID list lines
+#   - _maybe_focus_fallback_answer: may REPLACE entire answer (documented exception)
+#   - _build_focus_fallback_answer: builds excerpt fallback from context_str
+#   - Grounding refusal shortcut: sets canonical refusal phrase (no LLM)
+#   - verify_or_refuse: may replace answer on STRUCTURED-route FAIL only
+#
+# Rules:
+#   1. All semantic mutations must occur before verify_or_refuse OR be re-verified.
+#   2. Post-verification semantic mutation is forbidden unless verify_or_refuse reruns.
+#   3. Pre-verification mutators must preserve [Source n] citations and value-critical
+#      tokens unless explicitly documented (_maybe_focus_fallback_answer exception).
+#   4. Runtime does NOT block on citation/value integrity (validators are observability
+#      and test infrastructure until Phase 5B policy is defined).
+#
+# NOT GUARANTEED today:
+#   - Faithfulness verification for KNOWLEDGE routes (verify_or_refuse SKIPPED).
+#   - Post-verification immutability (convention only; no runtime guard).
+ANSWER_MUTATION_CONTRACT_VERSION = "v1"
 
 
 def _chat_rag_compliance_block() -> str:
@@ -94,34 +146,6 @@ def _chat_rag_compliance_block() -> str:
         "or scenarios that are NOT literally supported by the passages. "
         "If the passages do not name it, omit it entirely.\n\n"
     )
-
-
-# #region agent log
-def _agent_debug_ndjson(
-    *,
-    hypothesis_id: str,
-    location: str,
-    message: str,
-    data: Optional[Dict[str, Any]] = None,
-    run_id: str = "retrieve_chat",
-) -> None:
-    try:
-        payload: Dict[str, Any] = {
-            "sessionId": "e855ab",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        with open("debug-e855ab.log", "a", encoding="utf-8") as _f:
-            _f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-
-
-# #endregion
 
 
 def _chat_llm_transport_exc(exc: BaseException) -> bool:
@@ -358,6 +382,45 @@ def _filter_to_dominant_file(
     return filtered[:max_chunks]
 
 
+def _filter_to_multi_identifier_chunks(
+    chunks: List[RankedResult],
+    target_ids: List[str],
+    max_chunks: int = 2,
+) -> List[RankedResult]:
+    """
+    STRUCTURED multi-ID: pick the best-scoring chunk per requested identifier.
+    Ensures each invoice ID in the user query can surface in LLM context.
+    """
+    if not chunks or not target_ids:
+        return chunks[:max_chunks]
+
+    picked: List[RankedResult] = []
+    used_chunk_ids: set[str] = set()
+
+    for target_id in target_ids:
+        if len(picked) >= max_chunks:
+            break
+        candidates = [
+            c
+            for c in chunks
+            if c.chunk_id not in used_chunk_ids and _chunk_mentions_focus(c, target_id)
+        ]
+        if not candidates:
+            continue
+        best = max(candidates, key=lambda c: float(c.score))
+        picked.append(best)
+        used_chunk_ids.add(best.chunk_id)
+
+    if not picked:
+        logger.warning(
+            "[ChatRetrieve] Multi-ID filter found no matching chunks; falling back to top-%d",
+            max_chunks,
+        )
+        return chunks[:max_chunks]
+
+    return picked
+
+
 def _detect_amount_conflicts(chunks: List[RankedResult]) -> bool:
     """True when two+ chunks contain disjoint dollar amount sets (STRUCTURED pre-LLM)."""
     amount_sets: List[set] = []
@@ -521,6 +584,94 @@ class _ChatSessionCtx:
     chat_history: List[ChatMessage]
 
 
+def _resolve_search_params(
+    req: ChatRetrieveRequest,
+    rc: Any,
+    runtime_mode_chat: str,
+) -> Tuple[str, int]:
+    """
+    Resolve effective search_mode and top_k for chat retrieval.
+
+    Rules:
+      - Explicit request values always win.
+      - When fields are absent, fall back to tenant retrieval config
+        (ClientConfig.retrieval) via RuntimeComponents.
+    """
+    fields_set = getattr(req, "__fields_set__", set())
+
+    if "search_mode" in fields_set:
+        search_mode = (req.search_mode or "semantic").lower()
+    else:
+        if runtime_mode_chat == "authoritative_config" and getattr(rc, "search_mode", None):
+            search_mode = (rc.search_mode or "semantic").lower()
+        else:
+            search_mode = (req.search_mode or "semantic").lower()
+
+    if "top_k" in fields_set and req.top_k is not None:
+        effective_top_k = req.top_k
+    else:
+        effective_top_k = getattr(rc, "top_k_final", req.top_k or 5)
+
+    return search_mode, effective_top_k
+
+
+def _is_multi_query_enabled(
+    *,
+    route: "QueryRoute",
+    retrieval_cfg: Any,
+    has_tenant_pipeline: bool,
+) -> bool:
+    """
+    Decide whether multi-query retrieval should be activated.
+
+    Rules:
+      - Requires an authoritative tenant retrieval config.
+      - Requires a tenant-scoped query pipeline / VectorDB.
+      - Only enabled for KNOWLEDGE routes.
+      - Respects enable_multi_query and multi_query_count >= 2.
+    """
+    if not has_tenant_pipeline:
+        return False
+    if route != QueryRoute.KNOWLEDGE:
+        return False
+    if retrieval_cfg is None:
+        return False
+    if not getattr(retrieval_cfg, "enable_multi_query", False):
+        return False
+    try:
+        count = int(getattr(retrieval_cfg, "multi_query_count", 0))
+    except (TypeError, ValueError):
+        return False
+    return count >= 2
+
+
+def _chat_runtime_max_results(
+    search_mode: str,
+    recall_limit: int,
+    effective_top_k: int,
+) -> int:
+    """Wider recall for hybrid/keyword; semantic keeps final top_k."""
+    if search_mode in ("hybrid", "keyword"):
+        return max(1, int(recall_limit))
+    return max(1, int(effective_top_k))
+
+
+def _rebuild_ranked_from_fused_chunks(
+    fused_chunks: List[Dict[str, Any]],
+    chunk_index: Dict[str, RankedResult],
+) -> List[RankedResult]:
+    """Restore RankedResult rows by canonical chunk_id after multi-query RRF."""
+    fused_ranked: List[RankedResult] = []
+    for fused_chunk in fused_chunks:
+        cid = fused_chunk.get("id") or fused_chunk.get("chunk_id")
+        if not cid:
+            continue
+        base = chunk_index.get(cid)
+        if base is not None:
+            fused_ranked.append(base)
+    return fused_ranked
+
+
 def _build_direct_chat_response(
     *,
     req: ChatRetrieveRequest,
@@ -541,6 +692,11 @@ def _build_direct_chat_response(
         focus_id=None,
         route=route_decision.route.value,
     )
+    try:
+        outcome = getattr(_direct_verification.status, "value", str(_direct_verification.status))
+        record_trust_gate("chat", outcome)
+    except Exception:
+        logger.debug("[Observability] trust gate (direct) metric failed", exc_info=True)
     debug_info: Dict[str, Any] = {
         "client_id": retrieve_cid,
         "embedder": rc.embedder_type,
@@ -782,8 +938,10 @@ async def chat_retrieve(
             raise HTTPException(400, "Query rejected: potential prompt injection detected.")
 
         raw_query = scan_result.redacted_text
-        search_mode = req.search_mode.lower()
-        effective_top_k = req.top_k if req.top_k is not None else rc.top_k_final
+
+        # Resolve effective search parameters (tenant config is authoritative when
+        # request fields are absent; explicit request values always win).
+        search_mode, effective_top_k = _resolve_search_params(req, rc, runtime_mode_chat)
 
         # ── L0 Query Router (before embed / retrieve / LLM) ─────────────────────
         session_ctx = _ChatSessionCtx(chat_history=req.messages)
@@ -821,6 +979,7 @@ async def chat_retrieve(
             )
 
         matched_pattern = _route_decision.matched_pattern
+        task_plan: Optional[TaskPlan] = None
         if _route_decision.route == QueryRoute.STRUCTURED:
             effective_max_context_chunks = 2
 
@@ -832,6 +991,33 @@ async def chat_retrieve(
             _rewrite_enabled = _route_decision.rewrite_allowed
         _hyde_enabled = _route_decision.hyde_allowed
         _rerank_enabled = _route_decision.rerank_allowed
+
+        # ── L1 Task classification (internal, Phase 1: debug-only) ───────────────
+        # rc is the canonical runtime source for enable_l1_task_classification.
+        enable_l1 = bool(rc.enable_l1_task_classification)
+
+        if (
+            enable_l1
+            and _route_decision.route == QueryRoute.KNOWLEDGE
+            and _route_decision.retrieval_allowed
+        ):
+            try:
+                task_plan = classify_task(
+                    raw_query=raw_query,
+                    route_decision=_route_decision,
+                    client_id=retrieve_cid,
+                    rewritten_query=None,
+                )
+            except Exception:
+                task_plan = None
+
+            if trace and task_plan is not None:
+                trace.add_event(
+                    "L0",
+                    "task.classified",
+                    _trace_lap(),
+                    task_plan.to_debug_dict(),
+                )
 
         cfg_llm = (rc.llm_provider or "openai").lower()
         if cfg_llm == "google":
@@ -863,9 +1049,14 @@ async def chat_retrieve(
             else:
                 rewritten_query = rw_scan.redacted_text
     
+        query_structured_ids = _all_structured_ids_upper(raw_query)
+        multi_id_query = len(query_structured_ids) > 1
+
         embed_text = rewritten_query or raw_query
         if _route_decision.route == QueryRoute.STRUCTURED:
-            if matched_pattern:
+            if multi_id_query:
+                embed_text = " ".join(query_structured_ids)
+            elif matched_pattern:
                 embed_text = matched_pattern
             else:
                 logger.warning(
@@ -879,9 +1070,18 @@ async def chat_retrieve(
         if (
             not strict_detail_grounding_keys
             and _route_decision.route == QueryRoute.STRUCTURED
-            and matched_pattern
         ):
-            strict_detail_grounding_keys = [matched_pattern]
+            if multi_id_query:
+                strict_detail_grounding_keys = list(query_structured_ids)
+            elif matched_pattern:
+                strict_detail_grounding_keys = [matched_pattern]
+
+        if _route_decision.route == QueryRoute.STRUCTURED and multi_id_query:
+            effective_max_context_chunks = min(
+                max(effective_max_context_chunks, len(query_structured_ids)),
+                4,
+            )
+
         hyde_skipped_for_identifier = False
     
         # ── Optional HyDE ────────────────────────────────────────────────────────
@@ -950,38 +1150,279 @@ async def chat_retrieve(
             )
     
         # ── Retrieve ─────────────────────────────────────────────────────────────
+        retrieve_start = time.perf_counter()
+
+        # When hybrid / keyword modes are active, use the recall window from the
+        # router as the runtime max_results_override so BM25/RRF operates over a
+        # broader candidate set. For pure semantic mode, keep effective_top_k.
+        _runtime_max_results = _chat_runtime_max_results(
+            search_mode, _recall_limit, effective_top_k
+        )
+
+        # Instantiate tenant-scoped retrieval pipeline components when config
+        # resolution succeeded; otherwise fall back to legacy repository wiring.
+        _pipe_c = None
         if runtime_mode_chat == "authoritative_config" and _cfg_chat is not None:
             from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
-    
+
             _pipe_c = get_query_pipeline_for_client(retrieve_cid)
-            repository = RetrievalRepository(
-                db_session=db,
-                vectordb=_pipe_c.vectordb,
-                collection=rc.collection,
-            )
-        else:
-            repository = RetrievalRepository(db_session=db)
-        runtime = RetrievalRuntime(repository=repository, policy_registry=DEFAULT_POLICY_REGISTRY)
-    
+
         ctx = QueryContext(
             query=raw_query,
             intent=intent_enum,
             requested_at=int(time.time()),
         )
-    
-        try:
-            ranked_results, dropped = await runtime.retrieve(
-                ctx=ctx,
-                query_embedding=query_embedding,
-                max_results_override=req.top_k,
-                tenant_id=retrieve_cid,           # Tenant slug for logging
-                storage_uuid=_storage_uuid_str,   # Storage UUID for filtering
-                recall_limit_override=_recall_limit,
+
+        async def _run_single_retrieve(
+            *,
+            query_embedding_vec: List[float],
+            db_session: AsyncSession,
+        ) -> Tuple[List[RankedResult], List[Any]]:
+            """
+            Thin adapter around RetrievalRuntime.retrieve that:
+            - Uses the tenant-scoped VectorDB pipeline when available.
+            - Applies the router's recall window for hybrid/keyword modes.
+            - Leaves DB session lifecycle to the caller.
+            """
+            if _pipe_c is not None:
+                repository_local = RetrievalRepository(
+                    db_session=db_session,
+                    vectordb=_pipe_c.vectordb,
+                    collection=rc.collection,
+                )
+            else:
+                repository_local = RetrievalRepository(db_session=db_session)
+
+            runtime_local = RetrievalRuntime(
+                repository=repository_local,
+                policy_registry=DEFAULT_POLICY_REGISTRY,
             )
-        except Exception as e:
-            raise HTTPException(500, f"Retrieval failed: {e}")
-        finally:
-            repository.close()
+
+            try:
+                ranked_local, dropped_local = await runtime_local.retrieve(
+                    ctx=ctx,
+                    query_embedding=query_embedding_vec,
+                    max_results_override=_runtime_max_results,
+                    tenant_id=retrieve_cid,
+                    storage_uuid=_storage_uuid_str,
+                    recall_limit_override=_recall_limit,
+                )
+            except Exception as e:
+                raise HTTPException(500, f"Retrieval failed: {e}")
+            finally:
+                # For legacy env-backed VectorDBs, close connectors explicitly. For
+                # tenant-scoped pipelines, VectorDB lifetime is managed by the
+                # pipeline layer; avoid double-closing shared instances.
+                if _pipe_c is None:
+                    try:
+                        repository_local.close()
+                    except Exception:
+                        logger.debug(
+                            "[ChatRetrieve] repository.close() failed (legacy path)", exc_info=True
+                        )
+
+            return ranked_local, dropped_local
+
+        # Multi-query gating: only enabled for KNOWLEDGE routes when tenant
+        # retrieval config explicitly opts in.
+        _retrieval_cfg = getattr(_cfg_chat, "retrieval", None) if _cfg_chat is not None else None
+        _multi_query_enabled = _is_multi_query_enabled(
+            route=_route_decision.route,
+            retrieval_cfg=_retrieval_cfg,
+            has_tenant_pipeline=_pipe_c is not None,
+        )
+
+        ranked_results: List[RankedResult] = []
+        dropped: List[Any] = []
+        _bm25_already_applied = False
+
+        if _multi_query_enabled and _pipe_c is not None:
+            # ── Multi-query expansion + concurrent retrieval ─────────────────────
+            from app.core.multi_query_expander import (
+                generate_query_variants,
+                fuse_multi_query_results,
+            )
+
+            tracer = otel_trace.get_tracer("mai.chat")
+
+            try:
+                with tracer.start_as_current_span("retrieve.expand_queries"):
+                    t0_mq = time.perf_counter()
+                    variants = generate_query_variants(
+                        llm,
+                        embed_text,
+                        count=_retrieval_cfg.multi_query_count,
+                    )
+                    mq_latency_ms = round((time.perf_counter() - t0_mq) * 1000, 2)
+                    logger.info(
+                        '[ChatRetrieve] Multi-query expansion requested=%d generated=%d latency_ms=%.2f',
+                        _retrieval_cfg.multi_query_count,
+                        len(variants),
+                        mq_latency_ms,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[ChatRetrieve] Multi-query expansion failed, falling back to "
+                    "single-query retrieval: %s",
+                    exc,
+                )
+                variants = [embed_text]
+
+            # If expansion failed or produced no useful alternates, fall back to
+            # the original single-query path.
+            if len(variants) <= 1:
+                _multi_query_enabled = False
+            else:
+                # Fan-out retrieval across variants using independent DB sessions.
+                async def _retrieve_variant(variant_text: str) -> Tuple[str, List[RankedResult], List[Any]]:
+                    # Reuse base embedding when the variant equals the embed_text; otherwise
+                    # embed the variant separately.
+                    if variant_text.strip() == embed_text.strip():
+                        embedding_vec = query_embedding
+                    else:
+                        try:
+                            embedding_vec = await _embed_in_thread(variant_text, retrieve_cid)
+                        except Exception as exc:
+                            logger.warning(
+                                "[ChatRetrieve] Embedding failed for variant '%s': %s",
+                                variant_text,
+                                exc,
+                            )
+                            raise
+
+                    async with get_async_session() as variant_db:
+                        ranked_local, dropped_local = await _run_single_retrieve(
+                            query_embedding_vec=embedding_vec,
+                            db_session=variant_db,
+                        )
+
+                    # Per-variant BM25 / hybrid re-ranking over the wider recall
+                    # window before cross-variant fusion.
+                    if search_mode in ("hybrid", "keyword") and ranked_local:
+                        try:
+                            from app.core.search.bm25_index import BM25Index
+                            from app.core.search.rrf_fusion import reciprocal_rank_fusion
+
+                            chunk_dicts = [
+                                {
+                                    "id": r.chunk_id,
+                                    "text": r.text,
+                                    "score": r.score,
+                                    "metadata": {},
+                                }
+                                for r in ranked_local
+                            ]
+                            bm25 = BM25Index()
+                            bm25.build(chunk_dicts)
+                            kw_hits = bm25.search(variant_text, k=len(ranked_local))
+                            kw_dicts = [
+                                {
+                                    "id": h.id,
+                                    "text": h.text,
+                                    "score": h.score,
+                                    "metadata": h.metadata,
+                                }
+                                for h in kw_hits
+                            ]
+
+                            if search_mode == "hybrid":
+                                fused = reciprocal_rank_fusion(
+                                    vector_hits=chunk_dicts,
+                                    keyword_hits=kw_dicts,
+                                    alpha=getattr(_retrieval_cfg, "hybrid_alpha", rc.hybrid_alpha),
+                                    top_k=len(ranked_local),
+                                )
+                                order = {f.id: i for i, f in enumerate(fused)}
+                                ranked_local.sort(key=lambda r: order.get(r.chunk_id, 999_999))
+                            else:
+                                order = {h.id: i for i, h in enumerate(kw_hits)}
+                                ranked_local.sort(key=lambda r: order.get(r.chunk_id, 999_999))
+                        except Exception as hyb_exc:
+                            logger.warning(
+                                "[ChatRetrieve] Hybrid/keyword search failed for variant '%s': %s",
+                                variant_text,
+                                hyb_exc,
+                            )
+
+                    return variant_text, ranked_local, dropped_local
+
+                sem = asyncio.Semaphore(min(len(variants), 4))
+
+                async def _bounded_retrieve(v: str) -> Tuple[str, List[RankedResult], List[Any]]:
+                    async with sem:
+                        return await _retrieve_variant(v)
+
+                tasks = [asyncio.create_task(_bounded_retrieve(v)) for v in variants]
+                per_variant_results: List[Tuple[str, List[RankedResult], List[Any]]] = []
+
+                for res in await asyncio.gather(*tasks, return_exceptions=True):
+                    if isinstance(res, Exception):
+                        logger.warning(
+                            "[ChatRetrieve] Multi-query variant retrieval failed: %s", res
+                        )
+                        continue
+                    per_variant_results.append(res)
+
+                if not per_variant_results:
+                    # All variants failed; fall back to single-query behavior.
+                    _multi_query_enabled = False
+                else:
+                    # Cross-variant fusion via reciprocal-rank fusion over chunk_ids.
+                    with tracer.start_as_current_span("retrieve.rrf_fusion"):
+                        per_variant_chunks: List[List[Dict[str, Any]]] = []
+                        chunk_index: Dict[str, RankedResult] = {}
+                        all_dropped: List[Any] = []
+
+                        for _, ranked_local, dropped_local in per_variant_results:
+                            all_dropped.extend(dropped_local)
+                            variant_chunk_dicts: List[Dict[str, Any]] = []
+                            for r in ranked_local:
+                                if r.chunk_id not in chunk_index:
+                                    chunk_index[r.chunk_id] = r
+                                variant_chunk_dicts.append(
+                                    {
+                                        "id": r.chunk_id,
+                                        "text": r.text,
+                                        "score": r.score,
+                                        "metadata": {},
+                                    }
+                                )
+                            per_variant_chunks.append(variant_chunk_dicts)
+
+                        from app.core.multi_query_expander import fuse_multi_query_results
+
+                        mq_result = fuse_multi_query_results(
+                            per_variant_chunks=per_variant_chunks,
+                            top_k=_recall_limit,
+                        )
+
+                        ranked_results = _rebuild_ranked_from_fused_chunks(
+                            mq_result.fused_chunks,
+                            chunk_index,
+                        )
+                        dropped = all_dropped
+                        _bm25_already_applied = search_mode in ("hybrid", "keyword")
+
+        if not _multi_query_enabled:
+            # ── Single-query retrieval (legacy-compatible) ────────────────────────
+            if _pipe_c is not None:
+                # Tenant-scoped pipeline; DB session managed by FastAPI dependency.
+                ranked_results, dropped = await _run_single_retrieve(
+                    query_embedding_vec=query_embedding,
+                    db_session=db,
+                )
+            else:
+                ranked_results, dropped = await _run_single_retrieve(
+                    query_embedding_vec=query_embedding,
+                    db_session=db,
+                )
+
+        # Record chat-path retrieval metrics (route=\"chat\").
+        try:
+            duration = time.perf_counter() - retrieve_start
+            record_retrieval(route="chat", search_mode=search_mode, duration_seconds=duration)
+        except Exception:
+            logger.debug("[Observability] retrieval metrics for chat failed", exc_info=True)
     
         # ── Optional reranker (stack-aware resolver + circuit breaker) ─────────
         _default_rr = (rc.reranker_name or "none").strip().lower()
@@ -1030,31 +1471,59 @@ async def chat_retrieve(
                     len(scored),
                 )
     
-        # ── BM25 / Hybrid re-ranking ────────────────────────────────────────────
-        if search_mode in ("hybrid", "keyword") and ranked_results:
+        # ── BM25 / Hybrid re-ranking (single-query only) ────────────────────────
+        if search_mode in ("hybrid", "keyword") and ranked_results and not _bm25_already_applied:
             try:
                 from app.core.search.bm25_index import BM25Index
                 from app.core.search.rrf_fusion import reciprocal_rank_fusion
-    
-                chunk_dicts = [{"id": r.chunk_id, "text": r.text, "score": r.score, "metadata": {}} for r in ranked_results]
+
+                chunk_dicts = [
+                    {
+                        "id": r.chunk_id,
+                        "text": r.text,
+                        "score": r.score,
+                        "metadata": {},
+                    }
+                    for r in ranked_results
+                ]
                 bm25 = BM25Index()
                 bm25.build(chunk_dicts)
                 kw_hits = bm25.search(raw_query, k=len(ranked_results))
-                kw_dicts = [{"id": h.id, "text": h.text, "score": h.score, "metadata": h.metadata} for h in kw_hits]
-    
+                kw_dicts = [
+                    {
+                        "id": h.id,
+                        "text": h.text,
+                        "score": h.score,
+                        "metadata": h.metadata,
+                    }
+                    for h in kw_hits
+                ]
+
                 if search_mode == "hybrid":
-                    fused = reciprocal_rank_fusion(vector_hits=chunk_dicts, keyword_hits=kw_dicts, alpha=0.7, top_k=len(ranked_results))
+                    fused = reciprocal_rank_fusion(
+                        vector_hits=chunk_dicts,
+                        keyword_hits=kw_dicts,
+                        alpha=getattr(_retrieval_cfg, "hybrid_alpha", rc.hybrid_alpha)
+                        if _retrieval_cfg is not None
+                        else rc.hybrid_alpha,
+                        top_k=len(ranked_results),
+                    )
                     fused_order = {f.id: i for i, f in enumerate(fused)}
-                    ranked_results.sort(key=lambda r: fused_order.get(r.chunk_id, 999))
+                    ranked_results.sort(key=lambda r: fused_order.get(r.chunk_id, 999_999))
                 else:
                     bm25_order = {h.id: i for i, h in enumerate(kw_hits)}
-                    ranked_results.sort(key=lambda r: bm25_order.get(r.chunk_id, 999))
+                    ranked_results.sort(key=lambda r: bm25_order.get(r.chunk_id, 999_999))
             except Exception as e:
                 logger.warning("[ChatRetrieve] Hybrid/keyword search failed: %s", e)
     
-        # ── Threshold filter ─────────────────────────────────────────────────────
+        # ── Threshold filter & final top-k truncation ───────────────────────────
         if req.similarity_threshold > 0:
             ranked_results = [r for r in ranked_results if r.score >= req.similarity_threshold]
+
+        # Always respect the effective_top_k limit for the final ranked list,
+        # regardless of wider recall windows used earlier for hybrid/multi-query.
+        if effective_top_k and len(ranked_results) > effective_top_k:
+            ranked_results = ranked_results[:effective_top_k]
     
         # ── P3: surface chunks that mention the explicit identifier first ─────────
         if detail_focus_token:
@@ -1065,32 +1534,236 @@ async def chat_retrieve(
             )
 
         if _route_decision.route == QueryRoute.STRUCTURED:
-            ranked_results = _filter_to_dominant_file(
-                ranked_results,
-                focus_id=matched_pattern or detail_focus_token,
-                max_chunks=effective_max_context_chunks,
-            )
+            if multi_id_query:
+                ranked_results = _filter_to_multi_identifier_chunks(
+                    ranked_results,
+                    target_ids=query_structured_ids,
+                    max_chunks=effective_max_context_chunks,
+                )
+                _filter_mode = "multi_id"
+            else:
+                ranked_results = _filter_to_dominant_file(
+                    ranked_results,
+                    focus_id=matched_pattern or detail_focus_token,
+                    max_chunks=effective_max_context_chunks,
+                )
+                _filter_mode = "dominant_file"
             logger.info(
-                "[ChatRetrieve] STRUCTURED dominant-file filter | focus=%s | chunks=%d",
-                matched_pattern or detail_focus_token,
+                "[ChatRetrieve] STRUCTURED %s filter | ids=%s | chunks=%d",
+                _filter_mode,
+                query_structured_ids if multi_id_query else (matched_pattern or detail_focus_token),
                 len(ranked_results),
             )
-    
+
+        # Keep a stable snapshot of finalized retrieval outputs for analysis /
+        # shadow / golden evaluation and trust gating. Result shaping operates
+        # on a separate view derived from this list.
+        ranked_results_for_docset = list(ranked_results)
+
+        # ── Document-set analysis (single request-scoped instance) ─────────────
+        docset_analysis: Optional[Dict[str, Any]] = None
+        docset_analysis_structured = None
+        docset_matches = None
+        if getattr(rc, "enable_docset_analysis", False) and task_plan is not None:
+            # Post-retrieval, post-rerank analysis over finalized RankedResult.
+            # Single pass; exceptions leave analysis unavailable for all consumers.
+            try:
+                structured = run_docset_analysis_structured(
+                    raw_query=raw_query,
+                    task_plan=task_plan,
+                    ranked_results=ranked_results_for_docset,
+                    tenant_runtime=rc,
+                    trace=trace,
+                )
+            except Exception:
+                structured = None
+            if structured is not None:
+                docset_analysis_structured, docset_matches = structured
+                if getattr(rc, "enable_docset_analysis_debug", False):
+                    docset_analysis = docset_analysis_structured.to_debug_dict()
+
+        # ── Optional document-set shadow analysis (Phase 3A, observational) ─────
+        docset_shadow: Optional[Dict[str, Any]] = None
+        if (
+            getattr(rc, "enable_docset_shadow_mode", False)
+            and task_plan is not None
+            and _route_decision.route == QueryRoute.KNOWLEDGE
+        ):
+            # Shadow consumes the shared structured analysis; no second pass.
+            docset_shadow = run_shadow_docset_analysis(
+                raw_query=raw_query,
+                task_plan=task_plan,
+                ranked_results=ranked_results_for_docset,
+                tenant_runtime=rc,
+                trace=trace,
+                analysis=docset_analysis_structured,
+                matches=docset_matches,
+            )
+
+        # ── Optional golden evaluation over shadow matches (Phase 3B) ───────────
+        docset_golden_eval: Optional[Dict[str, Any]] = None
+        if (
+            getattr(rc, "enable_docset_golden_eval", False)
+            and docset_shadow is not None
+            and _route_decision.route == QueryRoute.KNOWLEDGE
+        ):
+            actual_ids = list(docset_shadow.get("matched_file_ids") or [])
+            docset_golden_eval = evaluate_docset_golden(
+                client_id=retrieve_cid,
+                raw_query=raw_query,
+                domain=docset_shadow.get("domain"),
+                actual_file_ids=actual_ids,
+                tenant_runtime=rc,
+                trace=trace,
+            )
+
+        # ── Optional Phase 4 active result shaping (presentation + grounding) ──
+        shaping_applied = False
+        if (
+            getattr(rc, "enable_docset_result_shaping", False)
+            and _route_decision.route == QueryRoute.KNOWLEDGE
+            and task_plan is not None
+            and docset_analysis_structured is not None
+            and not getattr(docset_analysis_structured, "degraded", False)
+            and docset_matches
+        ):
+            try:
+                shaped = shape_docset_results(
+                    ranked_results=ranked_results_for_docset,
+                    analysis=docset_analysis_structured,
+                    matches=docset_matches,
+                    runtime=rc,
+                )
+            except Exception:
+                shaped = None
+
+            if shaped is not None:
+                ranked_results = shaped
+                shaping_applied = True
+
         # ── Build results ────────────────────────────────────────────────────────
+        results_for_gate: List[ChatResultItem] = []
         results: List[ChatResultItem] = []
-        for idx, r in enumerate(ranked_results, start=1):
-            trust_state = None
-            sig = r.explanation.get("interpretation", {})
-            trust_state = sig.get("trust_state", "validated")
-    
-            results.append(ChatResultItem(
-                rank=idx,
-                chunk_id=r.chunk_id,
-                text=r.text,
-                score=round(r.score, 6),
-                trust_decision=r.trust_decision.value if hasattr(r.trust_decision, "value") else (r.trust_decision if isinstance(r.trust_decision, str) else None),
-                trust_state=trust_state,
-            ))
+
+        def _build_results_from_ranked(source: List[RankedResult]) -> List[ChatResultItem]:
+            items: List[ChatResultItem] = []
+            for idx, r in enumerate(source, start=1):
+                sig = r.explanation.get("interpretation", {}) if getattr(r, "explanation", None) else {}
+                trust_state = sig.get("trust_state", "validated")
+                items.append(
+                    ChatResultItem(
+                        rank=idx,
+                        chunk_id=r.chunk_id,
+                        text=r.text,
+                        score=round(r.score, 6),
+                        trust_decision=(
+                            r.trust_decision.value
+                            if hasattr(r.trust_decision, "value")
+                            else (r.trust_decision if isinstance(r.trust_decision, str) else None)
+                        ),
+                        trust_state=trust_state,
+                    )
+                )
+            return items
+
+        results_for_gate = _build_results_from_ranked(ranked_results_for_docset)
+        results = _build_results_from_ranked(ranked_results)
+
+        # PHASE 5A ARCHITECTURAL NOTE:
+        # Deterministic docset summaries are observability artifacts only in Phase 5A.
+        # They must not be used as answer grounding, must not replace raw chunk
+        # context, and must not be sent to the LLM.
+        # Non-docset requests remain unchanged.
+        # Golden evaluation remains document-selection validation only.
+        docset_summary_text: Optional[str] = None
+        docset_summary_metadata: Optional[Dict[str, Any]] = None
+        summary_mode: Optional[str] = None
+        summary_degraded = False
+        summary_degraded_reason: Optional[str] = None
+        if (
+            getattr(rc, "enable_docset_summary", False)
+            and _route_decision.route == QueryRoute.KNOWLEDGE
+            and task_plan is not None
+            and docset_analysis_structured is not None
+        ):
+            _summary_domain = str(
+                getattr(docset_analysis_structured, "domain", None) or "unknown"
+            )
+            try:
+                docset_summary_text = build_docset_summary(docset_analysis_structured)
+                docset_summary_metadata = build_docset_summary_metadata(
+                    docset_analysis_structured
+                )
+                summary_mode = "deterministic"
+                if getattr(docset_analysis_structured, "degraded", False):
+                    summary_degraded = True
+                try:
+                    record_docset_summary_generated(
+                        route="chat",
+                        domain=_summary_domain,
+                        summary_mode=summary_mode,
+                        matched_count=int(
+                            getattr(docset_analysis_structured, "docs_matched", 0) or 0
+                        ),
+                        degraded=bool(
+                            getattr(docset_analysis_structured, "degraded", False)
+                        ),
+                    )
+                except Exception:
+                    pass
+                if trace is not None:
+                    try:
+                        trace.add_event(
+                            "L2",
+                            "analysis.summary_generated",
+                            _trace_lap(),
+                            {
+                                "summary_mode": summary_mode,
+                                "summary_format_version": SUMMARY_FORMAT_VERSION,
+                                "matched_count": int(
+                                    getattr(
+                                        docset_analysis_structured, "docs_matched", 0
+                                    )
+                                    or 0
+                                ),
+                                "degraded": bool(
+                                    getattr(
+                                        docset_analysis_structured, "degraded", False
+                                    )
+                                ),
+                            },
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                docset_summary_text = None
+                docset_summary_metadata = None
+                summary_mode = "construction_failed"
+                summary_degraded = True
+                summary_degraded_reason = str(exc)[:200]
+                try:
+                    record_docset_summary_failure(
+                        route="chat",
+                        domain=_summary_domain,
+                        failure_type="construction_failed",
+                    )
+                except Exception:
+                    pass
+                if trace is not None:
+                    try:
+                        trace.add_event(
+                            "L2",
+                            "analysis.summary_failed",
+                            _trace_lap(),
+                            {
+                                "summary_mode": summary_mode,
+                                "summary_format_version": SUMMARY_FORMAT_VERSION,
+                                "failure_type": "construction_failed",
+                                "degraded": True,
+                            },
+                        )
+                    except Exception:
+                        pass
     
         if trace:
             trace.add_event(
@@ -1110,6 +1783,16 @@ async def chat_retrieve(
                     "detail_focus_token": detail_focus_token,
                     "structured_file_filter_applied": (
                         _route_decision.route == QueryRoute.STRUCTURED
+                    ),
+                    "docset_result_shaping_enabled": getattr(
+                        rc, "enable_docset_result_shaping", False
+                    ),
+                    "docset_result_shaping_applied": shaping_applied,
+                    "docset_max_docs_returned": getattr(
+                        rc, "docset_max_docs_returned", 0
+                    ),
+                    "docset_max_chunks_per_doc_view": getattr(
+                        rc, "docset_max_chunks_per_doc_view", 0
                     ),
                     "chunk_file_ids": [
                         r.file_id for r in ranked_results[:effective_max_context_chunks]
@@ -1137,12 +1820,23 @@ async def chat_retrieve(
         skipped_llm_grounding_miss = False
         tokens_missing_from_passages: List[str] = []
         _verification = None
+        answer_integrity_snapshot: Optional[Dict[str, Any]] = None
+        knowledge_verifier_debug: Optional[Dict[str, Any]] = None
+        _trust_gate_outcome_override: Optional[str] = None
     
         if req.generate_answer:
             if not results:
                 answer_error = "No results retrieved — cannot generate a grounded answer."
             else:
-                max_score = max(r.score for r in results)
+                # Trust gate Option A (intentional separation): evaluate
+                # rag_min_score against the baseline (pre-shaping) retrieval set.
+                # Shaping narrows grounding scope only; trust/refusal semantics are
+                # unchanged for all requests. The gate uses the best-scoring baseline
+                # candidate regardless of docset eligibility. Answer generation always
+                # uses shaped results when shaping applies, so a baseline-only
+                # high-scoring excluded document cannot appear in LLM context.
+                gate_results = results_for_gate or results
+                max_score = max(r.score for r in gate_results)
                 if max_score < rag_min_score:
                     answer_error = (
                         f"Retrieved context confidence too low (best={max_score:.3f} < threshold={rag_min_score:.2f}). "
@@ -1236,7 +1930,15 @@ async def chat_retrieve(
                         )
     
                         identifier_focus_block = ""
-                        if detail_focus_token:
+                        if multi_id_query and query_structured_ids:
+                            identifier_focus_block = (
+                                f"REQUESTED IDENTIFIERS: {', '.join(query_structured_ids)}\n"
+                                "Answer for EACH identifier separately using only the passages "
+                                "that mention it. If a passage contains an identifier, extract "
+                                "its details — do not refuse. Mark [NOT FOUND] only for fields "
+                                "absent in that identifier's passage.\n\n"
+                            )
+                        elif detail_focus_token:
                             identifier_focus_block = (
                                 f"PRIMARY IDENTIFIER IN FOCUS: {detail_focus_token}\n"
                                 "Prioritize sentences that mention this exact token verbatim. "
@@ -1309,18 +2011,6 @@ async def chat_retrieve(
                                 "ANSWER (grounded, with citations):"
                             )
 
-                            # #region agent log
-                            _agent_debug_ndjson(
-                                hypothesis_id="H1",
-                                location="retrieve_chat_api:pre_rag_generate",
-                                message="before_llm_generate",
-                                data={
-                                    "has_focus_token": bool(detail_focus_token),
-                                    "context_chars": len(context_str or ""),
-                                },
-                            )
-                            # #endregion
-
                             resp = None
                             try:
                                 resp = llm.generate(rag_prompt, temperature=0.0, max_tokens=1200)
@@ -1338,14 +2028,6 @@ async def chat_retrieve(
                                         transport_exc_name,
                                         exc_info=True,
                                     )
-                                    # #region agent log
-                                    _agent_debug_ndjson(
-                                        hypothesis_id="H2",
-                                        location="retrieve_chat_api:ragen_transport_exc",
-                                        message="transport_failure_focus_path",
-                                        data={"exc_type": transport_exc_name},
-                                    )
-                                    # #endregion
                                     fb_exc = _build_focus_fallback_answer(
                                         context_str, detail_focus_token
                                     )
@@ -1355,17 +2037,6 @@ async def chat_retrieve(
                                         raw_answer = ""
                                         rag_llm_resp = None
                                         answer, identifier_dedupe_applied = _dedupe_identifier_lines(answer)
-                                        # #region agent log
-                                        _agent_debug_ndjson(
-                                            hypothesis_id="H3",
-                                            location="retrieve_chat_api:after_timeout_fallback",
-                                            message="focus_fallback_answer_set",
-                                            data={
-                                                "answer_chars": len(answer or ""),
-                                                "focus_fallback_used": True,
-                                            },
-                                        )
-                                        # #endregion
                                         logger.info(
                                             "[ChatRetrieve] Transport failure — excerpts from "
                                             "passages | token=%s",
@@ -1415,6 +2086,11 @@ async def chat_retrieve(
                                 else:
                                     answer_error = "LLM returned an empty response."
 
+                        # ANSWER MUTATION BOUNDARY (Phase 5B prerequisite):
+                        # All pre-verification semantic mutations must complete above.
+                        # Future answer-polish must run here (before verify_or_refuse) or
+                        # re-run verify_or_refuse on the polished answer afterward.
+                        # Post-verification semantic mutation without re-verify is forbidden.
                         final_answer = answer if answer is not None else ""
                         _llm_answer, _verification = verify_or_refuse(
                             answer=final_answer,
@@ -1423,6 +2099,214 @@ async def chat_retrieve(
                             route=_route_decision.route.value,
                         )
                         answer = _llm_answer
+
+                        # Phase 6A: KNOWLEDGE/docset claim-level verifier (flag-gated).
+                        _kv_shadow = bool(
+                            getattr(rc, "enable_knowledge_faithfulness_shadow", False)
+                        )
+                        _kv_gate = bool(
+                            getattr(rc, "enable_knowledge_faithfulness_gate", False)
+                        )
+                        if (
+                            _route_decision.route == QueryRoute.KNOWLEDGE
+                            and (_kv_shadow or _kv_gate)
+                        ):
+                            _kv_result = None
+                            try:
+                                _kv_chunk_metas = [
+                                    (r.chunk_id, r.file_id) for r in llm_ranked
+                                ]
+                                _kv_bundle = build_verification_evidence_bundle(
+                                    context_str=context_str,
+                                    chunk_metas=_kv_chunk_metas,
+                                    route=_route_decision.route.value,
+                                    raw_query=raw_query,
+                                )
+                                _kv_result = verify_knowledge_answer(
+                                    answer=answer or "",
+                                    bundle=_kv_bundle,
+                                    refusal_text=_GROUNDING_REFUSAL_PHRASE,
+                                    gate_enabled=_kv_gate,
+                                    indeterminate_policy=getattr(
+                                        rc,
+                                        "knowledge_indeterminate_policy",
+                                        "pass_through",
+                                    ),
+                                )
+                                if _kv_gate:
+                                    answer = _kv_result.answer_out
+                                    _trust_gate_outcome_override = trust_gate_outcome(
+                                        _kv_result
+                                    )
+                                _kv_debug_on = _kv_shadow or _kv_gate or bool(
+                                    getattr(
+                                        rc,
+                                        "enable_knowledge_faithfulness_debug",
+                                        False,
+                                    )
+                                )
+                                if _kv_debug_on:
+                                    knowledge_verifier_debug = _kv_result.to_debug_dict(
+                                        include_claim_trace=bool(
+                                            getattr(
+                                                rc,
+                                                "enable_knowledge_faithfulness_debug",
+                                                False,
+                                            )
+                                            or _kv_shadow
+                                        )
+                                    )
+                                record_knowledge_verifier(
+                                    route="chat",
+                                    status=trust_gate_outcome(_kv_result),
+                                    duration_seconds=_kv_result.duration_ms / 1000.0,
+                                    claim_results=list(_kv_result.claim_results),
+                                )
+                                if trace is not None:
+                                    try:
+                                        trace.add_event(
+                                            "L5",
+                                            "knowledge_verifier",
+                                            _trace_lap(),
+                                            {
+                                                "status": trust_gate_outcome(
+                                                    _kv_result
+                                                ),
+                                                "gate_enabled": _kv_gate,
+                                                "shadow_only": _kv_shadow and not _kv_gate,
+                                                "gated_claims_failed": sum(
+                                                    1
+                                                    for c in _kv_result.claim_results
+                                                    if c.gated
+                                                    and c.status.value == "fail"
+                                                ),
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception as kv_exc:
+                                record_knowledge_verifier_error(stage="integration")
+                                if _kv_gate:
+                                    if _kv_result is not None:
+                                        answer = _kv_result.answer_out
+                                        _trust_gate_outcome_override = trust_gate_outcome(
+                                            _kv_result
+                                        )
+                                        _kv_status = trust_gate_outcome(_kv_result)
+                                    else:
+                                        _trust_gate_outcome_override = "indeterminate"
+                                        _kv_status = "indeterminate"
+                                    if knowledge_verifier_debug is None:
+                                        if _kv_result is not None:
+                                            try:
+                                                knowledge_verifier_debug = (
+                                                    _kv_result.to_debug_dict(
+                                                        include_claim_trace=False,
+                                                    )
+                                                )
+                                            except Exception:
+                                                knowledge_verifier_debug = {
+                                                    "version": KNOWLEDGE_VERIFIER_VERSION,
+                                                    "status": _kv_status,
+                                                    "integration_error": str(kv_exc)[
+                                                        :300
+                                                    ],
+                                                }
+                                        else:
+                                            knowledge_verifier_debug = {
+                                                "version": KNOWLEDGE_VERIFIER_VERSION,
+                                                "status": "indeterminate",
+                                                "integration_error": str(kv_exc)[
+                                                    :300
+                                                ],
+                                            }
+                                    try:
+                                        record_knowledge_verifier(
+                                            route="chat",
+                                            status=_kv_status,
+                                            duration_seconds=(
+                                                _kv_result.duration_ms / 1000.0
+                                                if _kv_result is not None
+                                                else None
+                                            ),
+                                            claim_results=(
+                                                list(_kv_result.claim_results)
+                                                if _kv_result is not None
+                                                else []
+                                            ),
+                                        )
+                                    except Exception:
+                                        pass
+                                logger.debug(
+                                    "[ChatRetrieve] KNOWLEDGE verifier failed",
+                                    exc_info=True,
+                                )
+
+                        # Phase 5B scaffold: observability-only integrity snapshot.
+                        # Gated on polish flags; never blocks or alters answer text.
+                        if getattr(rc, "enable_chat_answer_polish", False):
+                            try:
+                                _pre_mut = raw_answer if raw_answer else None
+                                _snap = build_answer_integrity_snapshot(
+                                    answer=answer or "",
+                                    chunk_count=len(top_chunks),
+                                    pre_mutation_answer=_pre_mut,
+                                    route=_route_decision.route.value,
+                                )
+                                record_chat_answer_polish_scaffold(
+                                    route="chat",
+                                    citation_integrity_valid=_snap.citation_integrity_valid,
+                                )
+                                if getattr(rc, "enable_chat_answer_polish_debug", False):
+                                    try:
+                                        answer_integrity_snapshot = _snap.to_debug_dict()
+                                    except Exception as snap_exc:
+                                        # Fallback minimal snapshot on debug formatting failure (observability-only).
+                                        answer_integrity_snapshot = {
+                                            "integration_error": str(snap_exc)[:300],
+                                        }
+                                    answer_integrity_snapshot[
+                                        "answer_mutation_contract_version"
+                                    ] = ANSWER_MUTATION_CONTRACT_VERSION
+                                if trace is not None:
+                                    try:
+                                        trace.add_event(
+                                            "L4",
+                                            "answer.polish_scaffold",
+                                            _trace_lap(),
+                                            {
+                                                "scaffold_only": True,
+                                                "citation_integrity_valid": (
+                                                    _snap.citation_integrity_valid
+                                                ),
+                                                "chunk_count": len(top_chunks),
+                                                "route": _route_decision.route.value,
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                try:
+                                    record_chat_answer_polish_scaffold_failure(
+                                        route="chat"
+                                    )
+                                except Exception:
+                                    pass
+
+                        try:
+                            if _trust_gate_outcome_override is not None:
+                                outcome = _trust_gate_outcome_override
+                            elif _verification is not None:
+                                outcome = getattr(
+                                    _verification.status,
+                                    "value",
+                                    str(_verification.status),
+                                )
+                            else:
+                                outcome = "unknown"
+                            record_trust_gate("chat", outcome)
+                        except Exception:
+                            logger.debug("[Observability] trust gate metric failed", exc_info=True)
     
                         if trace:
                             if skipped_llm_grounding_miss:
@@ -1570,8 +2454,45 @@ async def chat_retrieve(
                 "pii_detected": scan_result.has_pii,
                 "injection_detected": scan_result.injection_detected,
             },
+            "docset_result_shaping_enabled": getattr(
+                rc, "enable_docset_result_shaping", False
+            ),
+            "docset_max_docs_returned": getattr(rc, "docset_max_docs_returned", 0),
+            "docset_max_chunks_per_doc_view": getattr(
+                rc, "docset_max_chunks_per_doc_view", 0
+            ),
         }
-    
+        if task_plan is not None:
+            debug_info["task_plan"] = task_plan.to_debug_dict()
+        if docset_analysis is not None:
+            debug_info["docset_analysis"] = docset_analysis
+        if docset_shadow is not None:
+            debug_info["docset_shadow"] = docset_shadow
+        if docset_golden_eval is not None:
+            debug_info["docset_golden_eval"] = docset_golden_eval
+        if answer_integrity_snapshot is not None:
+            debug_info["answer_integrity_snapshot"] = answer_integrity_snapshot
+        if knowledge_verifier_debug is not None:
+            debug_info["knowledge_verifier"] = knowledge_verifier_debug
+        if summary_mode is not None:
+            debug_info["summary_mode"] = summary_mode
+            debug_info["summary_degraded"] = summary_degraded
+            if summary_degraded_reason is not None:
+                debug_info["summary_degraded_reason"] = summary_degraded_reason
+            debug_info["summary_format_version"] = SUMMARY_FORMAT_VERSION
+            debug_info["summary_used_llm"] = False
+            debug_info["golden_scope"] = "document_selection_only"
+            if docset_summary_metadata is not None:
+                debug_info["docset_summary_metadata"] = docset_summary_metadata
+            if (
+                getattr(rc, "enable_docset_summary_debug", False)
+                and docset_summary_text is not None
+            ):
+                debug_info["docset_summary"] = {
+                    "text": docset_summary_text[:2000],
+                    "format_version": SUMMARY_FORMAT_VERSION,
+                }
+
         logger.info(
             "[ChatRetrieve] session=%s query='%s' rewritten=%s results=%d latency=%.0fms",
             req.session_id, raw_query[:60], rewritten_query is not None, len(results), elapsed_ms,

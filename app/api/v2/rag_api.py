@@ -101,6 +101,59 @@ class BuildPipelineRequest(BaseModel):
     )
 
 
+class RAGRetrievedChunkItem(BaseModel):
+    """One ranked retrieval candidate for eval / observability (backward-compatible add)."""
+
+    rank: int
+    chunk_id: str
+    score: float
+    stage: str = Field(
+        "context",
+        description="retrieved | reranked | context — which list this row came from",
+    )
+    text: Optional[str] = Field(
+        None,
+        description="Truncated chunk text for faithfulness eval; omit in production clients if undesired.",
+    )
+
+
+def _build_retrieved_chunks_for_eval(result: Any) -> List[RAGRetrievedChunkItem]:
+    """
+    Build ranked chunk list for golden-set P/R/MRR.
+
+    Prefer reranked order when available; otherwise pre-rerank retrieval list.
+    """
+    from app.ai.evaluation.chunk_id_normalize import chunk_id_from_payload
+
+    if result.reranked and result.reranked_chunks:
+        source = result.reranked_chunks
+        stage = "reranked"
+    else:
+        source = result.retrieved_chunks or []
+        stage = "retrieved"
+
+    items: List[RAGRetrievedChunkItem] = []
+    for rank, ch in enumerate(source, start=1):
+        if not isinstance(ch, dict):
+            continue
+        cid = chunk_id_from_payload(ch)
+        if not cid:
+            continue
+        text = str(ch.get("text") or "").strip()
+        if len(text) > 2000:
+            text = text[:2000] + "…"
+        items.append(
+            RAGRetrievedChunkItem(
+                rank=rank,
+                chunk_id=cid,
+                score=float(ch.get("score") or 0.0),
+                stage=stage,
+                text=text or None,
+            )
+        )
+    return items
+
+
 class RAGQueryResponse(BaseModel):
     """Response from POST /api/v2/rag/query"""
     client_id:     str
@@ -111,6 +164,10 @@ class RAGQueryResponse(BaseModel):
     chunk_count:   int
     latency_ms:    Dict[str, Any]
     metadata:      Dict[str, Any]
+    retrieved_chunks: List[RAGRetrievedChunkItem] = Field(
+        default_factory=list,
+        description="Ranked candidates for retrieval metrics (eval harness).",
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,12 +316,20 @@ async def rag_query(req: RAGQueryRequest):
             plog=plog,
         )
 
+        _ranked_eval = _build_retrieved_chunks_for_eval(result)
+
         _metadata = {
             **result.metadata,
             "security_scan": {
                 "pii_detected": _scan_result.has_pii,
                 "injection_detected": _scan_result.injection_detected,
             },
+            "retrieved_chunks_ranked": [
+                c.model_dump() for c in _ranked_eval
+            ],
+            "retrieval_ranking_stage": (
+                _ranked_eval[0].stage if _ranked_eval else "none"
+            ),
         }
 
         return RAGQueryResponse(
@@ -276,6 +341,7 @@ async def rag_query(req: RAGQueryRequest):
             chunk_count=len(result.context_chunks),
             latency_ms=result.latency,
             metadata=_metadata,
+            retrieved_chunks=_ranked_eval,
         )
 
     except HTTPException:

@@ -1157,8 +1157,10 @@ class RAGPipeline:
             else:
                 candidates = [
                     RerankCandidate(
-                        id=c["id"], text=c["text"],
-                        score=c.get("score", 0.0), metadata=c.get("metadata", {}),
+                        id=c["id"],
+                        text=c["text"],
+                        vector_score=float(c.get("score", 0.0)),
+                        metadata=c.get("metadata", {}) or {},
                     )
                     for c in retrieved_chunks
                 ]

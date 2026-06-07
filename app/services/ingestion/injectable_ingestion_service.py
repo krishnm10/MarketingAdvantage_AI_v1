@@ -102,6 +102,7 @@ class InjectableIngestionService:
                 file_id=file_id,
                 client_id=business_id,
                 file_path=file_path,
+                kind="http_async",
             )
         _ing_log.info("Injectable process_file complete", file_id=file_id, stage="complete")
 

@@ -15,6 +15,7 @@ from datetime import datetime
 from functools import lru_cache
 from threading import Lock as _threading_lock
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 import uuid as _uuid_module
 
@@ -46,6 +47,11 @@ from app.services.ingestion.deduplication_engine_v2 import (
     create_normalized_hash,
     register_unique_chunks_in_gci,   # ← NEW: post-dedup GCI commit
 )
+from app.services.ingestion.streaming_state import (
+    STREAMING_INGESTION_ENABLED,
+    StreamingIngestionState,
+)
+from app.services.ingestion.pdf_parser_v2 import iter_pdf_pages
 from app.utils.text_cleaner_v2 import clean_text
 from app.utils.logger import log_info, log_warning, log_error
 from app.core.chunking_stratagies.text_preprocessor import preprocess_document_text
@@ -1383,6 +1389,7 @@ async def log_event(
 # =============================================
 
 class IngestionServiceV2:
+    _async_session_factory = async_session
 
     # ----------------------------------------------------------
     # Ensure file entry exists (FK safe + hash check)
@@ -1669,6 +1676,30 @@ class IngestionServiceV2:
         *,
         pre_embed_hook: Optional[Any] = None,
     ):
+        if STREAMING_INGESTION_ENABLED and (
+            str(file_record.file_type or "").lower() == "pdf"
+        ):
+            return await IngestionServiceV2._run_pipeline_streaming(
+                db,
+                file_record,
+                parsed_payload,
+                pre_embed_hook=pre_embed_hook,
+            )
+        return await IngestionServiceV2._run_pipeline_legacy(
+            db,
+            file_record,
+            parsed_payload,
+            pre_embed_hook=pre_embed_hook,
+        )
+
+    @staticmethod
+    async def _run_pipeline_legacy(
+        db: AsyncSession,
+        file_record: IngestedFileV2,
+        parsed_payload: Dict[str, Any],
+        *,
+        pre_embed_hook: Optional[Any] = None,
+    ):
         await IngestionServiceV2._set_file_processing(db, file_record.id)
         file_id     = file_record.id
         business_id = file_record.business_id
@@ -1909,6 +1940,423 @@ class IngestionServiceV2:
             f"({dedup_stats['dedup_ratio']:.2f}% deduplication)"
         )
 
+    @staticmethod
+    async def _run_pipeline_streaming(
+        db: AsyncSession,
+        file_record: IngestedFileV2,
+        parsed_payload: Dict[str, Any],
+        *,
+        pre_embed_hook: Optional[Any] = None,
+    ):
+        await IngestionServiceV2._set_file_processing(db, file_record.id)
+        file_id = file_record.id
+        business_id = file_record.business_id
+        file_type = file_record.file_type
+
+        if not business_id:
+            log_info(
+                f"[IngestionV2] Streaming requires business_id for {file_id}; "
+                f"using legacy pipeline"
+            )
+            return await IngestionServiceV2._run_pipeline_legacy(
+                db,
+                file_record,
+                parsed_payload,
+                pre_embed_hook=pre_embed_hook,
+            )
+
+        pipeline = _get_ingestion_pipeline(business_id)
+        embedding_model = pipeline.embedder.info.model
+        icfg = getattr(pipeline.config, "ingestion", None)
+        batch_size = max(
+            1,
+            int(getattr(icfg, "batch_size", BATCH_SIZE) or BATCH_SIZE),
+        )
+
+        _plog = PipelineLogger(
+            request_path="ingestion",
+            client_id=str(business_id) if business_id else None,
+            pipeline_id=str(file_id),
+            embedder_model=embedding_model,
+            vectordb_backend=getattr(
+                pipeline.vectordb, "kind", os.getenv("MAI_VECTORDB", "unknown")
+            ),
+        )
+        _plog.info("Streaming pipeline resolved for ingestion", file_id=str(file_id))
+
+        state = await StreamingIngestionState.from_checkpoint(
+            db, UUID(str(file_id)), UUID(str(business_id))
+        )
+
+        pdf_path = file_record.file_path or parsed_payload.get("file_path")
+        if not pdf_path:
+            log_info(
+                f"[IngestionV2] Streaming PDF path missing for {file_id}; "
+                f"falling back to legacy pipeline"
+            )
+            return await IngestionServiceV2._run_pipeline_legacy(
+                db,
+                file_record,
+                parsed_payload,
+                pre_embed_hook=pre_embed_hook,
+            )
+
+        def _semantic_hash_fn(text: str) -> str:
+            return create_normalized_hash(text, embedding_model)
+
+        from app.services.ingestion.chunk_stream import iter_chunks
+
+        page_iter = iter_pdf_pages(pdf_path, start_page=state.last_processed_page)
+        chunk_iter = iter_chunks(
+            page_iter=page_iter,
+            pipeline=pipeline,
+            db=db,
+            file_id=UUID(str(file_id)),
+            business_id=UUID(str(business_id)),
+            file_type=file_type,
+            semantic_hash_fn=_semantic_hash_fn,
+        )
+
+        current_window: List[Dict[str, Any]] = []
+
+        async def _flush_window() -> None:
+            nonlocal current_window
+            if not current_window:
+                return
+            window_snapshot = current_window
+            current_window = []
+            upserted_vector_ids: List[str] = []
+            async with IngestionServiceV2._async_session_factory() as window_db:
+                try:
+                    upserted_vector_ids = await IngestionServiceV2._process_window(
+                        window_snapshot,
+                        state,
+                        window_db,
+                        pipeline=pipeline,
+                        file_record=file_record,
+                        file_id=file_id,
+                        business_id=business_id,
+                        file_type=file_type,
+                        embedding_model=embedding_model,
+                        pre_embed_hook=pre_embed_hook,
+                    )
+                    await window_db.commit()
+                except Exception as window_err:
+                    await window_db.rollback()
+                    if upserted_vector_ids:
+                        await IngestionServiceV2._compensate_vectors_safe(
+                            upserted_vector_ids, pipeline
+                        )
+                    from app.services.ingestion.ingestion_failure_context import (
+                        IngestionFailureContext,
+                        set_ingestion_failure_context,
+                    )
+
+                    set_ingestion_failure_context(
+                        IngestionFailureContext(
+                            stage="streaming_window_commit",
+                            window_index=state.current_window_index,
+                            pipeline_mode="streaming",
+                            extra={
+                                "compensated_vector_ids": len(upserted_vector_ids),
+                            },
+                        )
+                    )
+                    raise window_err
+            state.current_window_index += 1
+
+        async for chunk in chunk_iter:
+            current_window.append(chunk)
+            if len(current_window) >= batch_size:
+                async with timed_stage(
+                    "process_window",
+                    file_id=str(file_id),
+                    business_id=str(business_id),
+                ):
+                    await _flush_window()
+
+        async with timed_stage(
+            "process_window_final",
+            file_id=str(file_id),
+            business_id=str(business_id),
+        ):
+            await _flush_window()
+
+        total = state.total_chunks
+        unique = state.unique_chunks
+        duplicates = state.duplicate_chunks
+        dedup_ratio = (
+            round((duplicates / max(1, total)) * 100, 2) if total else 0.0
+        )
+
+        await IngestionServiceV2._update_file_status(
+            db,
+            file_id,
+            total_chunks=total,
+            unique_chunks=unique,
+            duplicate_chunks=duplicates,
+            dedup_ratio=dedup_ratio,
+            status="processed",
+        )
+
+        log_info(
+            f"[IngestionV2] Streaming pipeline complete for {file_id}: "
+            f"{unique}/{total} chunks stored ({dedup_ratio:.2f}% deduplication)"
+        )
+
+    @staticmethod
+    async def _process_window(
+        window: List[Dict[str, Any]],
+        state: StreamingIngestionState,
+        window_db: AsyncSession,
+        *,
+        pipeline,
+        file_record: IngestedFileV2,
+        file_id,
+        business_id,
+        file_type: str,
+        embedding_model: str,
+        pre_embed_hook: Optional[Any] = None,
+    ) -> List[str]:
+        """
+        Process one micro-batch. Caller owns commit/rollback on window_db.
+        Returns semantic_hash doc_ids upserted to VectorDB (for compensation).
+        """
+        flattened: List[Dict[str, Any]] = []
+        for chunk in window:
+            ch: Dict[str, Any] = dict(chunk)
+            if ch.get("status") == "visual_pending" and ch.get("_visual_task"):
+                task = ch.pop("_visual_task")
+                try:
+                    resolved = await task
+                except Exception as exc:
+                    log_warning(
+                        f"[IngestionV2] Visual task failed for {file_id}: {exc}"
+                    )
+                    resolved = []
+                for resolved_chunk in resolved or []:
+                    rc = dict(resolved_chunk)
+                    rc.pop("_visual_task", None)
+                    if rc.get("status") != "empty":
+                        flattened.append(rc)
+                continue
+            ch.pop("_visual_task", None)
+            if ch.get("status") == "empty":
+                continue
+            flattened.append(ch)
+
+        if not flattened:
+            return []
+
+        for ch in flattened:
+            _normalize_chunk_metadata(ch)
+
+        if pre_embed_hook is not None:
+            flattened = pre_embed_hook(flattened)
+        elif flattened:
+            log_error(
+                "[SECURITY][CRITICAL] pre_embed_hook not provided in streaming window — "
+                "unsafe ingestion path.",
+                file_id=file_id,
+                stage="pre_embedding",
+            )
+            if STRICT_INGESTION_SECURITY:
+                raise RuntimeError(
+                    f"STRICT_INGESTION_SECURITY: pre_embed_hook required "
+                    f"(file_id={file_id})"
+                )
+
+        cross_window_dups: List[Dict[str, Any]] = []
+        survivors: List[Dict[str, Any]] = []
+        for ch in flattened:
+            semantic_hash = ch.get("semantic_hash")
+            if not semantic_hash:
+                survivors.append(ch)
+                continue
+            if state.dedup.is_seen(semantic_hash):
+                ch["is_duplicate"] = True
+                ch["dedup_layer"] = "layer1_streaming_state"
+                ch["similarity_score"] = 1.0
+                cross_window_dups.append(ch)
+            else:
+                survivors.append(ch)
+
+        if survivors:
+            try:
+                unique_chunks, dedup_stats = await IngestionServiceV2._dedup_chunks(
+                    window_db,
+                    survivors,
+                    file_id,
+                    business_id,
+                    collection_name=pipeline.config.vectordb.collection,
+                    pipeline=pipeline,
+                )
+            except Exception as dedup_err:
+                log_info(
+                    f"[IngestionV2] Window dedup failed for {file_id}; "
+                    f"non-deduplicated fallback: {dedup_err}"
+                )
+                unique_chunks = survivors
+                dedup_stats = {
+                    "total": len(survivors),
+                    "unique": len(survivors),
+                    "duplicates": 0,
+                    "dedup_ratio": 0.0,
+                }
+        else:
+            unique_chunks = []
+            dedup_stats = {
+                "total": len(cross_window_dups),
+                "unique": 0,
+                "duplicates": len(cross_window_dups),
+                "dedup_ratio": 100.0 if cross_window_dups else 0.0,
+            }
+
+        window_total = len(flattened)
+        window_unique = len(unique_chunks)
+        window_duplicates = window_total - window_unique
+        state.total_chunks += window_total
+        state.unique_chunks += window_unique
+        state.duplicate_chunks += window_duplicates
+
+        for ch in unique_chunks:
+            h = ch.get("semantic_hash")
+            if h:
+                state.dedup.add(h)
+
+        if unique_chunks:
+            await register_unique_chunks_in_gci(
+                db=window_db,
+                unique_chunks=unique_chunks,
+                file_id=str(file_id),
+                business_id=business_id,
+                source_type=file_type,
+                embedding_model=embedding_model,
+            )
+
+        unique_hashes = {c.get("semantic_hash") for c in unique_chunks}
+        all_chunks_for_storage: List[Dict[str, Any]] = []
+
+        for chunk in unique_chunks:
+            chunk["is_duplicate"] = False
+            chunk["duplicate_of"] = None
+            chunk["similarity_score"] = None
+            all_chunks_for_storage.append(chunk)
+
+        for chunk in flattened:
+            semantic_hash = chunk.get("semantic_hash")
+            if semantic_hash and semantic_hash not in unique_hashes:
+                chunk["is_duplicate"] = True
+                gci_uuid = chunk.get("global_content_id") or chunk.get("gci_id")
+                chunk["duplicate_of"] = gci_uuid
+                chunk["similarity_score"] = chunk.get("similarity_score")
+                all_chunks_for_storage.append(chunk)
+
+        _assign_structure_parent_offsets(all_chunks_for_storage)
+
+        if all_chunks_for_storage:
+            await IngestionServiceV2._insert_chunks(
+                window_db,
+                file_id,
+                business_id,
+                all_chunks_for_storage,
+                auto_commit=False,
+            )
+
+        upserted_vector_ids: List[str] = []
+        chunks_to_embed = [
+            c for c in unique_chunks if c.get("semantic_hash")
+        ]
+        if chunks_to_embed:
+            upserted_vector_ids = list(
+                dict.fromkeys(
+                    str(c["semantic_hash"])
+                    for c in chunks_to_embed
+                    if c.get("semantic_hash")
+                )
+            )
+            await IngestionServiceV2.embed_and_store(
+                file_id,
+                business_id,
+                file_type,
+                chunks_to_embed,
+                file_name=file_record.file_name,
+                source_url=file_record.source_url,
+                pipeline=pipeline,
+                db=window_db,
+                skip_presence_check=True,
+            )
+
+        if flattened:
+            chunk_indices = [
+                int(c.get("chunk_index", 0))
+                for c in flattened
+                if c.get("chunk_index") is not None
+            ]
+            page_numbers = [
+                int(c.get("page_number", 0))
+                for c in flattened
+                if isinstance(c.get("page_number"), int)
+            ]
+            if chunk_indices:
+                state.last_processed_chunk_index = max(
+                    state.last_processed_chunk_index,
+                    max(chunk_indices),
+                )
+            if page_numbers:
+                state.last_processed_page = max(
+                    state.last_processed_page,
+                    max(page_numbers),
+                )
+
+        await state.persist_checkpoint(window_db)
+        return upserted_vector_ids
+
+    @staticmethod
+    async def _batch_gci_lookup(
+        db: AsyncSession,
+        hashes: List[str],
+        business_id: Optional[str],
+        batch_size: int = 500,
+    ) -> set[str]:
+        """Batched GCI presence lookup (tenant-scoped when business_id set)."""
+        if not hashes:
+            return set()
+        known: set[str] = set()
+        for i in range(0, len(hashes), batch_size):
+            batch = hashes[i : i + batch_size]
+            query = select(GlobalContentIndexV2.semantic_hash).where(
+                GlobalContentIndexV2.semantic_hash.in_(batch)
+            )
+            if business_id:
+                query = query.where(
+                    GlobalContentIndexV2.business_id == business_id
+                )
+            result = await db.execute(query)
+            known.update(row[0] for row in result.all())
+        return known
+
+    @staticmethod
+    async def _compensate_vectors_safe(
+        ids: List[str],
+        pipeline,
+    ) -> None:
+        """Delete upserted vector doc_ids; never re-raise."""
+        if not ids:
+            return
+        collection = pipeline.config.vectordb.collection
+        try:
+            vectordb = pipeline.vectordb
+            if hasattr(vectordb, "delete_many") and callable(
+                vectordb.delete_many
+            ):
+                vectordb.delete_many(collection=collection, doc_ids=list(ids))
+            else:
+                for doc_id in ids:
+                    vectordb.delete(collection=collection, doc_id=doc_id)
+        except Exception as e:
+            log_error(f"[IngestionV2] Vector compensation failed: {e}")
+
     # ----------------------------------------------------------
     # Enhanced Chunk extraction (Global Index compatible)
     # ----------------------------------------------------------
@@ -1940,7 +2388,17 @@ class IngestionServiceV2:
           FIX-B3-4: parsed_payload reference released early on single-text path
                     so the raw payload dict is GC-eligible before downstream
                     dedup + embedding hold their own lists.
+
+        DEPRECATED: this helper will be replaced by the streaming
+        `iter_chunks` + windowed ingestion pipeline. Callers should
+        migrate to the streaming API as part of the
+        `chunk-streaming-generator` and `streaming-window-integration`
+        todos.
         """
+        log_warning(
+            "_extract_chunks() is deprecated. Callers must migrate to iter_chunks() "
+            "for streaming micro-batches. [todo: chunk-streaming-generator]"
+        )
         try:
             # FIX-D (carried forward): resolve pipeline once, never re-resolve
             if pipeline is None:
@@ -2317,7 +2775,12 @@ class IngestionServiceV2:
     # ----------------------------------------------------------
     @staticmethod
     async def _insert_chunks(
-        db: AsyncSession, file_id, business_id, chunks
+        db: AsyncSession,
+        file_id,
+        business_id,
+        chunks,
+        *,
+        auto_commit: bool = True,
     ):
         """
         Insert chunks into ingested_content using explicit text() SQL.
@@ -2552,10 +3015,12 @@ class IngestionServiceV2:
         # AFTER:
         try:
             await db.execute(stmt, all_rows)
-            await db.commit()
+            if auto_commit:
+                await db.commit()
             log_info(f"[IngestionV2] Inserted {len(chunks)} chunks into DB")
         except Exception as ins_err:
-            await db.rollback()   # B8: clean session so _update_file_status can still run
+            if auto_commit:
+                await db.rollback()   # B8: clean session so _update_file_status can still run
             log_info(f"[IngestionV2] _insert_chunks executemany failed: {ins_err}")
             raise
 
