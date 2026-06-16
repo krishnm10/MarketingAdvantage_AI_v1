@@ -17,11 +17,12 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 from app.core.config.client_config_schema import ClientConfig
 from app.core.config.client_config_resolver import get_config_fingerprint
+from app.core.config.secret_ref import secret_ref_env_var_name
 
 _logger = logging.getLogger(__name__)
 
@@ -57,12 +58,13 @@ def _normalize_reranker_plugin_name(name: str) -> str:
         "using '%s' (configure reranker.type in client JSON to a registered plugin to avoid this).",
         fb,
     )
+    try:
+        from app.observability.metrics import record_llm_judge_fallback
+
+        record_llm_judge_fallback(fb)
+    except Exception:
+        pass
     return fb
-
-
-_ENABLE_LEGACY_ENV_FALLBACK = os.getenv(
-    "ENABLE_LEGACY_ENV_FALLBACK", "true"
-).strip().lower() in ("1", "true", "yes")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,7 +77,7 @@ class RuntimeComponents:
     Immutable snapshot of all retrieval-stack runtime decisions.
     Constructed once per request, consumed by the entire pipeline.
     """
-    runtime_mode: str            # "authoritative_config" | "legacy_env_fallback"
+    runtime_mode: str            # always "authoritative_config"
     config_fingerprint: str      # short SHA-256 of canonical config
     client_id: str
 
@@ -130,83 +132,23 @@ class RuntimeComponents:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Config resolution with controlled fallback
+# Config resolution (tenant JSON only — Phase 8)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def resolve_config_or_fail(client_id: str) -> Tuple[Optional[ClientConfig], str]:
+def resolve_client_config(client_id: str) -> ClientConfig:
     """
-    Resolve ClientConfig for the given client_id.
+    Load authoritative ClientConfig for *client_id*.
 
-    Returns (config, runtime_mode) where runtime_mode is one of:
-      - "authoritative_config"  — resolver succeeded, config is authoritative
-      - "legacy_env_fallback"   — resolver failed, env-driven (feature-flagged)
-
-    Fail-fast rules:
-      - If client_id != "default" AND ENABLE_LEGACY_ENV_FALLBACK is False,
-        resolution failure raises immediately.  No silent degradation.
-      - If client_id == "default", legacy fallback is always permitted
-        (backward compatibility).
+    Raises on missing files, schema errors, or compatibility failures.
     """
-    from app.core.config.client_config_resolver import (
-        ConfigValidationError,
-        get_client_config,
-    )
+    from app.core.config.client_config_resolver import get_client_config
 
-    try:
-        config = get_client_config(client_id)
-        return config, "authoritative_config"
-    except (ConfigValidationError, FileNotFoundError, ValueError) as exc:
-        if client_id != "default" and not _ENABLE_LEGACY_ENV_FALLBACK:
-            _logger.error(
-                "[RetrievalComponents] FAIL-FAST: Config resolution failed for "
-                "client_id=%s and ENABLE_LEGACY_ENV_FALLBACK=false | error=%s",
-                client_id, exc,
-                extra={
-                    "event": "config_resolution_fail_fast",
-                    "client_id": client_id,
-                    "exc_type": type(exc).__name__,
-                },
-            )
-            raise
-        _logger.warning(
-            "[RetrievalComponents] Config resolution failed for client_id=%s, "
-            "legacy env fallback ACTIVE (ENABLE_LEGACY_ENV_FALLBACK=%s) | error=%s",
-            client_id, _ENABLE_LEGACY_ENV_FALLBACK, exc,
-            extra={
-                "event": "legacy_env_fallback",
-                "client_id": client_id,
-                "runtime_mode": "legacy_env_fallback",
-                "exc_type": type(exc).__name__,
-                "enable_legacy_env_fallback": _ENABLE_LEGACY_ENV_FALLBACK,
-            },
-        )
-        return None, "legacy_env_fallback"
-    except Exception as exc:
-        if client_id != "default" and not _ENABLE_LEGACY_ENV_FALLBACK:
-            _logger.error(
-                "[RetrievalComponents] FAIL-FAST: Unexpected error resolving "
-                "config for client_id=%s | error=%s",
-                client_id, exc,
-                extra={
-                    "event": "config_resolution_fail_fast",
-                    "client_id": client_id,
-                    "exc_type": type(exc).__name__,
-                },
-            )
-            raise
-        _logger.warning(
-            "[RetrievalComponents] Unexpected config error for client_id=%s, "
-            "legacy env fallback ACTIVE | error=%s",
-            client_id, exc,
-            extra={
-                "event": "legacy_env_fallback",
-                "client_id": client_id,
-                "runtime_mode": "legacy_env_fallback",
-                "exc_type": type(exc).__name__,
-                "enable_legacy_env_fallback": _ENABLE_LEGACY_ENV_FALLBACK,
-            },
-        )
-        return None, "legacy_env_fallback"
+    return get_client_config(client_id)
+
+
+def resolve_config_or_fail(client_id: str) -> Tuple[ClientConfig, str]:
+    """Backward-compatible wrapper returning (config, runtime_mode)."""
+    return resolve_client_config(client_id), "authoritative_config"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -248,7 +190,7 @@ def resolve_runtime_components(config: ClientConfig) -> RuntimeComponents:
         collection=config.vectordb.collection,
         llm_provider=_single.type.value if _single else "none",
         llm_model=_single.model if _single else "none",
-        llm_api_key_env=_single.api_key_env if _single else None,
+        llm_api_key_env=secret_ref_env_var_name(_single.secret_ref) if _single else None,
         llm_base_url=_single.base_url if _single else None,
         reranker_name=_rr_resolved.plugin_name,
         reranker_model=_rr_resolved.persisted_model or "",
@@ -318,100 +260,83 @@ def resolve_runtime_components(config: ClientConfig) -> RuntimeComponents:
     )
 
 
-def resolve_runtime_components_legacy() -> RuntimeComponents:
-    """
-    Last-resort runtime snapshot when tenant JSON cannot be loaded.
-
-    1) Prefer ``get_client_config(\"default\")`` so semantics stay JSON-authoritative.
-    2) Only if that fails, fall back to deprecated ``MAI_*`` process env (ops bridge).
-    """
-    try:
-        from app.core.config.client_config_resolver import get_client_config
-
-        rc = resolve_runtime_components(get_client_config("default"))
-        return replace(rc, runtime_mode="legacy_env_fallback")
-    except Exception:
-        _logger.warning(
-            "[RetrievalComponents] resolve_runtime_components_legacy: default JSON "
-            "unavailable; using MAI_* env shim (deprecated).",
-            exc_info=True,
-        )
-
-        _legacy_rr = _normalize_reranker_plugin_name(
-            os.getenv("MAI_RERANKER", "none").strip().lower()
-        )
-        return RuntimeComponents(
-            runtime_mode="legacy_env_fallback",
-            config_fingerprint="env_no_fingerprint",
-            client_id="default",
-            embedder_type=os.getenv("MAI_EMBEDDER", "unknown"),
-            embedder_model="",
-            vectordb_type=os.getenv("MAI_VECTORDB", "unknown"),
-            collection=os.getenv("MAI_COLLECTION", "ingested_content"),
-            llm_provider=os.getenv("MAI_LLM", "openai").lower(),
-            llm_model=_resolve_legacy_llm_model(os.getenv("MAI_LLM", "openai").lower()),
-            llm_api_key_env=None,
-            llm_base_url=os.getenv("OLLAMA_BASE_URL"),
-            reranker_name=_legacy_rr,
-            reranker_model=os.getenv("MAI_RERANKER_MODEL", ""),
-            search_mode="semantic",
-            enable_hyde=False,
-            enable_reranking=_legacy_rr not in ("none", "", "disabled"),
-            hybrid_alpha=0.7,
-            similarity_threshold=0.0,
-            top_k_retrieval=20,
-            top_k_final=5,
-            rag_min_score=0.25,
-            chunking_strategy="unknown",
-            enable_l1_task_classification=False,
-            enable_docset_analysis=False,
-            enable_docset_analysis_debug=False,
-            enable_docset_invoice_adapter=False,
-            docset_max_docs_debug=0,
-            docset_max_chunks_per_doc_debug=0,
-            enable_docset_shadow_mode=False,
-            enable_docset_shadow_debug=False,
-            enable_docset_golden_eval=False,
-            enable_docset_golden_debug=False,
-            docset_golden_set_ref=None,
-            enable_docset_result_shaping=False,
-            docset_max_docs_returned=0,
-            docset_max_chunks_per_doc_view=0,
-            enable_docset_summary=False,
-            enable_docset_summary_debug=False,
-            enable_chat_answer_polish=False,
-            enable_chat_answer_polish_debug=False,
-            enable_knowledge_faithfulness_shadow=False,
-            enable_knowledge_faithfulness_gate=False,
-            enable_knowledge_faithfulness_debug=False,
-            knowledge_indeterminate_policy="pass_through",
-        )
-
-
-def _resolve_legacy_llm_model(provider: str) -> str:
-    """Map provider → env-driven model name (legacy path only)."""
-    _map = {
-        "openai":    ("OPENAI_LLM_MODEL",    "gpt-4o-mini"),
-        "ollama":    ("OLLAMA_LLM_MODEL",     "llama3.1:8b"),
-        "groq":      ("GROQ_LLM_MODEL",       "llama-3.1-70b-versatile"),
-        "grok":      ("GROQ_LLM_MODEL",       "llama-3.1-70b-versatile"),
-        "gemini":    ("GEMINI_LLM_MODEL",      "gemini-1.5-flash"),
-        "google":    ("GEMINI_LLM_MODEL",      "gemini-1.5-flash"),
-        "anthropic": ("ANTHROPIC_LLM_MODEL",   "claude-3-5-sonnet-20241022"),
-    }
-    env_key, default = _map.get(provider, ("", "unknown"))
-    return os.getenv(env_key, default) if env_key else default
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Centralized LLM instantiation — the ONLY LLM factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM instantiation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUPPORTED_LLM_PROVIDERS = (
+    "openai, ollama, groq, gemini, anthropic, xai, grok, deepseek, huggingface"
+)
+
+
+def _openai_compatible_llm(
+    model: str,
+    *,
+    env_name: str,
+    default_base_url: str,
+    provider_label: str,
+    base_url: Optional[str] = None,
+    api_key_env: Optional[str] = None,
+    api_key: Optional[str] = None,
+):
+    from app.core.llms.openai_v1 import OpenAILLM
+
+    key_var = api_key_env or env_name
+    resolved_key = (api_key or "").strip() if api_key else os.getenv(key_var, "")
+    if not resolved_key:
+        raise ValueError(
+            f"API key env var '{key_var}' is not set for {provider_label} LLM."
+        )
+    url = (base_url or default_base_url).strip()
+    return OpenAILLM(model=model, api_key=resolved_key, base_url=url), model
+
+
+async def resolve_llm_api_key(
+    config: ClientConfig,
+    *,
+    provider: str,
+) -> Optional[str]:
+    """Resolve LLM API key from tenant secret_ref (vault/env) when configured."""
+    if not config.llm or not config.llm.single or not config.llm.single.secret_ref:
+        return None
+    from app.core.secrets.credentials import resolve_secret_optional
+
+    return await resolve_secret_optional(
+        config.llm.single.secret_ref,
+        config=config,
+        purpose=f"llm.{provider.lower()}",
+    )
+
+
+async def instantiate_llm_resolved(
+    provider: str,
+    model: str,
+    *,
+    config: ClientConfig,
+    api_key_env: Optional[str] = None,
+    base_url: Optional[str] = None,
+):
+    """Resolve tenant secrets then build the LLM connector."""
+    api_key = await resolve_llm_api_key(config, provider=provider)
+    return instantiate_llm(
+        provider,
+        model,
+        api_key_env=api_key_env,
+        base_url=base_url,
+        api_key=api_key,
+    )
+
 
 def instantiate_llm(
     provider: str,
     model: str,
     api_key_env: Optional[str] = None,
     base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ):
     """
     Create an LLM connector.  Reads ONLY API secret values from env.
@@ -421,15 +346,23 @@ def instantiate_llm(
     Raises ValueError on unsupported provider or missing API key.
     """
     provider = provider.lower()
+    if provider == "google":
+        provider = "gemini"
+    if provider == "grok":
+        provider = "xai"
+    if provider == "hf":
+        provider = "huggingface"
 
     if provider == "openai":
-        from app.core.llms.openai_v1 import OpenAILLM
-
-        env_name = api_key_env or "OPENAI_API_KEY"
-        key = os.getenv(env_name, "")
-        if not key:
-            raise ValueError(f"API key env var '{env_name}' is not set for OpenAI LLM.")
-        return OpenAILLM(model=model, api_key=key, base_url=base_url), model
+        return _openai_compatible_llm(
+            model,
+            env_name="OPENAI_API_KEY",
+            default_base_url="https://api.openai.com/v1",
+            provider_label="OpenAI",
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_key=api_key,
+        )
 
     if provider == "ollama":
         from app.core.llms.ollama_v1 import OllamaLLM
@@ -438,26 +371,61 @@ def instantiate_llm(
         # Read timeout caps /api/chat local inference; defaults match slow local GPUs.
         _to_raw = (os.getenv("OLLAMA_LLM_TIMEOUT_SECONDS") or "").strip()
         if not _to_raw:
-            _to_raw = (os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS") or "").strip() or "120"
+            _to_raw = (os.getenv("OLLAMA_CHAT_TIMEOUT_SECONDS") or "").strip() or "250"
         try:
             ollama_timeout = int(_to_raw)
         except ValueError:
-            ollama_timeout = 120
+            ollama_timeout = 250
         ollama_timeout = max(60, min(ollama_timeout, 900))
         return OllamaLLM(model=model, base_url=url, timeout=ollama_timeout), model
 
-    if provider in ("groq", "grok"):
+    if provider == "groq":
         from app.core.llms.groq_v1 import GroqLLM
 
         env_name = api_key_env or "GROQ_API_KEY"
-        key = os.getenv(env_name, "")
+        key = (api_key or "").strip() if api_key else os.getenv(env_name, "")
         if not key:
             raise ValueError(f"API key env var '{env_name}' is not set for Groq LLM.")
         return GroqLLM(model=model, api_key=key), model
 
+    if provider == "xai":
+        return _openai_compatible_llm(
+            model,
+            env_name="XAI_API_KEY",
+            default_base_url="https://api.x.ai/v1",
+            provider_label="xAI",
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_key=api_key,
+        )
+
+    if provider == "deepseek":
+        return _openai_compatible_llm(
+            model,
+            env_name="DEEPSEEK_API_KEY",
+            default_base_url="https://api.deepseek.com",
+            provider_label="DeepSeek",
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_key=api_key,
+        )
+
+    if provider == "huggingface":
+        return _openai_compatible_llm(
+            model,
+            env_name="HF_TOKEN",
+            default_base_url="https://router.huggingface.co/v1",
+            provider_label="HuggingFace",
+            base_url=base_url,
+            api_key_env=api_key_env,
+            api_key=api_key,
+        )
+
     if provider in ("gemini", "google"):
         env_name = api_key_env or "GOOGLE_API_KEY"
-        key = os.getenv(env_name, "") or os.getenv("GEMINI_API_KEY", "")
+        key = (api_key or "").strip() if api_key else (
+            os.getenv(env_name, "") or os.getenv("GEMINI_API_KEY", "")
+        )
         if not key:
             raise ValueError(
                 f"API key env var '{env_name}' (or legacy GEMINI_API_KEY) is not set "
@@ -467,7 +435,8 @@ def instantiate_llm(
         return GeminiLLM(model=model, api_key=key), model
 
     if provider == "anthropic":
-        key = os.getenv(api_key_env or "ANTHROPIC_API_KEY", "")
+        env_name = api_key_env or "ANTHROPIC_API_KEY"
+        key = (api_key or "").strip() if api_key else os.getenv(env_name, "")
         if not key:
             raise ValueError(
                 f"API key env var '{api_key_env or 'ANTHROPIC_API_KEY'}' is not set "
@@ -481,7 +450,7 @@ def instantiate_llm(
 
     raise ValueError(
         f"Unsupported LLM provider: '{provider}'. "
-        "Supported: openai, ollama, groq, gemini, anthropic."
+        f"Supported: {_SUPPORTED_LLM_PROVIDERS}."
     )
 
 

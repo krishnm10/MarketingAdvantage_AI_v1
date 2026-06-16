@@ -704,7 +704,7 @@ async def _check_llm_groq(hcfg: Optional[Any] = None) -> dict:
     try:
         if hcfg is not None and hcfg.llm and hcfg.llm.single:
             ll = hcfg.llm.single
-            if ll.type.value.lower() in ("groq", "grok"):
+            if ll.type.value.lower() == "groq":
                 model = ll.model or model
                 if ll.api_key_env:
                     api_key = os.getenv(ll.api_key_env, "") or api_key
@@ -720,6 +720,26 @@ async def _check_llm_groq(hcfg: Optional[Any] = None) -> dict:
         timeout=_T + 5,
     )
     return _ok(f"{model} | API key valid") if data else _fail("Groq unreachable")
+
+
+async def _check_llm_xai(hcfg: Optional[Any] = None) -> dict:
+    api_key = os.getenv("XAI_API_KEY", "")
+    model = "grok-2"
+    try:
+        if hcfg is not None and hcfg.llm and hcfg.llm.single:
+            ll = hcfg.llm.single
+            if ll.type.value.lower() in ("xai", "grok"):
+                model = ll.model or model
+    except Exception:
+        pass
+    if not api_key:
+        return _skip("xAI API key not set (XAI_API_KEY).")
+    data = await _http_get(
+        "https://api.x.ai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=_T + 5,
+    )
+    return _ok(f"{model} | API key valid") if data else _fail("xAI unreachable")
 
 
 async def _check_llm_anthropic(hcfg: Optional[Any] = None) -> dict:
@@ -786,7 +806,8 @@ _LLM_CHECKS = {
     "ollama":    _check_llm_ollama,
     "openai":    _check_llm_openai,
     "groq":      _check_llm_groq,
-    "grok":      _check_llm_groq,       # alias
+    "xai":       _check_llm_xai,
+    "grok":      _check_llm_xai,
     "anthropic": _check_llm_anthropic,
     "gemini":    _check_llm_gemini,
     "google":    _check_llm_gemini,     # alias — google maps to Gemini LLM

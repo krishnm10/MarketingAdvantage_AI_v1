@@ -2,12 +2,13 @@
 
 export const API = {
   AUTH: {
-    LOGIN: "/auth/login",
-    VERIFY: "/auth/verify-token",
+    LOGIN: "/api/v2/auth/login",
+    VERIFY: "/api/v2/auth/verify-token",
+    TENANT_SCOPE: "/api/v2/auth/tenant-scope",
   },
   INGESTION: {
-    HEALTH: "/ingestion/health",
-    UPLOAD: "/ingestion/upload",
+    HEALTH: "/api/v2/ingestion/health",
+    UPLOAD: "/api/v2/ingestion/upload",
   },
   INGESTION_ADMIN: {
     FILES: (tenantId?: string) =>
@@ -23,21 +24,24 @@ export const API = {
         ? `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/chunks?tenant_id=${encodeURIComponent(tenantId)}`
         : `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/chunks`,
     RETRY: (id: string) => `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}/retry`,
+    DELETE_FILE: (id: string, tenantId: string) =>
+      `/api/v2/ingestion-admin/files/${encodeURIComponent(id)}?tenant_id=${encodeURIComponent(tenantId)}`,
     CHUNK_UPDATE: (id: string) => `/api/v2/ingestion-admin/chunks/${encodeURIComponent(id)}`,
   },
   SYNC: {
-    ORPHANS: "/sync/orphans",
-    FIX_ORPHANS: "/sync/fix/orphans",
-    FIX_DB_TO_VECTORDB: "/sync/fix/db-to-vectordb",
-    FIX_VECTORDB_TO_DB: "/sync/fix/vectordb-to-db",
+    ORPHANS: "/api/v2/ingestion-admin/sync/orphans",
+    FIX_ORPHANS: "/api/v2/ingestion-admin/sync/fix/orphans",
+    FIX_DB_TO_VECTORDB: "/api/v2/ingestion-admin/sync/fix/db-to-vectordb",
+    FIX_VECTORDB_TO_DB: "/api/v2/ingestion-admin/sync/fix/vectordb-to-db",
   },
   INTEGRITY: {
-    FIX_DB_TO_CHROMA: "/integrity/fix/db-to-chroma",
-    FIX_CHROMA_TO_DB: "/integrity/fix/chroma-to-db",
+    FIX_DB_TO_CHROMA: "/api/v2/ingestion-admin/integrity/fix/db-to-chroma",
+    FIX_CHROMA_TO_DB: "/api/v2/ingestion-admin/integrity/fix/chroma-to-db",
   },
   // Admin — multi-customer pipeline + alignment (config-file tenant list)
   ADMIN: {
     CUSTOMERS_RAG_DASHBOARD: () => "/api/v2/admin/customers-rag-dashboard",
+    CREATE_TENANT: () => "/api/v2/admin/tenants",
     TENANT_OVERVIEW: (clientId: string) =>
       `/api/v2/admin/tenants/${encodeURIComponent(clientId)}/overview`,
     /** Soft-delete: moves client overlay JSON/YAML to `_archived/` on the server. */
@@ -71,6 +75,10 @@ export const API = {
     GET: () => "/api/v2/config/",
     PUT: () => "/api/v2/config/",
   },
+
+  /** Phase 6 — sanitized, secret-free tenant config for browser boot. */
+  PUBLIC_CONFIG: (clientId: string) =>
+    `/api/v2/config/${encodeURIComponent(clientId)}`,
 
   // Phase 2 — RAG Configuration (reranking, query transforms, post-processing)
   RAG_CONFIG: {
@@ -114,6 +122,21 @@ export const API = {
       `/api/v2/tenants/${encodeURIComponent(clientId)}/prompt-config`,
   },
 
+  TENANT_SECRETS: {
+    GET_BACKEND: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secrets-backend`,
+    PUT_BACKEND: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secrets-backend`,
+    GET_REFS: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secret-refs`,
+    PUT_REFS: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secret-refs`,
+    TEST_BACKEND: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secrets-backend/test`,
+    TEST_REFS: (clientId: string) =>
+      `/api/v2/tenants/${encodeURIComponent(clientId)}/secret-refs/test`,
+  },
+
   // Phase 2 — RAG Evaluation
   RAG_EVAL: {
     RETRIEVAL:         () => "/api/v2/rag-eval/retrieval",
@@ -129,7 +152,10 @@ export const API = {
 
   // Model Discovery (for chat console dropdowns)
   MODELS: {
-    LLM:       () => "/api/v2/models/llm",
+    LLM:       (clientId?: string) =>
+      clientId
+        ? `/api/v2/models/llm?client_id=${encodeURIComponent(clientId)}`
+        : "/api/v2/models/llm",
     RERANKER:  () => "/api/v2/models/reranker",
     DEFAULTS:  (clientId?: string) =>
       clientId

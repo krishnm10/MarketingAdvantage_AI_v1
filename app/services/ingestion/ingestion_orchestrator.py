@@ -27,7 +27,8 @@ from __future__ import annotations
 import asyncio
 import json as _json_module
 import logging
-from typing import Any, Dict, FrozenSet, List, Optional
+import os
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from opentelemetry import trace
 
@@ -42,6 +43,9 @@ from app.observability.metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+_INGEST_SCAN_PREFIX_LEN = int(os.getenv("SECURITY_INGEST_SCAN_PREFIX", "2000"))
+_INGEST_INJECTION_MIN_HITS = int(os.getenv("SECURITY_INGEST_INJECTION_THRESHOLD", "2"))
 
 _LOCAL_EMBEDDER_PROVIDERS: FrozenSet[str] = frozenset({
     "huggingface",
@@ -237,17 +241,24 @@ class IngestionOrchestrator:
         file_id: str,
         client_id: str,
         plog: PipelineLogger,
-    ):
+    ) -> Tuple[Callable[[List[Dict[str, Any]]], List[Dict[str, Any]]], List[Dict[str, Any]]]:
         """
         Build a pre_embed_hook closure that sanitizes chunks via the
-        central security layer and logs PII findings.
+        central security layer, quarantines injection hits, and logs PII findings.
 
-        The returned callable has the signature expected by
-        IngestionServiceV2._run_pipeline(pre_embed_hook=...):
-            (chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]
+        Returns:
+            (hook_callable, flagged_chunks_list) — flagged_chunks is mutated in-place
+            when injection patterns are detected; caller should DLQ after ingestion.
         """
 
+        flagged_chunks: List[Dict[str, Any]] = []
+
         def _sanitize_hook(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            from app.middleware.security_middleware import (
+                detect_prompt_injection,
+                scan_text,
+            )
+
             sanitized, pii_meta = sanitize_ingestion_chunks(
                 chunks, client_config=config,
             )
@@ -266,12 +277,98 @@ class IngestionOrchestrator:
                     file_id=file_id,
                     pii_meta=pii_meta,
                 )
-            return sanitized
 
-        return _sanitize_hook
+            safe_chunks: List[Dict[str, Any]] = []
+            for chunk in sanitized:
+                text = (
+                    chunk.get("cleaned_text")
+                    or chunk.get("text")
+                    or chunk.get("content")
+                    or ""
+                )
+                if not isinstance(text, str):
+                    text = str(text)
+
+                # Ingest-tuned injection scan: bounded prefix + higher hit threshold
+                scan_target = text[:_INGEST_SCAN_PREFIX_LEN]
+                injection_detected, injection_hits = detect_prompt_injection(scan_target)
+                if injection_detected and len(injection_hits) >= _INGEST_INJECTION_MIN_HITS:
+                    chunk_id = chunk.get("chunk_id") or chunk.get("id") or "unknown"
+                    flagged_chunks.append({
+                        "chunk_id": str(chunk_id),
+                        "pattern_hits": len(injection_hits),
+                        "snippet": scan_target[:200],
+                    })
+                    plog.warning(
+                        "Injection quarantined before embedding",
+                        file_id=file_id,
+                        client_id=client_id,
+                        chunk_id=chunk_id,
+                        pattern_hits=len(injection_hits),
+                    )
+                    continue
+
+                # Secondary PII/injection pass on the full chunk (redact only; no re-quarantine)
+                scan_result = scan_text(
+                    text,
+                    redact_pii_data=True,
+                    check_injection=False,
+                    log_pii=False,
+                    log_injection=False,
+                    context=f"ingest:{file_id}",
+                )
+                if scan_result.redacted_text != text:
+                    updated = dict(chunk)
+                    if "cleaned_text" in updated:
+                        updated["cleaned_text"] = scan_result.redacted_text
+                    elif "text" in updated:
+                        updated["text"] = scan_result.redacted_text
+                    else:
+                        updated["content"] = scan_result.redacted_text
+                    safe_chunks.append(updated)
+                else:
+                    safe_chunks.append(chunk)
+
+            return safe_chunks
+
+        return _sanitize_hook, flagged_chunks
+
+    @staticmethod
+    async def _record_injection_quarantine(
+        *,
+        client_id: str,
+        file_id: str,
+        flagged_chunks: List[Dict[str, Any]],
+        plog: PipelineLogger,
+    ) -> None:
+        """Aggregate per-chunk injection flags into one DLQ tombstone per file."""
+        if not flagged_chunks:
+            return
+
+        from app.services.ingestion.ingestion_dlq_service import record_ingestion_failure
+
+        plog.warning(
+            "Recording injection quarantine to DLQ",
+            file_id=file_id,
+            client_id=client_id,
+            flagged_count=len(flagged_chunks),
+        )
+        await record_ingestion_failure(
+            business_id=client_id,
+            file_id=file_id,
+            stage="injection_quarantine",
+            error=ValueError("injection_detected"),
+            payload_snapshot={
+                "reason": "injection_detected",
+                "flagged_chunk_ids": [
+                    c.get("chunk_id") for c in flagged_chunks if c.get("chunk_id")
+                ],
+                "flagged_chunks": flagged_chunks,
+                "flagged_count": len(flagged_chunks),
+            },
+        )
 
     # ------------------------------------------------------------------
-    # File ingestion (UI upload, bulk, watcher)
     # ------------------------------------------------------------------
 
     async def ingest_file(
@@ -317,7 +414,7 @@ class IngestionOrchestrator:
                 ingest_sem = await self._get_tenant_ingest_semaphore(client_id, max_parallel)
 
                 async with ingest_sem:
-                    hook = self._make_pii_hook(
+                    hook, injection_flagged = self._make_pii_hook(
                         config,
                         file_id=file_id,
                         client_id=client_id,
@@ -329,6 +426,13 @@ class IngestionOrchestrator:
                         file_path=file_path,
                         business_id=client_id,
                         pre_embed_hook=hook,
+                    )
+
+                    await self._record_injection_quarantine(
+                        client_id=client_id,
+                        file_id=file_id,
+                        flagged_chunks=injection_flagged,
+                        plog=plog,
                     )
 
                 plog.info("Orchestrator: file ingestion completed", file_id=file_id)
@@ -372,7 +476,7 @@ class IngestionOrchestrator:
 
         self._enforce_embedding_policy(config, plog=plog)
 
-        hook = self._make_pii_hook(
+        hook, injection_flagged = self._make_pii_hook(
             config,
             file_id=file_id,
             client_id=client_id,
@@ -383,6 +487,14 @@ class IngestionOrchestrator:
             file_id=file_id,
             parsed_output=parsed,
             pre_embed_hook=hook,
+            client_id=client_id,
+        )
+
+        await self._record_injection_quarantine(
+            client_id=client_id,
+            file_id=file_id,
+            flagged_chunks=injection_flagged,
+            plog=plog,
         )
 
         plog.info("Orchestrator: parsed ingestion completed", file_id=file_id)

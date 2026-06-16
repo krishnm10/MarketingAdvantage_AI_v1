@@ -373,44 +373,17 @@ class TestBackwardCompatibility:
 
 
 class TestFeatureFlagBehavior:
-    """Tests for feature flag behavior."""
-    
-    def test_flag_defaults_to_false(self):
-        """Verify feature flag defaults to False for safe rollout."""
-        import os
-        
-        # Clear the env var if set
-        original = os.environ.pop("MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT", None)
-        
-        try:
-            # Re-import to get fresh value
-            import importlib
-            import app.core.runtime.runtime_flags as flags
-            importlib.reload(flags)
-            
-            assert flags.ENABLE_RETRIEVAL_SECURITY_ALIGNMENT is False
-        finally:
-            if original is not None:
-                os.environ["MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT"] = original
-    
-    def test_flag_enabled_when_set(self):
-        """Verify feature flag can be enabled."""
-        import os
-        import importlib
-        
-        original = os.environ.get("MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT")
-        os.environ["MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT"] = "true"
-        
-        try:
-            import app.core.runtime.runtime_flags as flags
-            importlib.reload(flags)
-            
-            assert flags.ENABLE_RETRIEVAL_SECURITY_ALIGNMENT is True
-        finally:
-            if original is not None:
-                os.environ["MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT"] = original
-            else:
-                os.environ.pop("MAI_ENABLE_RETRIEVAL_SECURITY_ALIGNMENT", None)
+    """Shared executors are always enabled (no env migration flags)."""
+
+    def test_shared_retrieval_enabled(self):
+        from app.core.runtime.runtime_flags import ENABLE_SHARED_RETRIEVAL
+
+        assert ENABLE_SHARED_RETRIEVAL is True
+
+    def test_shared_generation_enabled(self):
+        from app.core.runtime.runtime_flags import ENABLE_SHARED_GENERATION
+
+        assert ENABLE_SHARED_GENERATION is True
 
 
 class TestTenantIsolation:

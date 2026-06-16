@@ -24,6 +24,17 @@ from app.core.embedders.base import BaseEmbedder, EmbedderInfo, _l2_normalize
 logger = logging.getLogger(__name__)
 
 
+def _is_non_retryable_ollama_error(exc: Exception) -> bool:
+    """Model missing / bad request — retrying will not help."""
+    msg = str(exc).lower()
+    return (
+        "not found" in msg
+        or "status code: 404" in msg
+        or "status code: 400" in msg
+        or "unknown model" in msg
+    )
+
+
 class OllamaEmbedder(BaseEmbedder):
     def __init__(
         self,
@@ -59,6 +70,12 @@ class OllamaEmbedder(BaseEmbedder):
                 break
             except Exception as exc:
                 last_err = exc
+                if _is_non_retryable_ollama_error(exc):
+                    logger.warning(
+                        "[OllamaEmbedder] dim_probe failed (non-retryable): %s",
+                        exc,
+                    )
+                    break
                 wait = _BACKOFF[attempt] if attempt < len(_BACKOFF) else _BACKOFF[-1]
                 logger.warning(
                     "[OllamaEmbedder] dim_probe attempt %d/%d failed (%s). "

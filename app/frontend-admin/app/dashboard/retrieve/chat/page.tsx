@@ -1,6 +1,10 @@
 "use client";
 
-import { useState, useRef, useEffect, useCallback, type ComponentType } from "react";
+import Link from "next/link";
+import { useState, useRef, useEffect, useCallback, useMemo, type ComponentType, type ReactNode, type HTMLAttributes } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeSanitize from "rehype-sanitize";
 import apiClient from "@/lib/apiClient";
 import {
   Send,
@@ -25,8 +29,11 @@ import {
   Info,
   FileText,
   Building2,
+  Sparkles,
+  ImageIcon,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { pipelineSettingsHref } from "@/lib/forbiddenEnvConfigKeys";
 import { useTenant } from "@/contexts/TenantContext";
 import { API } from "@/lib/apiRoutes";
 import { useAuth } from "@/lib/useAuth";
@@ -165,6 +172,268 @@ function applyRuntimeToSession(
   setters.setEnableHyde(rt.retrieval.enable_hyde);
 }
 
+/** Wrap [Source N] citations in subtle chips (paragraphs/lists only, not tables). */
+function decorateSourceCitations(node: ReactNode): ReactNode {
+  if (typeof node === "string") {
+    const parts = node.split(/(\[Source \d+\])/gi);
+    if (parts.length === 1) return node;
+    return parts.map((part, i) =>
+      /^\[Source \d+\]$/i.test(part) ? (
+        <span
+          key={i}
+          className="inline-flex items-center mx-0.5 px-1.5 py-0.5 rounded-md bg-primary-50 text-primary-700 text-[10px] font-semibold ring-1 ring-primary-200/60 align-middle"
+        >
+          {part}
+        </span>
+      ) : (
+        part
+      )
+    );
+  }
+  if (Array.isArray(node)) {
+    return node.map((child, i) => (
+      <span key={i}>{decorateSourceCitations(child)}</span>
+    ));
+  }
+  return node;
+}
+
+function JsonImageConceptCard({
+  payload,
+}: {
+  payload: { engine?: string; action?: string; prompt: string };
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const engineLabel = payload.engine || "Image engine";
+  const actionLabel = payload.action || "text2im";
+  const prompt = payload.prompt || "";
+
+  return (
+    <div className="my-4 rounded-xl border border-slate-200/80 bg-gradient-to-b from-white to-slate-50/80 shadow-card ring-1 ring-primary-100/80 overflow-hidden">
+      <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-slate-100 bg-white/90">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="flex-shrink-0 w-7 h-7 rounded-lg bg-primary-50 border border-primary-100 flex items-center justify-center">
+            <Sparkles className="w-3.5 h-3.5 text-primary-600" />
+          </span>
+          <div className="min-w-0">
+            <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-700">
+              AI Generated Visual Concept
+            </div>
+            <div className="text-[10px] text-slate-400 truncate">
+              {engineLabel} • {actionLabel}
+            </div>
+          </div>
+        </div>
+      </div>
+      {prompt && (
+        <div className="px-4 pt-3">
+          <p
+            className={cn(
+              "text-xs text-slate-600 leading-relaxed",
+              !expanded && "line-clamp-3"
+            )}
+          >
+            {prompt}
+          </p>
+          {prompt.length > 120 && (
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="mt-1 text-[10px] font-medium text-primary-600 hover:text-primary-700"
+            >
+              {expanded ? "Show less" : "Show full brief"}
+            </button>
+          )}
+        </div>
+      )}
+      <div className="mx-4 my-3 h-36 rounded-lg border border-dashed border-slate-200 bg-[linear-gradient(to_right,#f1f5f9_1px,transparent_1px),linear-gradient(to_bottom,#f1f5f9_1px,transparent_1px)] bg-[size:16px_16px] flex flex-col items-center justify-center gap-2">
+        <ImageIcon className="w-5 h-5 text-slate-300" />
+        <span className="text-[11px] text-slate-400 text-center px-4">
+          Visual concept preview — image engine not connected
+        </span>
+      </div>
+    </div>
+  );
+}
+
+function AssistantMarkdown({ content }: { content: string }) {
+  return (
+    <div className="rounded-xl bg-gradient-to-b from-slate-50/80 to-white px-2 py-2 sm:px-3 animate-fade-in">
+      <div className="text-sm text-slate-700 leading-relaxed max-w-none space-y-0.5">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[rehypeSanitize]}
+          components={{
+            h1: ({ children, ...props }) => (
+              <h1
+                className="text-lg font-bold text-slate-900 mt-4 mb-2 first:mt-0 border-b border-slate-200 pb-2"
+                {...props}
+              >
+                {children}
+              </h1>
+            ),
+            h2: ({ children, ...props }) => (
+              <h2
+                className="text-base font-semibold text-slate-900 mt-5 mb-2 first:mt-0 pl-3 border-l-4 border-primary-500"
+                {...props}
+              >
+                {children}
+              </h2>
+            ),
+            h3: ({ children, ...props }) => (
+              <h3
+                className="text-sm font-semibold text-slate-800 mt-4 mb-1.5 first:mt-0"
+                {...props}
+              >
+                {children}
+              </h3>
+            ),
+            h4: ({ children, ...props }) => (
+              <h4
+                className="text-xs font-semibold uppercase tracking-wide text-slate-500 mt-3 mb-1 first:mt-0"
+                {...props}
+              >
+                {children}
+              </h4>
+            ),
+            p: ({ children, ...props }) => (
+              <p className="text-sm leading-relaxed text-slate-700 my-2" {...props}>
+                {decorateSourceCitations(children)}
+              </p>
+            ),
+            strong: ({ children, ...props }) => (
+              <strong className="font-semibold text-slate-900" {...props}>
+                {children}
+              </strong>
+            ),
+            em: ({ children, ...props }) => (
+              <em className="italic text-slate-600" {...props}>
+                {children}
+              </em>
+            ),
+            ul: ({ children, ...props }) => (
+              <ul className="my-2 space-y-1.5 pl-1 list-none [&_ul]:mt-1.5 [&_ul]:ml-3 [&_ul_li]:before:w-1 [&_ul_li]:before:h-1 [&_ul_li]:before:bg-primary-400" {...props}>
+                {children}
+              </ul>
+            ),
+            ol: ({ children, ...props }) => (
+              <ol
+                className="my-2 space-y-1.5 pl-5 list-decimal marker:text-primary-600 marker:font-semibold [&>li]:pl-0 [&>li]:before:content-none"
+                {...props}
+              >
+                {children}
+              </ol>
+            ),
+            li: ({ children, ...props }) => (
+              <li
+                className="relative pl-5 text-sm leading-relaxed text-slate-700 before:content-[''] before:absolute before:left-0 before:top-[0.6em] before:w-1.5 before:h-1.5 before:rounded-full before:bg-primary-500 before:ring-2 before:ring-primary-100 [&>ol]:list-decimal [&>ol]:pl-5 [&>ol]:mt-1.5 [&>ol>li]:pl-0 [&>ol>li]:before:content-none"
+                {...props}
+              >
+                {decorateSourceCitations(children)}
+              </li>
+            ),
+            hr: (props) => (
+              <hr className="my-5 border-0 border-t border-slate-200/90" {...props} />
+            ),
+            blockquote: ({ children, ...props }) => (
+              <blockquote
+                className="my-3 border-l-4 border-amber-300 bg-amber-50/60 rounded-r-lg px-3 py-2 text-sm text-amber-900/90"
+                {...props}
+              >
+                {children}
+              </blockquote>
+            ),
+            a: ({ children, href, ...props }) => (
+              <a
+                href={href}
+                className="text-primary-700 underline underline-offset-2 hover:text-primary-800"
+                target="_blank"
+                rel="noopener noreferrer"
+                {...props}
+              >
+                {children}
+              </a>
+            ),
+            pre: ({ children, ...props }) => (
+              <pre
+                className="my-3 overflow-x-auto rounded-lg bg-slate-100 border border-slate-200 px-3 py-2 text-xs text-slate-800"
+                {...props}
+              >
+                {children}
+              </pre>
+            ),
+            table: ({ children, ...props }) => (
+              <div className="my-3 overflow-x-auto rounded-xl border border-slate-200 bg-slate-50">
+                <table className="min-w-full text-sm text-slate-800" {...props}>
+                  {children}
+                </table>
+              </div>
+            ),
+            th: ({ children, ...props }) => (
+              <th
+                className="px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wide bg-slate-100 border-b border-slate-200 whitespace-nowrap"
+                {...props}
+              >
+                {children}
+              </th>
+            ),
+            td: ({ children, ...props }) => (
+              <td
+                className="px-3 py-2 align-top text-xs text-slate-700 border-b border-slate-100"
+                {...props}
+              >
+                {children}
+              </td>
+            ),
+            code: (codeProps) => {
+              const { inline, className, children, ...props } = codeProps as {
+                inline?: boolean;
+                className?: string;
+                children?: ReactNode;
+              } & HTMLAttributes<HTMLElement>;
+
+              const lang = (className || "").replace("language-", "");
+              const raw = String(children || "").trim();
+
+              if (!inline && lang === "json-image") {
+                try {
+                  const payload = JSON.parse(raw) as {
+                    engine?: string;
+                    action?: string;
+                    prompt: string;
+                  };
+                  return <JsonImageConceptCard payload={payload} />;
+                } catch {
+                  // Fallback to plain code rendering below
+                }
+              }
+
+              if (inline) {
+                return (
+                  <code
+                    className="font-mono text-xs bg-slate-100 text-slate-800 px-1.5 py-0.5 rounded border border-slate-200/80"
+                    {...props}
+                  >
+                    {children}
+                  </code>
+                );
+              }
+
+              return (
+                <code className={cn("font-mono text-xs", className)} {...props}>
+                  {children}
+                </code>
+              );
+            },
+          }}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+    </div>
+  );
+}
+
 /* ─── Main Page ─────────────────────────────────────────────── */
 
 export default function ChatRetrievePage() {
@@ -205,31 +474,77 @@ export default function ChatRetrievePage() {
     type: "success" | "error";
     msg: string;
   } | null>(null);
-
+  const [renderMode, setRenderMode] = useState<"plain" | "rich">("plain");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const runtimeFetchGenRef = useRef(0);
 
+  const [catalogError, setCatalogError] = useState<string | null>(null);
+
   // Global catalogs — options only; never set selectedLLM from this list.
   useEffect(() => {
+    if (!clientId) return;
     let cancelled = false;
     (async () => {
+      setCatalogError(null);
       try {
-        const [llmRes, rrRes] = await Promise.all([
-          apiClient.get<LLMProvider[]>(API.MODELS.LLM()),
+        const [llmRes, rrRes] = await Promise.allSettled([
+          apiClient.get<LLMProvider[]>(API.MODELS.LLM(clientId)),
           apiClient.get<RerankerOption[]>(API.MODELS.RERANKER()),
         ]);
         if (cancelled) return;
-        setLlmProviders(llmRes.data);
-        setRerankers(rrRes.data);
+        if (llmRes.status === "fulfilled") {
+          setLlmProviders(Array.isArray(llmRes.value.data) ? llmRes.value.data : []);
+        } else {
+          setLlmProviders([]);
+          setCatalogError("Could not load LLM providers.");
+        }
+        if (rrRes.status === "fulfilled") {
+          setRerankers(Array.isArray(rrRes.value.data) ? rrRes.value.data : []);
+        } else {
+          setRerankers([]);
+          setCatalogError((prev) => prev ?? "Could not load reranker plugins.");
+        }
       } catch {
-        /* dropdowns stay empty until retry */
+        if (!cancelled) {
+          setCatalogError("Could not load model catalogs.");
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [clientId]);
+
+  const llmOptions = useMemo(() => {
+    const options = [...llmProviders];
+    const effective = selectedLLM || tenantRuntime?.llm.effective_provider;
+    if (effective && !options.some((p) => p.provider === effective)) {
+      options.unshift({
+        provider: effective,
+        display_name: effective,
+        default_model: tenantRuntime?.llm.effective_model || "",
+        api_key_set: true,
+        api_key_env: "(tenant default)",
+        recommended: false,
+      });
+    }
+    return options;
+  }, [llmProviders, selectedLLM, tenantRuntime]);
+
+  const rerankerOptions = useMemo(() => {
+    const options = [...rerankers];
+    const effective = selectedReranker || tenantRuntime?.reranker.effective_plugin;
+    if (effective && !options.some((r) => r.name === effective)) {
+      options.unshift({
+        name: effective,
+        description: "Tenant effective reranker",
+        requires_gpu: false,
+        requires_api_key: false,
+      });
+    }
+    return options;
+  }, [rerankers, selectedReranker, tenantRuntime]);
 
   // Hydrate session controls from tenant SSOT (debounced clientId from TenantContext).
   useEffect(() => {
@@ -408,6 +723,7 @@ export default function ChatRetrievePage() {
       if (sessionPromptOverride) {
         body.system_prompt_override = sessionPromptOverride;
       }
+      body.enable_hyde = enableHyde;
 
       const res = await apiClient.post<ChatResponse>(
         "/api/v2/retrieve/chat",
@@ -446,6 +762,7 @@ export default function ChatRetrievePage() {
     searchMode,
     generateAnswer,
     autoRewrite,
+    enableHyde,
     sessionPromptOverride,
     clientId,
   ]);
@@ -478,6 +795,11 @@ export default function ChatRetrievePage() {
         </div>
 
         <div className="p-4 space-y-4 overflow-y-auto flex-1">
+          {catalogError && (
+            <div className="rounded-md border border-red-200 bg-red-50 px-2.5 py-2 text-[10px] text-red-800">
+              {catalogError}
+            </div>
+          )}
           {runtimeWarnings.length > 0 && (
             <div className="rounded-md border border-amber-200 bg-amber-50 px-2.5 py-2 text-[10px] text-amber-900 space-y-1">
               {runtimeWarnings.map((w, i) => (
@@ -520,7 +842,7 @@ export default function ChatRetrievePage() {
               {!sessionConfigReady && (
                 <option value="">Loading tenant defaults…</option>
               )}
-              {llmProviders.map((p) => (
+              {llmOptions.map((p) => (
                 <option key={p.provider} value={p.provider} disabled={!p.api_key_set}>
                   {p.display_name} {p.api_key_set ? `(${p.default_model})` : "(no API key)"}{p.recommended ? " (catalog)" : ""}
                 </option>
@@ -537,7 +859,7 @@ export default function ChatRetrievePage() {
               disabled={!sessionConfigReady || sessionConfigLoading}
               className="w-full rounded-md border border-slate-200 px-2.5 py-1.5 text-xs text-slate-700 bg-white focus:border-primary-300 outline-none disabled:opacity-60"
             >
-              {rerankers.map((r) => (
+              {rerankerOptions.map((r) => (
                 <option key={r.name} value={r.name}>
                   {r.name === "none" ? "None" : r.name}
                 </option>
@@ -577,6 +899,48 @@ export default function ChatRetrievePage() {
               <option value="hybrid">Hybrid (Semantic + BM25)</option>
               <option value="keyword">Keyword (BM25)</option>
             </select>
+          </div>
+
+          {/* Answer display mode */}
+          <div>
+            <label className="text-xs font-medium text-slate-500 block mb-1">
+              Answer Display
+            </label>
+            <div
+              className="inline-flex rounded-full bg-slate-100 p-0.5"
+              role="group"
+              aria-label="Answer display mode"
+            >
+              <button
+                type="button"
+                onClick={() => setRenderMode("plain")}
+                aria-pressed={renderMode === "plain"}
+                className={cn(
+                  "px-2.5 py-1 text-[11px] rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-100 transition-colors",
+                  renderMode === "plain"
+                    ? "bg-white text-slate-800 shadow-sm"
+                    : "text-slate-500"
+                )}
+              >
+                Plain text
+              </button>
+              <button
+                type="button"
+                onClick={() => setRenderMode("rich")}
+                aria-pressed={renderMode === "rich"}
+                className={cn(
+                  "ml-1 px-2.5 py-1 text-[11px] rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-500 focus-visible:ring-offset-1 focus-visible:ring-offset-slate-100 transition-colors",
+                  renderMode === "rich"
+                    ? "bg-white text-slate-800 shadow-sm"
+                    : "text-slate-500"
+                )}
+              >
+                Rich markdown & visuals
+              </button>
+            </div>
+            <p className="mt-1 text-[10px] text-slate-500">
+              Controls only how answers are displayed in this console.
+            </p>
           </div>
 
           {/* Toggles */}
@@ -668,10 +1032,19 @@ export default function ChatRetrievePage() {
                 </div>
               )}
 
-              <div className={cn("max-w-[75%] rounded-2xl px-4 py-3", turn.role === "user"
-                ? "bg-primary-600 text-white"
-                : "bg-white border border-slate-200 shadow-sm"
-              )}>
+              <div
+                className={cn(
+                  "rounded-2xl px-4 py-3",
+                  turn.role === "user"
+                    ? "max-w-[75%] bg-primary-600 text-white"
+                    : cn(
+                        "bg-white border border-slate-200 shadow-sm",
+                        renderMode === "rich" && turn.response?.answer
+                          ? "max-w-[92%]"
+                          : "max-w-[75%]"
+                      )
+                )}
+              >
                 {/* User message */}
                 {turn.role === "user" && <p className="text-sm whitespace-pre-wrap">{turn.content}</p>}
 
@@ -691,14 +1064,31 @@ export default function ChatRetrievePage() {
                     )}
 
                     {turn.response?.answer && (
-                      <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{turn.response.answer}</p>
+                      renderMode === "plain" ? (
+                        <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">
+                          {turn.response.answer}
+                        </p>
+                      ) : (
+                        <AssistantMarkdown content={turn.response.answer} />
+                      )
                     )}
 
                     {turn.response?.debug_info &&
                       !turn.error &&
                       (() => {
                         const dbg = parseChatDebugInfo(turn.response.debug_info);
-                        return dbg ? <EffectiveThisTurnStrip debug={dbg} /> : null;
+                        if (!dbg) return null;
+                        const genAttempted =
+                          turn.response.answer_latency_ms != null ||
+                          Boolean(turn.response.answer) ||
+                          Boolean(turn.response.answer_error);
+                        return (
+                          <EffectiveThisTurnStrip
+                            debug={dbg}
+                            observability={dbg.observability}
+                            generateAnswer={genAttempted}
+                          />
+                        );
                       })()}
 
                     {turn.response?.answer_error && !turn.response?.answer && (
@@ -722,7 +1112,7 @@ export default function ChatRetrievePage() {
                           className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-600"
                         >
                           <FileText className="w-3 h-3" />
-                          {turn.response.results.length} sources | {turn.response.latency_ms.toFixed(0)}ms
+                          {turn.response.results.length} sources
                           {expandedDebug.has(turn.id) ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                         </button>
 
@@ -901,6 +1291,20 @@ export default function ChatRetrievePage() {
                     </div>
 
                     <div className="flex flex-wrap items-center gap-3">
+                      <Link
+                        href={pipelineSettingsHref(clientId, "prompts")}
+                        className="text-[10px] font-medium text-primary-700 hover:text-primary-800 underline-offset-2 hover:underline"
+                      >
+                        Edit tenant defaults in Pipeline →
+                      </Link>
+                      {sessionPromptOverride !== null && (
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200">
+                          Session override active
+                        </span>
+                      )}
+                      {activeTemplateId && selectedTemplateId === activeTemplateId && sessionPromptOverride === null && (
+                        <span className="text-[10px] text-emerald-700">Tenant default template</span>
+                      )}
                       <label
                         className="flex items-center gap-2 cursor-pointer"
                         title="Edit prompt text for this session only (not saved to tenant config)"

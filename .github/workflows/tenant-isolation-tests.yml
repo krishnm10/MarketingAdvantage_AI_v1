@@ -1,4 +1,4 @@
-# Phase 7 — lightweight tenant correctness gates (no torch / vector DB required).
+# Full test suite + static analysis (Phase 1 CI gate).
 name: Tenant isolation (Phase 7)
 
 on:
@@ -6,8 +6,31 @@ on:
   pull_request:
 
 jobs:
-  pytest-tenant-core:
+  pytest-and-static:
     runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: mai
+          POSTGRES_PASSWORD: mai
+          POSTGRES_DB: mai_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U mai -d mai_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      PYTHONPATH: ${{ github.workspace }}
+      ENVIRONMENT: test
+      JWT_SECRET_KEY: ci_test_jwt_secret_key_0123456789abcdef0123456789abcdef
+      DATABASE_URL: postgresql+asyncpg://mai:mai@localhost:5432/mai_test
+      AUTH_USERS: '[{"username":"admin","password_sha256":"8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918","role":"admin"}]'
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,11 +38,31 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install pytest only
-        run: pip install "pytest>=8"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff bandit pip-audit
 
-      - name: Run tenant validator suite
-        working-directory: ${{ github.workspace }}
-        env:
-          PYTHONPATH: ${{ github.workspace }}
-        run: pytest tests/test_tenant_validator_phase7.py -q --tb=short
+      - name: Ruff (E,F,B,S)
+        run: ruff check app/ --select E,F,B,S
+
+      - name: Bandit (medium+)
+        run: bandit -r app/ -ll
+
+      - name: Run remediation + tenant gate tests (blocking)
+        run: |
+          pytest tests/test_tenant_validator_phase7.py \
+            tests/test_auth_api.py \
+            tests/test_rag_api_auth.py \
+            tests/test_rag_pipeline_query_e2e.py \
+            tests/test_pipeline_cache_eviction.py \
+            tests/test_chunk_reference_parity.py \
+            tests/test_tenant_corpus_erasure.py \
+            -q --tb=short
+
+      - name: Full suite (non-integration, blocking)
+        run: pytest tests/ -q --tb=short -m "not integration"
+
+      - name: pip-audit (advisory)
+        run: pip-audit -r requirements.txt || true

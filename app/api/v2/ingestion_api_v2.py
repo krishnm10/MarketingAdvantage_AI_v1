@@ -4,6 +4,7 @@
 # =============================================
 
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -19,6 +20,7 @@ from app.utils.tenant_validator import (
     get_storage_uuid_str,
     TenantValidationError,
 )
+from app.auth.guards import require_role
 import aiofiles
 import re
 import uuid
@@ -91,6 +93,7 @@ async def ingest_file(
         description="REQUIRED: Tenant / client identifier for tenant-scoped ingestion.",
     ),
     db: AsyncSession = Depends(get_db),
+    _user=Depends(require_role("admin")),
 ):
     """
     Handles ingestion of uploaded files (PDF, DOCX, CSV, TXT, etc.)
@@ -122,6 +125,23 @@ async def ingest_file(
                 "message": f"Duplicate detected. '{file.filename}' was already ingested.",
                 "details": response,
             }
+
+        if details_status == "queued":
+            file_id = response.get("file_id", "")
+            poll_url = response.get("poll_url") or f"/api/v2/ingestion/status/{file_id}"
+            body = {
+                "status": "queued",
+                "file_id": file_id,
+                "file_name": file.filename,
+                "message": f"File '{file.filename}' queued for async ingestion.",
+                "poll_url": poll_url,
+                "details": response,
+            }
+            return JSONResponse(
+                status_code=202,
+                content=body,
+                headers={"Location": poll_url},
+            )
 
         return {
             "status": "success",
@@ -333,6 +353,7 @@ async def ingest_media(
         max_length=64,
         description="REQUIRED: Tenant / client identifier for tenant-scoped media ingestion.",
     ),
+    _user=Depends(require_role("admin")),
 ):
     """
     Unified media ingestion endpoint with enterprise-grade deduplication.

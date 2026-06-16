@@ -122,10 +122,9 @@ async def retrieve_query(
         TenantValidationError,
     )
     from app.retrieval.components import (
-        resolve_config_or_fail,
+        resolve_client_config,
         resolve_runtime_components,
-        resolve_runtime_components_legacy,
-        instantiate_llm,
+        instantiate_llm_resolved,
     )
     from app.retrieval.runtime import RetrievalRuntime
     from app.retrieval.repository import RetrievalRepository
@@ -146,11 +145,8 @@ async def retrieve_query(
     # Storage UUID for vector/SQL filtering (Phase 2 will use this)
     _storage_uuid_str = get_storage_uuid_str(tenant_ctx)
 
-    _cfg_for_authoritative, runtime_mode = resolve_config_or_fail(retrieve_cid)
-    if _cfg_for_authoritative is not None:
-        rc = resolve_runtime_components(_cfg_for_authoritative)
-    else:
-        rc = resolve_runtime_components_legacy()
+    cfg = resolve_client_config(retrieve_cid)
+    rc = resolve_runtime_components(cfg)
 
     plog = PipelineLogger(
         request_path="retrieve_api",
@@ -200,9 +196,10 @@ async def retrieve_query(
                 llm_provider = _hyde_llm_provider()
                 if llm_provider == "google":
                     llm_provider = "gemini"
-                llm, _resolved = instantiate_llm(
+                llm, _resolved = await instantiate_llm_resolved(
                     llm_provider,
                     rc.llm_model,
+                    config=cfg,
                     api_key_env=rc.llm_api_key_env,
                     base_url=rc.llm_base_url,
                 )
@@ -227,17 +224,14 @@ async def retrieve_query(
         raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
 
     # Build repository aligned with merged Client JSON when authoritative
-    if runtime_mode == "authoritative_config" and _cfg_for_authoritative is not None:
-        from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
+    from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client_async
 
-        _pipe = get_query_pipeline_for_client(retrieve_cid)
-        repository = RetrievalRepository(
-            db_session=db,
-            vectordb=_pipe.vectordb,
-            collection=rc.collection,
-        )
-    else:
-        repository = RetrievalRepository(db_session=db)
+    _pipe = await get_query_pipeline_for_client_async(retrieve_cid)
+    repository = RetrievalRepository(
+        db_session=db,
+        vectordb=_pipe.vectordb,
+        collection=rc.collection or _pipe.config.vectordb.collection,
+    )
 
     runtime = RetrievalRuntime(
         repository=repository,
@@ -429,19 +423,26 @@ async def retrieve_query(
                     _llm_gen_start = time.perf_counter()
                     _llm = None
 
-                    if _llm_provider_name not in ("openai", "ollama", "groq", "grok", "gemini", "google", "anthropic"):
+                    _SUPPORTED_ANSWER_LLMS = (
+                        "openai", "ollama", "groq", "grok", "xai", "gemini", "google",
+                        "anthropic", "deepseek", "huggingface", "hf",
+                    )
+                    if _llm_provider_name not in _SUPPORTED_ANSWER_LLMS:
                         answer_error = (
                             f"LLM provider '{_llm_provider_name}' is not wired for answer generation. "
-                            "Supported: openai, ollama, groq, gemini, anthropic. "
+                            f"Supported: {_SUPPORTED_ANSWER_LLMS}. "
                             "Configure the LLM provider in Client JSON (RAG / pipeline-pluggable)."
                         )
                     else:
                         _prov = "gemini" if _llm_provider_name == "google" else _llm_provider_name
                         if _prov == "grok":
-                            _prov = "groq"
-                        _llm, answer_model = instantiate_llm(
+                            _prov = "xai"
+                        if _prov == "hf":
+                            _prov = "huggingface"
+                        _llm, answer_model = await instantiate_llm_resolved(
                             _prov,
                             rc.llm_model,
+                            config=cfg,
                             api_key_env=rc.llm_api_key_env,
                             base_url=rc.llm_base_url,
                         )
@@ -592,15 +593,11 @@ async def retrieve_pipeline_config(
     import os as _os
 
     from app.middleware.security_middleware import validate_business_id
-    from app.retrieval.components import (
-        resolve_config_or_fail,
-        resolve_runtime_components,
-        resolve_runtime_components_legacy,
-    )
+    from app.retrieval.components import resolve_client_config, resolve_runtime_components
 
     cid = validate_business_id(client_id or _os.getenv("MAI_DEFAULT_BUSINESS_ID"))
-    cfg, mode = resolve_config_or_fail(cid)
-    rc = resolve_runtime_components(cfg) if cfg is not None else resolve_runtime_components_legacy()
+    cfg = resolve_client_config(cid)
+    rc = resolve_runtime_components(cfg)
 
     llm_provider = (rc.llm_provider or "openai").lower()
     if llm_provider == "google":

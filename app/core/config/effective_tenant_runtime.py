@@ -1,8 +1,8 @@
 """
 Build ``EffectiveTenantRuntime`` — server-computed SSOT bridge per tenant.
 
-Cached by ``(client_id, config_fingerprint)``; invalidate via
-``invalidate_effective_tenant_runtime_cache`` on config writes.
+Cached by ``(client_id, config_store_version)``; invalidate via
+``ConfigChangeBus`` publishes or ``invalidate_effective_tenant_runtime_cache``.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from app.core.config.client_config_schema import (
     RetrievalState,
     StackProfile,
 )
+from app.core.config.config_change_bus import get_config_change_bus
+from app.core.config.config_store import get_config_store
 from app.core.config.reranker_config_coercion import (
     is_local_ollama_stack,
     resolve_reranker_runtime,
@@ -33,16 +35,15 @@ from app.core.prompts.ssot import prompt_ssot_to_state, resolve_prompt_ssot
 from app.retrieval.components import (
     _resolve_embedder_model,
     resolve_runtime_components,
-    resolve_runtime_components_legacy,
 )
 from app.utils.path_sanitizer import sanitize_client_id
 
 logger = logging.getLogger(__name__)
 
-# Tenant-scoped cache: client_id -> (config_fingerprint, runtime, cached_at_monotonic)
+# Tenant-scoped cache: client_id -> (config_version, runtime, cached_at_monotonic)
 _RUNTIME_CACHE: Dict[str, Tuple[str, EffectiveTenantRuntime, float]] = {}
 _CACHE_LOCK = threading.RLock()
-_DEFAULT_TTL_SECONDS = 300
+_BUS_SUBSCRIBED = False
 
 
 def _normalize_llm_provider(provider: str) -> str:
@@ -70,8 +71,6 @@ def _build_warnings(
     prompt_ssot: PromptSSOTState,
 ) -> List[str]:
     warnings: List[str] = []
-    if runtime_mode == "legacy_env_fallback":
-        warnings.append("Tenant JSON unavailable; using legacy env fallback snapshot.")
     if config.reranker and config.is_reranking_enabled():
         raw_type = config.reranker.type.value
         if raw_type != rr.coerced_type.value:
@@ -102,6 +101,23 @@ def _build_warnings(
     return warnings
 
 
+def _on_config_change(client_id: str, version: str) -> None:
+    invalidate_effective_tenant_runtime_cache(client_id)
+    logger.debug(
+        "[EffectiveTenantRuntime] Bus invalidation client_id=%r version=%s",
+        client_id,
+        version,
+    )
+
+
+def _ensure_bus_subscribed() -> None:
+    global _BUS_SUBSCRIBED
+    if _BUS_SUBSCRIBED:
+        return
+    get_config_change_bus().subscribe(_on_config_change)
+    _BUS_SUBSCRIBED = True
+
+
 def invalidate_effective_tenant_runtime_cache(client_id: Optional[str] = None) -> None:
     """
     Drop cached effective runtime snapshot(s).
@@ -122,43 +138,37 @@ def invalidate_effective_tenant_runtime_cache(client_id: Optional[str] = None) -
             )
 
 
-def build_effective_tenant_runtime(
+def get_effective_tenant_runtime(
     client_id: str,
     *,
     skip_cache: bool = False,
-    ttl_seconds: int = _DEFAULT_TTL_SECONDS,
 ) -> EffectiveTenantRuntime:
     """
-    Compute immutable effective runtime for a tenant (no session overrides).
+    Return the effective runtime for a tenant, using version-aware caching.
 
-    Results are cached keyed by ``config_fingerprint`` until TTL expiry or explicit
-    invalidation (e.g. rag_config_api pipeline writes).
+    Compares ``ConfigStore.get_version(client_id)`` against the cached version.
+    On mismatch (or missing entry), rebuilds and refreshes the cache.
     """
+    _ensure_bus_subscribed()
     safe_id = sanitize_client_id(client_id)
-    fingerprint_for_cache: Optional[str] = None
+    store = get_config_store()
 
     if not skip_cache:
-        try:
-            cfg_probe = get_client_config(safe_id)
-            fingerprint_for_cache = get_config_fingerprint(cfg_probe)
-        except Exception:
-            fingerprint_for_cache = None
-
-        if fingerprint_for_cache:
-            now = time.monotonic()
-            with _CACHE_LOCK:
-                entry = _RUNTIME_CACHE.get(safe_id)
-                if entry is not None:
-                    fp, cached_rt, cached_at = entry
-                    if fp == fingerprint_for_cache and (now - cached_at) < ttl_seconds:
-                        return cached_rt.model_copy(deep=True)
+        version = store.get_version(safe_id)
+        with _CACHE_LOCK:
+            entry = _RUNTIME_CACHE.get(safe_id)
+            if entry is not None:
+                cached_version, cached_rt, _cached_at = entry
+                if cached_version == version:
+                    return cached_rt.model_copy(deep=True)
 
     runtime = _build_effective_tenant_runtime_uncached(safe_id)
 
-    if not skip_cache and fingerprint_for_cache:
+    if not skip_cache:
+        version = store.get_version(safe_id)
         with _CACHE_LOCK:
             _RUNTIME_CACHE[safe_id] = (
-                fingerprint_for_cache,
+                version,
                 runtime.model_copy(deep=True),
                 time.monotonic(),
             )
@@ -166,31 +176,27 @@ def build_effective_tenant_runtime(
     return runtime
 
 
+def build_effective_tenant_runtime(
+    client_id: str,
+    *,
+    skip_cache: bool = False,
+    ttl_seconds: int = 300,
+) -> EffectiveTenantRuntime:
+    """
+    Backward-compatible alias for :func:`get_effective_tenant_runtime`.
+
+    ``ttl_seconds`` is ignored; invalidation is driven by ConfigStore version keys.
+    """
+    del ttl_seconds
+    return get_effective_tenant_runtime(client_id, skip_cache=skip_cache)
+
+
 def _build_effective_tenant_runtime_uncached(client_id: str) -> EffectiveTenantRuntime:
     """Uncached builder — used internally and for tests."""
+    config = get_client_config(client_id)
+    rc = resolve_runtime_components(config)
+    fingerprint = get_config_fingerprint(config)
     runtime_mode = "authoritative_config"
-    config: Optional[ClientConfig] = None
-
-    try:
-        config = get_client_config(client_id)
-        rc = resolve_runtime_components(config)
-        fingerprint = get_config_fingerprint(config)
-    except Exception as exc:
-        logger.warning(
-            "[EffectiveTenantRuntime] Failed to load config for %r: %s",
-            client_id,
-            exc,
-        )
-        runtime_mode = "legacy_env_fallback"
-        rc = resolve_runtime_components_legacy()
-        fingerprint = rc.config_fingerprint
-        try:
-            config = get_client_config("default")
-        except Exception:
-            config = None
-
-    if config is None:
-        return _legacy_shell_runtime(client_id, rc, runtime_mode)
 
     rr = resolve_reranker_runtime(config)
     prompt_res = resolve_prompt_ssot(config)
@@ -229,8 +235,6 @@ def _build_effective_tenant_runtime_uncached(client_id: str) -> EffectiveTenantR
 
     effective_provider = _normalize_llm_provider(rc.llm_provider)
     effective_model = rc.llm_model or "none"
-    if runtime_mode == "legacy_env_fallback":
-        llm_source = "legacy_env_fallback"
 
     llm_state = LLMState(
         configured_provider=configured_provider,
@@ -294,53 +298,4 @@ def _build_effective_tenant_runtime_uncached(client_id: str) -> EffectiveTenantR
         prompt_node=prompt_node,
         features=features,
         warnings=warnings,
-    )
-
-
-def _legacy_shell_runtime(client_id: str, rc, runtime_mode: str) -> EffectiveTenantRuntime:
-    """Minimal runtime when no ClientConfig can be loaded."""
-    empty_prompt = PromptSSOTState(
-        effective_template_id=None,
-        source="default_builtin",
-        configured_prompt_type=None,
-        library_found=False,
-        preview=None,
-        legacy_inline_detected=False,
-    )
-    return EffectiveTenantRuntime(
-        client_id=client_id,
-        fingerprint=rc.config_fingerprint,
-        runtime_mode=runtime_mode,
-        stack_profile="mixed",
-        embedder=EmbedderState(type=rc.embedder_type, model=rc.embedder_model, locked=True),
-        llm=LLMState(
-            configured_provider=None,
-            configured_model=None,
-            effective_provider=_normalize_llm_provider(rc.llm_provider),
-            effective_model=rc.llm_model or "none",
-            source="legacy_env_fallback",
-        ),
-        reranker=RerankerState(
-            configured_type=None,
-            configured_model=None,
-            effective_plugin=rc.reranker_name,
-            effective_model=rc.reranker_model or None,
-            coercion_applied=False,
-            coercion_reason=None,
-        ),
-        retrieval=RetrievalState(
-            search_mode=rc.search_mode,
-            top_k_retrieval=rc.top_k_retrieval,
-            top_k_final=rc.top_k_final,
-            enable_hyde=rc.enable_hyde,
-            prompt_template_id=None,
-            prompt_ssot=empty_prompt,
-        ),
-        prompt_node=PromptNodeState(
-            enabled=False,
-            configured_prompt_type=None,
-            effective_template_id=None,
-        ),
-        features=FeatureFlagsSnapshot(),
-        warnings=["No tenant ClientConfig available."],
     )

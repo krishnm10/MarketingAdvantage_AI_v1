@@ -1,15 +1,19 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import timedelta
+from typing import Optional
 import hashlib
 import hmac
 import json
 import logging
 import os
-from app.db.session_v2 import get_db
+from app.auth.cookies import attach_auth_cookies, clear_auth_cookies
+from app.auth.deps import get_current_user
 from app.auth.generate_token import create_access_token, verify_access_token
+from app.auth.guards import require_role
+from app.utils.path_sanitizer import sanitize_client_id
 
 logger = logging.getLogger(__name__)
 
@@ -89,13 +93,45 @@ class TokenResponse(BaseModel):
     token_type: str
     username: str
     role: str
+    client_id: Optional[str] = None
+
+
+class TenantScopeRequest(BaseModel):
+    client_id: str
+
+
+class MeResponse(BaseModel):
+    username: str
+    role: str
+    client_id: Optional[str] = None
+
+
+def _token_response_body(user: dict, token: str, client_id: Optional[str] = None) -> dict:
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": user["username"],
+        "role": user["role"],
+        "client_id": client_id,
+    }
+
+
+def _auth_json_response(user: dict, token: str, client_id: Optional[str] = None) -> JSONResponse:
+    body = _token_response_body(user, token, client_id=client_id)
+    response = JSONResponse(content=body)
+    attach_auth_cookies(
+        response,
+        token,
+        max_age_seconds=ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
+    return response
 
 
 # -----------------------------------------------------------
 # LOGIN ENDPOINT
 # -----------------------------------------------------------
 @router.post("/login", response_model=TokenResponse)
-async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
+async def login(payload: LoginRequest):
     """
     Validate username & password (temporary in-memory user check)
     Returns a JWT token for session authentication.
@@ -109,12 +145,31 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": user["username"],
-        "role": user["role"],
-    }
+    return _auth_json_response(user, token)
+
+
+# -----------------------------------------------------------
+# TENANT SCOPE — embed client_id in JWT for tenant-scoped APIs
+# -----------------------------------------------------------
+@router.post("/tenant-scope", response_model=TokenResponse)
+async def bind_tenant_scope(
+    payload: TenantScopeRequest,
+    user=Depends(require_role("admin")),
+):
+    """
+    Issue a new JWT that includes ``client_id`` for tenant-scoped admin APIs
+    (e.g. secrets configuration). Admin role required.
+    """
+    cid = sanitize_client_id(payload.client_id.strip())
+    if not cid:
+        raise HTTPException(status_code=400, detail="client_id is required")
+
+    token = create_access_token(
+        data={"sub": user["sub"], "role": user["role"], "client_id": cid},
+        expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
+    )
+    scoped_user = {"username": user["sub"], "role": user["role"]}
+    return _auth_json_response(scoped_user, token, client_id=cid)
 
 
 # -----------------------------------------------------------
@@ -135,16 +190,27 @@ async def get_token(form_data: OAuth2PasswordRequestForm = Depends()):
         data={"sub": user["username"], "role": user["role"]},
         expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES),
     )
+    return _auth_json_response(user, token)
+
+
+@router.get("/me", response_model=MeResponse)
+async def me(user=Depends(get_current_user)):
+    """Return the authenticated principal (cookie or Bearer)."""
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": user["username"],
-        "role": user["role"],
+        "username": user.get("sub", ""),
+        "role": user.get("role", "viewer"),
+        "client_id": user.get("client_id"),
     }
 
 
-# -----------------------------------------------------------
-# VERIFY TOKEN ENDPOINT
+@router.post("/logout")
+async def logout():
+    """Clear httpOnly session cookies."""
+    response = JSONResponse(content={"ok": True})
+    clear_auth_cookies(response)
+    return response
+
+
 # -----------------------------------------------------------
 @router.get("/verify-token")
 async def verify_token(token: str):

@@ -1,27 +1,29 @@
 {
   "client_id": "default",
-  "client_name": "Default",
+  "client_name": "tenant1",
   "version": "1.0",
   "vectordb": {
     "type": "chroma",
-    "collection": "ingested_content",
+    "collection": "ingested_content_tenant1",
     "chroma": {
-      "persist_directory": "./pluggable_db",
+      "persist_directory": "./pluggable_tenant1",
       "host": null,
       "port": 8000,
       "ssl": false,
-      "api_key_env": null,
       "tenant": "default_tenant",
       "database": "default_database",
       "anonymized_telemetry": false
     }
   },
   "embedder": {
-    "type": "gemini",
-    "gemini": {
-      "model": "gemini-embedding-2",
-      "api_key_env": "GOOGLE_API_KEY"
-    }
+    "type": "huggingface",
+    "huggingface": {
+      "model": "nomic-ai/nomic-embed-text-v1.5",
+      "device": "auto",
+      "trust_remote_code": true
+    },
+    "query_prefix": "search_query: ",
+    "document_prefix": "search_document: "
   },
   "retrieval": {
     "search_mode": "hybrid",
@@ -74,7 +76,7 @@
     },
     "deduplication": {
       "enable_hash_dedup": true,
-      "enable_embedding_dedup": true,
+      "enable_embedding_dedup": false,
       "enable_gci_dedup": true,
       "similarity_threshold": 0.95,
       "l3_redis_threshold": 500,
@@ -98,18 +100,19 @@
   },
   "llm": {
     "single": {
-      "type": "gemini",
-      "model": "gemini-2.5-flash",
-      "api_key_env": "GOOGLE_API_KEY",
-      "base_url": "https://generativelanguage.googleapis.com/v1",
+      "type": "huggingface",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "secret_ref": {
+        "uri": "env://HF_TOKEN"
+      },
+      "base_url": "https://router.huggingface.co/v1",
       "temperature": 0.3,
       "max_tokens": 1024
     }
   },
   "reranker": {
-    "type": "flashrank",
-    "model": "ms-marco-MiniLM-L-12-v2",
-    "api_key_env": null,
+    "type": "crossencoder",
+    "model": "cross-encoder/ms-marco-MiniLM-L-12-v2",
     "top_k": 5
   },
   "security": {
@@ -142,5 +145,13 @@
     "enabled": true,
     "truncation_strategy": "least_relevant",
     "response_reserve_tokens": 1024
+  },
+  "secrets_backend": {
+    "provider": "hashicorp_vault",
+    "vault_addr": "http://127.0.0.1:8200",
+    "mount_path": "secret",
+    "role_id": "Root",
+    "vault_token": "hvs.rTQsxkx7F6RuFgMrlrzdgjLv",
+    "enforce_tenant_path": true
   }
 }

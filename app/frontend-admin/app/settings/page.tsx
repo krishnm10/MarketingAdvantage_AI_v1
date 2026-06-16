@@ -9,7 +9,6 @@ import {
   Brain,
   Zap,
   HardDrive,
-  Clock,
   Shield,
   Globe,
   Image,
@@ -93,8 +92,6 @@ const CATEGORIES: Category[] = [
   { id: "observability", label: "Observability",            icon: Activity,     color: "text-cyan-600" },
   { id: "security",      label: "Security & App",           icon: Shield,       color: "text-red-600" },
 ];
-
-const DEFAULT_PIPELINE_TENANT = process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default";
 
 interface PipelineIdentitySummary {
   client_id: string;
@@ -742,24 +739,6 @@ const SECTIONS: ConfigSection[] = [
     keys: [
       { key: "CORS_ORIGINS", label: "Allowed Origins", placeholder: "* or comma-separated URLs", tooltip: "Which domains can make API requests. '*' allows all (development only). In production, list specific origins (e.g. https://yourdomain.com)." },
       { key: "VITE_API_URL", label: "Frontend API URL", type: "url", tooltip: "Base URL the frontend uses to call the backend API. Must include protocol and port (e.g. http://localhost:8000). Change when deploying." },
-    ],
-  },
-  {
-    category: "security",
-    title: "Validation Scheduler",
-    description: "Background validation workers and intervals",
-    icon: Clock,
-    gradient: "from-amber-500 to-amber-700 shadow-amber-600/20",
-    keys: [
-      { key: "ENABLE_VALIDATION", label: "Validation Worker", type: "boolean", tooltip: "Enable the background validation worker that periodically checks ingested content for integrity issues (hash mismatches, missing vectors)." },
-      { key: "ENABLE_CONFLICT", label: "Conflict Detection", type: "boolean", tooltip: "Enable background detection of conflicting content — documents that contain contradictory information about the same topic." },
-      { key: "ENABLE_TEMPORAL", label: "Temporal Worker", type: "boolean", tooltip: "Enable detection of outdated content based on timestamps. Flags documents that may contain stale information." },
-      { key: "VALIDATION_INTERVAL", label: "Validation Interval (sec)", type: "number", tooltip: "Seconds between validation worker runs. Lower = more frequent checks but more CPU/DB load." },
-      { key: "CONFLICT_INTERVAL", label: "Conflict Interval (sec)", type: "number", tooltip: "Seconds between conflict detection runs. Conflict detection compares document pairs, so it can be CPU-intensive at scale." },
-      { key: "TEMPORAL_INTERVAL", label: "Temporal Interval (sec)", type: "number", tooltip: "Seconds between temporal staleness checks. Scans documents for date-related content that may be expired." },
-      { key: "VALIDATION_BATCH_SIZE", label: "Validation Batch", type: "number", tooltip: "Number of documents processed per validation run. Larger batches catch more issues per cycle but take longer." },
-      { key: "CONFLICT_BATCH_SIZE", label: "Conflict Batch", type: "number", tooltip: "Number of document pairs compared per conflict detection run. Keep moderate to avoid long-running queries." },
-      { key: "TEMPORAL_BATCH_SIZE", label: "Temporal Batch", type: "number", tooltip: "Number of documents scanned per temporal check run. Higher = more thorough per cycle." },
     ],
   },
 ];
@@ -1730,11 +1709,6 @@ export default function SettingsPage() {
   const llm = pipelineIdentity?.llm || "—";
   const celeryOn = config["CELERY_ENABLED"] === "true";
   const celeryBroker = config["CELERY_BROKER"] || "redis";
-  const workersActive = [
-    config["ENABLE_VALIDATION"],
-    config["ENABLE_CONFLICT"],
-    config["ENABLE_TEMPORAL"],
-  ].filter((v) => v === "true").length;
 
   /* ── Toast auto-dismiss ── */
   useEffect(() => {
@@ -1745,6 +1719,21 @@ export default function SettingsPage() {
 
   return (
     <div className="space-y-5">
+      <div
+        className="rounded-xl border border-amber-200 bg-amber-50 px-5 py-4 text-sm text-amber-900"
+        role="alert"
+      >
+        <p className="font-semibold">Legacy Configuration</p>
+        <p className="mt-1 text-amber-800">
+          This page edits system <code className="text-xs bg-amber-100 rounded px-1">.env</code> values and is
+          being phased out. Use{" "}
+          <Link href={pipelineSettingsHref(clientId)} className="font-semibold underline">
+            Pipeline Builder
+          </Link>{" "}
+          for tenant pipeline settings. This page will be removed in a future release.
+        </p>
+      </div>
+
       {/* ── Pipeline Builder Banner ── */}
       <Link
         href={pipelineSettingsHref(clientId)}
@@ -1765,7 +1754,7 @@ export default function SettingsPage() {
           </div>
         </div>
         <div className="flex items-center gap-1 text-xs font-semibold text-primary-600 group-hover:gap-2 transition-all">
-          Open Builder <ArrowRight className="h-4 w-4" />
+          Open Pipeline Builder <ArrowRight className="h-4 w-4" />
         </div>
       </Link>
 
@@ -1983,7 +1972,7 @@ export default function SettingsPage() {
       {/* ── Quick Summary ── */}
       {!loading && (
         <>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
           <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
             <p className="text-lg font-bold text-primary-600 capitalize">{vectorDb}</p>
             <p className="text-[11px] text-slate-400 mt-0.5">Vector DB</p>
@@ -2001,10 +1990,6 @@ export default function SettingsPage() {
               {celeryOn ? celeryBroker : "Off"}
             </p>
             <p className="text-[11px] text-slate-400 mt-0.5">Task Queue</p>
-          </div>
-          <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
-            <p className="text-lg font-bold text-emerald-600">{workersActive}</p>
-            <p className="text-[11px] text-slate-400 mt-0.5">Workers Active</p>
           </div>
           <div className="rounded-xl border border-slate-200/60 bg-white p-3.5 shadow-card text-center">
             <p className={cn("text-lg font-bold", config["SENTRY_DSN"] ? "text-purple-600" : "text-slate-400")}>

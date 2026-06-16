@@ -2,12 +2,18 @@
 # app/api/v2/ingestion_admin_api.py
 # =============================================
 import asyncio
+import logging
+import os
+from collections import Counter
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import or_, select
+from sqlalchemy import delete, func, or_, select
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from app.db.models.admin_audit_log import AdminAuditLog
 from app.db.models.ingested_file_v2 import IngestedFileV2
@@ -16,7 +22,12 @@ from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 
 # ✅ PERMANENT FIX: removed get_embedder, get_chroma_collection
 # Use _get_pipeline() directly — works with ANY backend (Chroma, Qdrant, Milvus...)
-from app.services.ingestion.ingestion_service_v2 import IngestionServiceV2, _get_pipeline, _normalize_business_id
+from app.services.ingestion.ingestion_service_v2 import (
+    IngestionServiceV2,
+    _get_pipeline,
+    _get_ingestion_pipeline_async,
+    _normalize_business_id,
+)
 from app.services.ingestion.ingestion_orchestrator import IngestionOrchestrator
 from app.services.ingestion.tenant_guard import resolve_tenant_from_db_record
 from app.llm.llm_client import run_llm_normalization
@@ -249,6 +260,113 @@ async def retry_ingestion(
     )
     return {"status": "retry_started", "file_id": file_id, "tenant_id": tenant_ctx.tenant_id}
 
+
+# ===========================================================
+# 4b️⃣  DELETE SINGLE INGESTED FILE
+# ===========================================================
+@router.delete("/files/{file_id}")
+async def delete_ingested_file(
+    file_id: str,
+    tenant_id: str = Query(
+        ...,
+        min_length=1,
+        max_length=64,
+        description="REQUIRED: Tenant identifier to scope file deletion.",
+    ),
+    db: AsyncSession = Depends(get_db),
+    _user=Depends(require_role("admin")),
+):
+    """Remove one ingested file, its chunks, vectors, and optional disk copy. Admin only."""
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            tenant_id,
+            source="query",
+            endpoint="ingestion_admin_delete_file",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    file_record = await db.get(IngestedFileV2, file_id)
+    if not file_record:
+        raise HTTPException(status_code=404, detail="File not found")
+    _assert_filescoped_to_tenant(file_record, tenant_ctx)
+
+    chunk_rows = (
+        await db.execute(
+            select(IngestedContentV2).where(IngestedContentV2.file_id == file_id)
+        )
+    ).scalars().all()
+
+    semantic_hashes = list(
+        dict.fromkeys(
+            str(c.semantic_hash) for c in chunk_rows if c.semantic_hash
+        )
+    )
+    gci_counts = Counter(
+        c.global_content_id for c in chunk_rows if c.global_content_id
+    )
+
+    deleted_vectors = 0
+    if semantic_hashes:
+        try:
+            pipeline = await _get_ingestion_pipeline_async(tenant_ctx.tenant_id)
+            deleted_vectors = await asyncio.to_thread(
+                pipeline.vectordb.delete_many,
+                collection=pipeline.config.vectordb.collection,
+                doc_ids=semantic_hashes,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Vector delete failed for file_id=%s: %s", file_id, exc
+            )
+
+    await db.execute(
+        delete(IngestedContentV2).where(IngestedContentV2.file_id == file_id)
+    )
+
+    for global_content_id, decrement in gci_counts.items():
+        row = await db.get(GlobalContentIndexV2, global_content_id)
+        if not row:
+            continue
+        remaining_refs_result = await db.execute(
+            select(func.count())
+            .select_from(IngestedContentV2)
+            .where(IngestedContentV2.global_content_id == global_content_id)
+        )
+        remaining_refs = int(remaining_refs_result.scalar() or 0)
+        next_occurrence = max(0, int(row.occurrence_count or 0) - decrement)
+        if remaining_refs == 0 and (
+            next_occurrence == 0
+            or str(row.first_seen_file_id or "") == str(file_id)
+        ):
+            await db.delete(row)
+            continue
+
+        row.occurrence_count = max(
+            remaining_refs, next_occurrence, 1 if remaining_refs > 0 else 0
+        )
+        row.updated_at = datetime.utcnow()
+
+    if file_record.file_path and os.path.isfile(file_record.file_path):
+        try:
+            os.remove(file_record.file_path)
+        except OSError as exc:
+            logger.warning(
+                "Failed to remove file %s: %s", file_record.file_path, exc
+            )
+
+    await db.delete(file_record)
+    await db.commit()
+
+    return {
+        "status": "deleted",
+        "file_id": file_id,
+        "tenant_id": tenant_ctx.tenant_id,
+        "deleted_chunks": len(chunk_rows),
+        "deleted_vectors": deleted_vectors,
+    }
+
+
 # ===========================================================
 # 5️⃣  CHUNK EDIT / LLM NORMALIZATION
 # ===========================================================
@@ -383,4 +501,99 @@ async def update_chunk(
         "llm_mode":      payload.llm_mode,
         "vectordb_used": vectordb.kind,
         "embedder_used": embedder.kind,
+    }
+
+
+BATCH_ERASE_SIZE = 1000
+
+
+@router.delete("/tenant/{tenant_id}/corpus")
+async def erase_tenant_corpus(
+    tenant_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user=Depends(require_role("admin")),
+):
+    """
+    GDPR right-to-erasure for a tenant corpus.
+
+    Deletes vectors via batched ``delete_many`` over PG-sourced chunk IDs —
+    never ``delete_collection`` (shared-collection backends would wipe all tenants).
+    """
+    try:
+        tenant_ctx = validate_tenant_id_strict(
+            tenant_id, source="path", endpoint="erase_tenant_corpus",
+        )
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    storage_uid = get_storage_uuid(tenant_ctx)
+    storage_uid_str = str(storage_uid)
+
+    pipeline = _get_pipeline(tenant_ctx.tenant_id)
+    collection = pipeline.config.vectordb.collection
+    vectordb = pipeline.vectordb
+
+    deleted_chunks = 0
+    failed_chunks = 0
+    offset = 0
+
+    while True:
+        chunk_rows = (
+            await db.execute(
+                select(IngestedContentV2.id)
+                .where(IngestedContentV2.business_id == storage_uid)
+                .limit(BATCH_ERASE_SIZE)
+                .offset(offset)
+            )
+        ).scalars().all()
+        if not chunk_rows:
+            break
+
+        ids = [str(cid) for cid in chunk_rows]
+        try:
+            deleted_chunks += await asyncio.to_thread(
+                vectordb.delete_many,
+                collection=collection,
+                doc_ids=ids,
+            )
+        except Exception as exc:
+            failed_chunks += len(ids)
+            logger.error(
+                "Erasure batch failed tenant=%s ids=%s error=%s",
+                tenant_ctx.tenant_id,
+                ids,
+                exc,
+            )
+        offset += BATCH_ERASE_SIZE
+
+    file_rows = (
+        await db.execute(
+            select(IngestedFileV2).where(IngestedFileV2.business_id == storage_uid)
+        )
+    ).scalars().all()
+    for row in file_rows:
+        if row.file_path and os.path.isfile(row.file_path):
+            try:
+                os.remove(row.file_path)
+            except OSError as exc:
+                logger.warning("Failed to remove file %s: %s", row.file_path, exc)
+
+    await db.execute(
+        delete(IngestedContentV2).where(IngestedContentV2.business_id == storage_uid)
+    )
+    await db.execute(
+        delete(GlobalContentIndexV2).where(
+            GlobalContentIndexV2.business_id == storage_uid
+        )
+    )
+    await db.execute(
+        delete(IngestedFileV2).where(IngestedFileV2.business_id == storage_uid)
+    )
+    await db.commit()
+
+    return {
+        "tenant_id": tenant_ctx.tenant_id,
+        "deleted_chunks": deleted_chunks,
+        "failed_chunks": failed_chunks,
+        "deleted_files": len(file_rows),
     }

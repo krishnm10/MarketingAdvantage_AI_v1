@@ -32,7 +32,10 @@ def test_matha_ollama_stack_profile(matha_runtime):
 
 
 def test_matha_prompt_library_ssot(matha_runtime):
-    assert matha_runtime.retrieval.prompt_template_id == "querysystem"
+    cfg = get_client_config("matha")
+    res = resolve_prompt_ssot(cfg)
+    assert matha_runtime.retrieval.prompt_template_id == cfg.retrieval.prompt_template_id
+    assert matha_runtime.retrieval.prompt_template_id == res.effective_template_id
     assert matha_runtime.retrieval.prompt_ssot.library_found
     assert matha_runtime.retrieval.prompt_ssot.source == "library"
     preview = matha_runtime.retrieval.prompt_ssot.preview
@@ -65,5 +68,5 @@ def test_resolve_prompt_ssot_library_priority():
     cfg = get_client_config("matha")
     res = resolve_prompt_ssot(cfg)
     assert res.source == "library"
-    assert res.effective_template_id == "querysystem"
+    assert res.effective_template_id == cfg.retrieval.prompt_template_id
     assert res.instructions

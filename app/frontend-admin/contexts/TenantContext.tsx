@@ -7,12 +7,16 @@ import {
   useEffect,
   useCallback,
   useMemo,
+  useRef,
   type ReactNode,
 } from "react";
 import { useSearchParams, usePathname } from "next/navigation";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
 import { useDebounce } from "@/lib/useDebounce";
+import { FALLBACK_TENANT_ID } from "@/lib/defaultTenantId";
+import { useAuth } from "@/lib/useAuth";
+import { bindTenantScope } from "@/lib/tenantScope";
 
 // =============================================================================
 // Types
@@ -34,6 +38,11 @@ export interface TenantContextValue {
   clientIdInput: string;
   /** Update tenant id (updates input immediately; APIs see debounced value). */
   setClientId: (id: string) => void;
+  /**
+   * Monotonic key that increments whenever the active debounced tenant changes.
+   * Use as a React `key` on layout shells to force a clean remount.
+   */
+  tenantVersion: number;
   /** List of available tenants from backend */
   tenants: TenantInfo[];
   /** Whether tenant list is loading */
@@ -42,6 +51,8 @@ export interface TenantContextValue {
   tenantError: string | null;
   /** Refresh tenant list from backend */
   refreshTenants: () => Promise<void>;
+  /** True once client_id has been resolved from URL / storage / fallback. */
+  tenantReady: boolean;
 }
 
 // =============================================================================
@@ -49,8 +60,17 @@ export interface TenantContextValue {
 // =============================================================================
 
 const STORAGE_KEY = "mai_admin_tenant";
-const DEFAULT_TENANT = process.env.NEXT_PUBLIC_DEFAULT_TENANT ?? "default";
 const TENANT_DEBOUNCE_MS = 500;
+export const TENANT_CHANGED_EVENT = "mai:tenant-changed";
+
+function dispatchTenantChanged(clientId: string, tenantVersion: number): void {
+  if (typeof window === "undefined") return;
+  window.dispatchEvent(
+    new CustomEvent(TENANT_CHANGED_EVENT, {
+      detail: { clientId, tenantVersion },
+    })
+  );
+}
 
 // =============================================================================
 // Context
@@ -63,16 +83,33 @@ const TenantContext = createContext<TenantContextValue | null>(null);
 // =============================================================================
 
 export function TenantProvider({ children }: { children: ReactNode }) {
+  const { isAuthenticated } = useAuth();
   const searchParams = useSearchParams();
   const pathname = usePathname();
 
-  const [clientIdInput, setClientIdInput] = useState<string>(DEFAULT_TENANT);
+  const [clientIdInput, setClientIdInput] = useState<string>(FALLBACK_TENANT_ID);
   const clientId = useDebounce(clientIdInput, TENANT_DEBOUNCE_MS);
 
   const [tenants, setTenants] = useState<TenantInfo[]>([]);
   const [loadingTenants, setLoadingTenants] = useState(true);
   const [tenantError, setTenantError] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
+  const [tenantVersion, setTenantVersion] = useState(0);
+  const prevClientIdRef = useRef<string | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Bump tenant version + broadcast when debounced tenant id changes
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!initialized) return;
+    if (prevClientIdRef.current === clientId) return;
+    prevClientIdRef.current = clientId;
+    setTenantVersion((v) => {
+      const next = v + 1;
+      dispatchTenantChanged(clientId, next);
+      return next;
+    });
+  }, [clientId, initialized]);
 
   // ---------------------------------------------------------------------------
   // Initialize clientId from URL -> localStorage -> default
@@ -101,7 +138,7 @@ export function TenantProvider({ children }: { children: ReactNode }) {
       }
     } catch {}
 
-    setClientIdInput(DEFAULT_TENANT);
+    setClientIdInput(FALLBACK_TENANT_ID);
     setInitialized(true);
   }, [searchParams, initialized]);
 
@@ -125,7 +162,7 @@ export function TenantProvider({ children }: { children: ReactNode }) {
   // Set clientId with immediate input update
   // ---------------------------------------------------------------------------
   const setClientId = useCallback((newId: string) => {
-    const trimmed = newId.trim() || DEFAULT_TENANT;
+    const trimmed = newId.trim() || FALLBACK_TENANT_ID;
     setClientIdInput(trimmed);
   }, []);
 
@@ -186,6 +223,17 @@ export function TenantProvider({ children }: { children: ReactNode }) {
     refreshTenants();
   }, [refreshTenants]);
 
+  // Re-issue JWT with client_id when active tenant changes (debounced).
+  useEffect(() => {
+    if (!isAuthenticated || !clientId) return;
+
+    const timer = window.setTimeout(() => {
+      void bindTenantScope(clientId);
+    }, 400);
+
+    return () => window.clearTimeout(timer);
+  }, [clientId, isAuthenticated]);
+
   const routeTenantFromPath = useMemo(() => {
     const m = pathname?.match(/^\/dashboard\/multi-customer-rag\/([^/]+)$/);
     if (!m?.[1]) return null;
@@ -213,10 +261,12 @@ export function TenantProvider({ children }: { children: ReactNode }) {
     clientId,
     clientIdInput,
     setClientId,
+    tenantVersion,
     tenants: tenantsMerged,
     loadingTenants,
     tenantError,
     refreshTenants,
+    tenantReady: initialized,
   };
 
   return (

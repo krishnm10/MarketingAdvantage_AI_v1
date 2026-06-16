@@ -71,7 +71,14 @@ async def run_cli(client_id: str):
     print("Type 'exit' to quit\n")
 
     async with get_async_session() as db:
-        repository = RetrievalRepository(db_session=db)
+        from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
+
+        pipe = get_query_pipeline_for_client(client_id)
+        repository = RetrievalRepository(
+            db_session=db,
+            vectordb=pipe.vectordb,
+            collection=pipe.config.vectordb.collection,
+        )
 
         runtime = RetrievalRuntime(
             repository=repository,

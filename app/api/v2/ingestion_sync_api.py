@@ -20,8 +20,9 @@ from app.auth.guards import require_role
 from app.db.session_v2 import get_db
 from app.db.models.global_content_index_v2 import GlobalContentIndexV2
 from app.services.ingestion.ingestion_service_v2 import (
-    get_chroma_collection,
-    get_embedder,
+    get_chroma_collection_async,
+    get_embedder_async,
+    _CollectionAdapter,
 )
 
 router = APIRouter(
@@ -32,10 +33,13 @@ router = APIRouter(
 BATCH_SIZE = 500  # Check IDs in batches to avoid oversized requests
 
 
-def _get_vectordb_and_collection():
-    """Get the pluggable vectordb instance and collection name."""
+async def _get_vectordb_and_collection():
+    """Open the tenant vector store via async pipeline build (safe inside FastAPI event loop)."""
     try:
-        _, adapter = get_chroma_collection()
+        _, adapter = await get_chroma_collection_async()
+        vectordb = adapter._vdb
+        collection = adapter.name
+        return vectordb, collection, adapter
     except HTTPException:
         raise
     except Exception as e:
@@ -47,10 +51,6 @@ def _get_vectordb_and_collection():
                 f"{e}"
             ),
         ) from e
-    # The adapter wraps a BaseVectorDB — extract for direct API calls
-    vectordb = adapter._vdb
-    collection = adapter.name
-    return vectordb, collection
 
 
 async def _batch_exists(vectordb, collection: str, all_ids: list) -> set:
@@ -67,12 +67,11 @@ async def _batch_exists(vectordb, collection: str, all_ids: list) -> set:
     return existing
 
 
-async def _bulk_list_ids(vectordb, collection: str):
+async def _bulk_list_ids(adapter: _CollectionAdapter):
     """
     Return all vector IDs if the backend exposes bulk listing.
     Falls back to None when unsupported.
     """
-    _, adapter = get_chroma_collection()
     loop = asyncio.get_running_loop()
     try:
         all_data = await loop.run_in_executor(
@@ -97,7 +96,7 @@ async def detect_orphans(
     Works with ALL vector backends.
     Read-only. No mutations.
     """
-    vectordb, collection = _get_vectordb_and_collection()
+    vectordb, collection, adapter = await _get_vectordb_and_collection()
 
     backend = vectordb.kind
 
@@ -130,7 +129,7 @@ async def detect_orphans(
 
     # 4. Compute drift
     db_without_vdb = sorted(db_hashes - existing_in_vdb)
-    vdb_ids = await _bulk_list_ids(vectordb, collection)
+    vdb_ids = await _bulk_list_ids(adapter)
     vectordb_without_db = sorted(vdb_ids - db_hashes) if vdb_ids is not None else []
     # Approximate vector orphans only when bulk listing is unavailable
     estimated_vdb_orphans = (
@@ -170,15 +169,14 @@ async def fix_vectordb_to_db(
     which is efficient only for ChromaDB. For other backends,
     use the detect endpoint to see estimated orphan counts.
     """
-    vectordb, collection = _get_vectordb_and_collection()
+    vectordb, collection, adapter = await _get_vectordb_and_collection()
 
     result = await db.execute(
         select(GlobalContentIndexV2.semantic_hash)
     )
     db_hashes = {row[0] for row in result.all() if row[0]}
 
-    # Try bulk listing (works for Chroma via adapter, fallback for others)
-    vdb_ids = await _bulk_list_ids(vectordb, collection)
+    vdb_ids = await _bulk_list_ids(adapter)
 
     if vdb_ids is None:
         return {
@@ -218,7 +216,7 @@ async def fix_db_to_vectordb(
     but are missing from vector store.
     Works with ALL backends. SAFE & IDEMPOTENT.
     """
-    vectordb, collection = _get_vectordb_and_collection()
+    vectordb, collection, _adapter = await _get_vectordb_and_collection()
 
     result = await db.execute(
         select(
@@ -231,7 +229,7 @@ async def fix_db_to_vectordb(
     all_hashes = [r[0] for r in rows if r[0]]
     existing = await _batch_exists(vectordb, collection, all_hashes)
 
-    embedder = get_embedder()
+    embedder = await get_embedder_async()
     reembedded = 0
     loop = asyncio.get_running_loop()
 
@@ -277,7 +275,7 @@ async def cleanup_orphans(
     Detects and re-embeds DB records missing from vector store.
     Works with ALL backends.
     """
-    vectordb, collection = _get_vectordb_and_collection()
+    vectordb, collection, _adapter = await _get_vectordb_and_collection()
 
     try:
         # STEP 1 — Get all DB hashes
@@ -291,10 +289,9 @@ async def cleanup_orphans(
 
         # STEP 3 — Re-embed DB orphans into vector store
         if db_orphans:
-            embedder = get_embedder()
+            embedder = await get_embedder_async()
             loop = asyncio.get_running_loop()
 
-            # Fetch texts for orphan hashes
             orphan_result = await db.execute(
                 select(
                     GlobalContentIndexV2.semantic_hash,

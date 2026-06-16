@@ -15,7 +15,7 @@ from app.core.config.default_config_templates import (
     default_embedder_dict_for_type,
     default_llm_root_dict_for_provider,
 )
-from app.core.config.client_config_resolver import get_client_config
+from app.core.config.client_config_resolver import get_client_config, load_default_client_raw_dict
 from app.retrieval.components import resolve_runtime_components
 
 
@@ -26,13 +26,14 @@ def test_default_embedder_template_no_ollama_env(monkeypatch: pytest.MonkeyPatch
     d = default_embedder_dict_for_type("ollama", None)
     assert d["type"] == "ollama"
     assert d["ollama"]["base_url"] == "http://localhost:11434"
-    assert d["ollama"]["model"] == "nomic-embed-text"
+    expected_model = load_default_client_raw_dict()["embedder"]["ollama"]["model"]
+    assert d["ollama"]["model"] == expected_model
 
 
-def test_default_llm_template_gemini_uses_google_key_env(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_default_llm_template_gemini_uses_secret_ref(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GEMINI_LLM_MODEL", raising=False)
     d = default_llm_root_dict_for_provider("gemini", None)
-    assert d["single"]["api_key_env"] == "GOOGLE_API_KEY"
+    assert d["single"]["secret_ref"]["uri"] == "env://GOOGLE_API_KEY"
     assert "generativelanguage.googleapis.com" in d["single"]["base_url"]
 
 
@@ -42,7 +43,7 @@ def test_default_llm_switching_from_gemini_to_ollama_replaces_provider_fields() 
         "single": {
             "type": "gemini",
             "model": "gemini-2.5-flash",
-            "api_key_env": "GOOGLE_API_KEY",
+            "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
             "base_url": "https://generativelanguage.googleapis.com/v1",
             "temperature": 0.5,
             "max_tokens": 2048,

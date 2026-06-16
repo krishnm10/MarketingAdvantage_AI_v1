@@ -75,11 +75,27 @@ class TrustAdapter:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _chunk_has_trust_signals(chunk: Dict[str, Any]) -> bool:
+        meta = chunk.get("metadata") or {}
+        if not isinstance(meta, dict):
+            return False
+        return any(
+            meta.get(key) is not None
+            for key in (
+                "tap_trust_score",
+                "agentic_validation_score",
+                "reasoning_quality_score",
+            )
+        )
+
+    @staticmethod
     def _base_score(chunks: List[Dict[str, Any]]) -> float:
         if not chunks:
             return 0.0
 
-        if _TRUST_CALCULATOR_AVAILABLE:
+        if _TRUST_CALCULATOR_AVAILABLE and any(
+            TrustAdapter._chunk_has_trust_signals(c) for c in chunks
+        ):
             try:
                 scores: list[float] = []
                 for chunk in chunks:

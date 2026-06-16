@@ -49,7 +49,7 @@ class _FakeVectorDB(BaseVectorDB):
 
 def test_retrieval_repository_close_is_idempotent():
     vectordb = _FakeVectorDB()
-    repository = RetrievalRepository(db_session=None, vectordb=vectordb)
+    repository = RetrievalRepository(db_session=None, vectordb=vectordb, collection="test")
 
     repository.close()
     repository.close()

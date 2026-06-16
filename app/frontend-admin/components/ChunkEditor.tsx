@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 import DiffViewer from "./DiffViewer";
+import apiClient from "@/lib/apiClient";
+import { API } from "@/lib/apiRoutes";
 
 type ChunkEditorProps = {
   chunkId: string;
@@ -28,18 +30,18 @@ export default function ChunkEditor({
 
     setSaving(true);
 
-    await fetch(
-      `http://localhost:8000/api/v2/ingestion-admin/chunks/${chunkId}`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cleaned_text: text }),
-      }
-    );
-
-    setSaving(false);
-    setShowDiff(false);
-    alert("Chunk updated and re-embedded");
+    try {
+      await apiClient.put(API.INGESTION_ADMIN.CHUNK_UPDATE(chunkId), {
+        cleaned_text: text,
+      });
+      setShowDiff(false);
+      alert("Chunk updated and re-embedded");
+    } catch (err) {
+      console.error("Chunk save failed", err);
+      alert("Failed to save chunk");
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (

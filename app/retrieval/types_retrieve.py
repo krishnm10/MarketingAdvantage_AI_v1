@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional, Dict, List
+from typing import Literal, Optional, Dict, List
 
 
 # ---------------------------------------------------------
@@ -113,6 +113,34 @@ class DroppedCandidate:
     """
     chunk_id: str
     reason: str
+
+
+# ---------------------------------------------------------
+# Chunk identity contract (shared across rag_api + retrieve/chat)
+# ---------------------------------------------------------
+
+@dataclass(frozen=True)
+class ChunkReference:
+    """Canonical chunk identity returned by all retrieval HTTP paths."""
+
+    chunk_id: str
+    source: Literal["postgres", "vector_payload"]
+
+    def to_dict(self) -> Dict[str, str]:
+        return {"chunk_id": self.chunk_id, "source": self.source}
+
+
+def chunk_ref_from_postgres(chunk_id: str) -> ChunkReference:
+    return ChunkReference(chunk_id=str(chunk_id), source="postgres")
+
+
+def chunk_ref_from_vector_payload(item: Dict) -> ChunkReference:
+    from app.ai.evaluation.chunk_id_normalize import chunk_id_from_payload
+
+    return ChunkReference(
+        chunk_id=chunk_id_from_payload(item),
+        source="vector_payload",
+    )
 
 
 # ---------------------------------------------------------

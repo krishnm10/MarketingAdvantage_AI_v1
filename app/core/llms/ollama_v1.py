@@ -19,11 +19,54 @@ Install:
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator, Dict, List, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
 from app.core.llms.base import BaseLLM, LLMInfo, LLMResponse
 
 logger = logging.getLogger(__name__)
+
+
+def _ollama_get_field(response: Any, key: str, default: Any = None) -> Any:
+    """Read a field from Ollama ChatResponse (Pydantic) or dict."""
+    if hasattr(response, key):
+        val = getattr(response, key, default)
+        return default if val is None else val
+    if isinstance(response, dict):
+        return response.get(key, default)
+    return default
+
+
+def _extract_ollama_token_usage(response: Any) -> Tuple[int, int, int]:
+    """
+    Map Ollama native counts to OpenAI-style prompt/completion/total.
+
+    Ollama reports prompt_eval_count and eval_count per API response.
+    """
+    usage = _ollama_get_field(response, "usage") or {}
+    if isinstance(usage, dict) and usage:
+        pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        tt = int(usage.get("total_tokens") or 0)
+        if tt <= 0 and (pt > 0 or ct > 0):
+            tt = pt + ct
+        if pt > 0 or ct > 0 or tt > 0:
+            return pt, ct, tt
+
+    pt = int(_ollama_get_field(response, "prompt_eval_count", 0) or 0)
+    ct = int(_ollama_get_field(response, "eval_count", 0) or 0)
+    tt = pt + ct if (pt > 0 or ct > 0) else 0
+    return pt, ct, tt
+
+
+def _ollama_message_content(response: Any) -> str:
+    msg = _ollama_get_field(response, "message")
+    if msg is None:
+        return ""
+    if hasattr(msg, "content"):
+        return str(getattr(msg, "content", "") or "")
+    if isinstance(msg, dict):
+        return str(msg.get("content") or "")
+    return ""
 
 
 class OllamaLLM(BaseLLM):
@@ -43,7 +86,7 @@ class OllamaLLM(BaseLLM):
         *,
         model: str,
         base_url: str = "http://localhost:11434",
-        timeout: int = 120,  # seconds; retrieve/chat overrides via instantiate_llm + OLLAMA_LLM_TIMEOUT_SECONDS
+        timeout: int = 250,  # seconds; retrieve/chat overrides via instantiate_llm + OLLAMA_LLM_TIMEOUT_SECONDS
         keep_alive: str = "5m",
     ):
         try:
@@ -112,16 +155,17 @@ class OllamaLLM(BaseLLM):
             keep_alive=self._keep_alive,
         )
 
-        content = response["message"]["content"]
-        usage   = response.get("usage") or {}
+        content = _ollama_message_content(response)
+        pt, ct, tt = _extract_ollama_token_usage(response)
+        finish_reason = _ollama_get_field(response, "done_reason", "stop")
 
         return LLMResponse(
             text=content,
             model=self._model,
-            prompt_tokens=usage.get("prompt_tokens", 0),
-            completion_tokens=usage.get("completion_tokens", 0),
-            total_tokens=usage.get("total_tokens", 0),
-            finish_reason=response.get("done_reason", "stop"),
+            prompt_tokens=pt,
+            completion_tokens=ct,
+            total_tokens=tt,
+            finish_reason=str(finish_reason) if finish_reason is not None else "stop",
             raw=response,
         )
 

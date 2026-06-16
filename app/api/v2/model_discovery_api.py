@@ -89,8 +89,29 @@ _LLM_PROVIDER_DEFS = [
     {
         "provider": "groq",
         "display_name": "Groq",
-        "default_model": "llama-3.1-70b-versatile",
+        "default_model": "llama-3.1-8b-instant",
         "key_env": "GROQ_API_KEY",
+        "recommended": False,
+    },
+    {
+        "provider": "xai",
+        "display_name": "xAI (Grok)",
+        "default_model": "grok-2",
+        "key_env": "XAI_API_KEY",
+        "recommended": False,
+    },
+    {
+        "provider": "deepseek",
+        "display_name": "DeepSeek",
+        "default_model": "deepseek-chat",
+        "key_env": "DEEPSEEK_API_KEY",
+        "recommended": False,
+    },
+    {
+        "provider": "huggingface",
+        "display_name": "HuggingFace",
+        "default_model": "meta-llama/Meta-Llama-3-8B-Instruct",
+        "key_env": "HF_TOKEN",
         "recommended": False,
     },
     {
@@ -104,15 +125,61 @@ _LLM_PROVIDER_DEFS = [
 
 
 @router.get("/llm", response_model=List[LLMProviderInfo])
-async def list_llm_providers(_user=Depends(require_role("admin"))):
+async def list_llm_providers(
+    client_id: Optional[str] = Query(
+        None,
+        description="Tenant id; when set, vault/env secret_ref for that tenant's LLM is checked.",
+    ),
+    _user=Depends(require_role("admin")),
+):
     """List available LLM providers with API key readiness."""
     from app.core.config.client_config_resolver import get_client_config
+    from app.core.config.secret_ref import secret_ref_env_var_name, secret_ref_uses_env_backend
+    from app.core.secrets.credentials import resolve_secret_optional
     from app.middleware.security_middleware import validate_business_id
 
-    try:
-        cfg = get_client_config(validate_business_id(os.getenv("MAI_DEFAULT_BUSINESS_ID")))
-    except Exception:
-        cfg = None
+    cfg = None
+    tenant_id = (client_id or "").strip()
+    if tenant_id:
+        try:
+            cfg = get_client_config(validate_business_id(tenant_id))
+        except Exception:
+            cfg = None
+    if cfg is None:
+        try:
+            cfg = get_client_config(validate_business_id(os.getenv("MAI_DEFAULT_BUSINESS_ID")))
+        except Exception:
+            cfg = None
+
+    async def _api_key_ready(provider: str, key_env: str) -> bool:
+        if not key_env:
+            return True
+        if provider == "gemini":
+            if bool(os.getenv(key_env or "GOOGLE_API_KEY", "").strip()) or bool(
+                os.getenv("GEMINI_API_KEY", "").strip()
+            ):
+                return True
+        elif bool(os.getenv(key_env, "").strip()):
+            return True
+        if cfg and cfg.llm and cfg.llm.single:
+            ll = cfg.llm.single
+            prov = ll.type.value.lower()
+            if prov == "google":
+                prov = "gemini"
+            if prov == provider and ll.secret_ref:
+                if not secret_ref_uses_env_backend(ll.secret_ref):
+                    try:
+                        key = await resolve_secret_optional(
+                            ll.secret_ref,
+                            config=cfg,
+                            purpose=f"llm.{provider}",
+                        )
+                        return bool(key)
+                    except Exception:
+                        return False
+                env_name = secret_ref_env_var_name(ll.secret_ref) or key_env
+                return bool(os.getenv(env_name or "", "").strip())
+        return False
 
     result = []
     for d in _LLM_PROVIDER_DEFS:
@@ -125,14 +192,7 @@ async def list_llm_providers(_user=Depends(require_role("admin"))):
                 prov = "gemini"
             if prov == d["provider"]:
                 default_model = ll.model or default_model
-                if ll.api_key_env:
-                    key_env = ll.api_key_env
-        if d["provider"] == "gemini":
-            api_key_set = bool(os.getenv(key_env or "GOOGLE_API_KEY", "").strip()) or bool(
-                os.getenv("GEMINI_API_KEY", "").strip()
-            )
-        else:
-            api_key_set = True if not key_env else bool(os.getenv(key_env, "").strip())
+        api_key_set = await _api_key_ready(d["provider"], key_env)
         result.append(LLMProviderInfo(
             provider=d["provider"],
             display_name=d["display_name"],

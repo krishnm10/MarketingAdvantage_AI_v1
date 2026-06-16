@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 import app.api.v2.rag_config_api as rag_config_api
 from app.core.config.client_config_resolver import load_default_client_raw_dict
+from app.core.config.config_store import FileSystemConfigStore, set_config_store
 
 
 @pytest.fixture()
@@ -117,3 +118,200 @@ def test_parser_patch_deep_merge_preserves_non_ui_fields(
   assert parser_identity.get("enable_pdf") is False
   assert parser_identity.get("ocr_language") == "eng+hin"
 
+
+def test_pipeline_pluggable_patch_embedder_type_and_model(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_embedder_model"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+  monkeypatch.setenv("GOOGLE_API_KEY", "dummy-for-contract-test")
+
+  default_raw = load_default_client_raw_dict()
+  (cfg_dir / "default.json").write_text(json.dumps(default_raw), encoding="utf-8")
+  set_config_store(FileSystemConfigStore([cfg_dir]))
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={
+      "embedder_type": "openai",
+      "embedder_model": "text-embedding-3-large",
+    },
+  )
+  assert r.status_code == 200, r.text
+
+  cfg_path = rag_config_api._get_client_config_path(tenant_id)
+  assert cfg_path is not None
+  stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+  assert stored.get("embedder", {}).get("type") == "openai"
+  assert stored.get("embedder", {}).get("openai", {}).get("model") == "text-embedding-3-large"
+
+  r2 = client.get(f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}")
+  assert r2.status_code == 200, r2.text
+  identity = r2.json()
+  assert identity.get("embedder") == "openai"
+  assert identity.get("embedder_model") == "text-embedding-3-large"
+
+
+def test_pipeline_pluggable_patch_embedder_model_empty_rejected(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_embedder_empty"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={"embedder_model": "   "},
+  )
+  assert r.status_code == 400, r.text
+
+
+def test_pipeline_pluggable_patch_llm_type_and_model(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_llm_model"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+  monkeypatch.setenv("GOOGLE_API_KEY", "dummy-for-contract-test")
+
+  default_raw = load_default_client_raw_dict()
+  (cfg_dir / "default.json").write_text(json.dumps(default_raw), encoding="utf-8")
+  set_config_store(FileSystemConfigStore([cfg_dir]))
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={
+      "llm_provider": "openai",
+      "llm_model": "gpt-5",
+    },
+  )
+  assert r.status_code == 200, r.text
+
+  cfg_path = rag_config_api._get_client_config_path(tenant_id)
+  assert cfg_path is not None
+  stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+  assert stored.get("llm", {}).get("single", {}).get("type") == "openai"
+  assert stored.get("llm", {}).get("single", {}).get("model") == "gpt-5"
+
+  r2 = client.get(f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}")
+  assert r2.status_code == 200, r2.text
+  identity = r2.json()
+  assert identity.get("llm") == "openai"
+  assert identity.get("llm_model") == "gpt-5"
+
+
+def test_pipeline_pluggable_patch_llm_model_not_overwritten_by_provider_default(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  """Provider is applied first (default model), then llm_model overrides it."""
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_llm_order"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+  monkeypatch.setenv("GOOGLE_API_KEY", "dummy-for-contract-test")
+
+  default_raw = load_default_client_raw_dict()
+  (cfg_dir / "default.json").write_text(json.dumps(default_raw), encoding="utf-8")
+  set_config_store(FileSystemConfigStore([cfg_dir]))
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={"llm_provider": "openai", "llm_model": "gpt-5"},
+  )
+  assert r.status_code == 200, r.text
+
+  identity = client.get(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}"
+  ).json()
+  assert identity.get("llm") == "openai"
+  assert identity.get("llm_model") == "gpt-5"
+  assert identity.get("llm_model") != "gpt-4o-mini"
+
+
+def test_pipeline_pluggable_patch_provider_change_resets_model(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_llm_reset"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+  monkeypatch.setenv("ANTHROPIC_API_KEY", "dummy-for-contract-test")
+  monkeypatch.setenv("GOOGLE_API_KEY", "dummy-for-contract-test")
+
+  default_raw = load_default_client_raw_dict()
+  (cfg_dir / "default.json").write_text(json.dumps(default_raw), encoding="utf-8")
+  set_config_store(FileSystemConfigStore([cfg_dir]))
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r1 = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={"llm_provider": "openai", "llm_model": "gpt-5"},
+  )
+  assert r1.status_code == 200, r1.text
+
+  r2 = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={"llm_provider": "anthropic"},
+  )
+  assert r2.status_code == 200, r2.text
+
+  identity = client.get(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}"
+  ).json()
+  assert identity.get("llm") == "anthropic"
+  assert identity.get("llm_model") == "claude-3-5-sonnet-20241022"
+  assert identity.get("llm_model") != "gpt-5"
+
+
+def test_pipeline_pluggable_patch_llm_model_too_long_rejected(
+  pipeline_app: FastAPI,
+  cfg_dir: Path,
+  monkeypatch: pytest.MonkeyPatch,
+) -> None:
+  client = TestClient(pipeline_app, raise_server_exceptions=True)
+  tenant_id = "acme_llm_long"
+
+  monkeypatch.setenv("OPENAI_API_KEY", "dummy-for-contract-test")
+
+  base = load_default_client_raw_dict()
+  base["client_id"] = tenant_id
+  (cfg_dir / f"{tenant_id}.json").write_text(json.dumps(base), encoding="utf-8")
+
+  r = client.patch(
+    f"/api/v2/rag-config/pipeline-pluggable/{tenant_id}",
+    json={"llm_model": "x" * 201},
+  )
+  assert r.status_code == 400, r.text

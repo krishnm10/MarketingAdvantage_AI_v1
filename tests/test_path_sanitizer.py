@@ -108,7 +108,6 @@ class TestValidateSlug:
         with pytest.raises(ValueError):
             validate_slug("a" * 100, max_length=64)
 
-    def test_uppercase_rejected(self):
+    def test_uppercase_normalized_to_lowercase(self):
         from app.utils.path_sanitizer import validate_slug
-        with pytest.raises(ValueError):
-            validate_slug("FooBar")
+        assert validate_slug("FooBar") == "foobar"

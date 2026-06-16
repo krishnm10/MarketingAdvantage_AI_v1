@@ -5,6 +5,10 @@ GET /api/v2/admin/customers-rag-dashboard
     Auth: admin | superadmin
     Tenant list: stems from *.json config files under app/core/configs and configs/.
 
+POST /api/v2/admin/tenants
+    Auth: admin | superadmin
+    Create a new tenant config overlay (exclusive file create; optional copy_from allowlist).
+
 DELETE /api/v2/admin/tenants/{client_id}/client-config
     Auth: admin | superadmin
     Moves the client overlay config file to app/core/configs/_archived/ (soft delete).
@@ -108,6 +112,24 @@ class TenantOverviewResponse(BaseModel):
     alignment_summary: Optional[AlignmentSummary] = None
     alignment_error: Optional[str] = None
     rag_config_highlight: Dict[str, Any] = Field(default_factory=dict)
+
+
+class CreateTenantRequest(BaseModel):
+    client_id: str = Field(..., description="Unique tenant slug (normalized by validate_tenant_id).")
+    client_name: Optional[str] = Field(None, description="Optional display name.")
+    copy_from: Optional[str] = Field(
+        None,
+        description="Existing tenant id to clone behavioural settings from (allowlist only).",
+    )
+
+
+class TenantCreatedResponse(BaseModel):
+    status: str = "created"
+    client_id: str
+    client_name: str
+    config_version: str
+    config_path: str
+    pipeline: Dict[str, Any] = Field(default_factory=dict)
 
 
 def _iso_now() -> str:
@@ -221,6 +243,101 @@ async def get_customers_rag_dashboard(
         cached_pipeline_count=len(cached_ids),
         evaluation_templates_count=eval_count,
         customers=sorted(rows, key=lambda r: r.client_id),
+    )
+
+
+@router.post(
+    "/tenants",
+    response_model=TenantCreatedResponse,
+    status_code=201,
+)
+async def create_tenant(
+    body: CreateTenantRequest,
+    _user: Any = Depends(require_role("admin", "superadmin")),
+) -> TenantCreatedResponse:
+    """
+    Create a new tenant by writing an exclusive ``{client_id}.json`` overlay.
+
+    Preferred explicit flow for tenant onboarding. Reuses the same seeding helpers
+    as ``PUT /rag-config/pipeline/{client_id}`` but prevents TOCTOU races via
+    ``O_CREAT | O_EXCL`` and scrubs secrets when ``copy_from`` is supplied.
+    """
+    try:
+        vctx = validate_tenant_id(
+            body.client_id,
+            source="body",
+            endpoint="create_tenant",
+            allow_default=False,
+        )
+        cid = vctx.tenant_id
+    except TenantValidationError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from e
+
+    if cid == "default":
+        raise HTTPException(status_code=422, detail="Cannot create the reserved tenant id 'default'.")
+
+    from app.api.v2 import rag_config_api as _rc
+    from app.core.config.config_store import compute_config_version
+
+    if _rc._get_client_config_path(cid) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tenant config already exists for client_id={cid!r}.",
+        )
+
+    if body.copy_from:
+        try:
+            validate_tenant_id(
+                body.copy_from,
+                source="body",
+                endpoint="create_tenant_copy_from",
+                allow_default=True,
+            )
+        except TenantValidationError as e:
+            raise HTTPException(status_code=422, detail=str(e)) from e
+        cfg = _rc.build_tenant_config_from_copy(cid, body.copy_from.strip())
+    else:
+        cfg = _rc._build_default_config_dict(cid)
+
+    if body.client_name and body.client_name.strip():
+        cfg["client_name"] = body.client_name.strip()
+    elif not cfg.get("client_name"):
+        cfg["client_name"] = cid.replace("_", " ").strip() or cid
+
+    _rc._validate_config_dict_raises(cfg)
+
+    safe_id = sanitize_client_id(cid)
+    out_path = (_rc._CONFIGS_DIR / f"{safe_id}.json").resolve()
+    try:
+        _rc._atomic_write_json_exclusive(out_path, cfg)
+    except FileExistsError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Tenant config already exists for client_id={cid!r}.",
+        ) from e
+
+    try:
+        pipeline_factory.invalidate(cid)
+    except Exception as ex:
+        logger.warning("[create_tenant] pipeline cache invalidate failed for %s: %s", cid, ex)
+
+    try:
+        from app.core.config.effective_tenant_runtime import invalidate_effective_tenant_runtime_cache
+
+        invalidate_effective_tenant_runtime_cache(cid)
+    except Exception as ex:
+        logger.warning("[create_tenant] runtime cache invalidate failed for %s: %s", cid, ex)
+
+    from app.core.config.pipeline_runtime import get_pipeline_identity
+
+    version = compute_config_version(cfg)
+    logger.info("[create_tenant] Created tenant overlay client_id=%s path=%s", cid, out_path)
+    return TenantCreatedResponse(
+        client_id=cid,
+        client_name=str(cfg.get("client_name") or cid),
+        config_version=version,
+        config_path=str(out_path),
+        pipeline=get_pipeline_identity(cid),
     )
 
 

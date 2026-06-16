@@ -1904,8 +1904,12 @@ async def test_option_a_answer_grounding_excludes_baseline_only_documents(minima
     body = resp.json()
     assert [r["chunk_id"] for r in body["results"]] == ["c-low"]
     assert body.get("answer_error") is None
-    assert captured_prompts, "LLM should receive a grounded prompt"
-    prompt = captured_prompts[0]
+    assert captured_prompts
+    grounding_prompts = [
+        p for p in captured_prompts if "diverse search queries" not in p.lower()
+    ]
+    assert grounding_prompts, "LLM should receive a grounded prompt"
+    prompt = grounding_prompts[-1]
     assert "fully paid" not in prompt.lower()
     assert "inv-paid" not in prompt.lower()
     assert "invoice low" in prompt.lower()
@@ -2441,7 +2445,9 @@ async def test_docset_phase5a_is_observability_only(minimal_runtime):
         verifier_calls.append(list(source_texts))
         from app.services.faithfulness_verifier import VerificationResult, VerificationStatus
 
-        return VerificationResult(status=VerificationStatus.PASS, checks=[], fail_reason=None)
+        return answer, VerificationResult(
+            status=VerificationStatus.PASS, checks=[], fail_reason=None
+        )
 
     with (
         _tenant_patches(runtime, route),
@@ -2487,7 +2493,11 @@ async def test_docset_phase5a_is_observability_only(minimal_runtime):
     assert debug.get("docset_summary") is not None
 
     assert captured_prompts
-    prompt = captured_prompts[0]
+    grounding_prompts = [
+        p for p in captured_prompts if "diverse search queries" not in p.lower()
+    ]
+    assert grounding_prompts
+    prompt = grounding_prompts[-1]
     summary_text = (debug.get("docset_summary") or {}).get("text") or ""
     assert summary_text
     assert summary_text not in prompt

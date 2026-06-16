@@ -369,6 +369,126 @@ async def _collect_pages_via_stream(file_path: str) -> List[str]:
     return pages_text
 
 
+async def _collect_pages_via_stream_with_stats(file_path: str) -> tuple[List[str], int, int]:
+    """Like _collect_pages_via_stream but also returns (page_count, raw_char_total)."""
+    pages_text: List[str] = []
+    page_count = 0
+    raw_chars = 0
+    async for page in iter_pdf_pages(file_path):
+        page_count += 1
+        raw_chars += len(page.text or "")
+        stripped = strip_page_headers_footers(page.text)
+        if stripped.strip():
+            pages_text.append(stripped)
+    return pages_text, page_count, raw_chars
+
+
+async def _fetch_visual_explanations(file_path: str) -> List[str]:
+    """Optional visual/OCR explanations from embedded PDF images (fail-open)."""
+    if not LOCAL_VISUAL_INTERCEPT_TOGGLE:
+        return []
+    try:
+        from app.services.ingestion.media.document_visual_interceptor_v1 import (
+            DocumentVisualInterceptorV1,
+        )
+
+        interceptor = DocumentVisualInterceptorV1()
+        visual_texts = await asyncio.wait_for(
+            interceptor.intercept_explanations_only(
+                file_path=file_path,
+                parsed_output={},
+                file_type="pdf",
+                max_visuals=MAX_VISUAL_EXPLANATIONS,
+            ),
+            timeout=VISUAL_INTERCEPT_TIMEOUT_SEC,
+        )
+        if visual_texts:
+            log_info(
+                f"[pdf_parser_v2] Extracted {len(visual_texts)} visual explanations"
+            )
+        return visual_texts or []
+    except asyncio.TimeoutError:
+        log_warning(
+            f"[pdf_parser_v2] Visual interception timed out after "
+            f"{VISUAL_INTERCEPT_TIMEOUT_SEC}s (non-fatal)"
+        )
+    except Exception as e:
+        log_warning(
+            f"[pdf_parser_v2] Visual interception failed (non-fatal): {e}"
+        )
+    return []
+
+
+def _non_empty_stripped_pages(pages: List[str]) -> List[str]:
+    return [
+        strip_page_headers_footers(p)
+        for p in pages
+        if isinstance(p, str) and strip_page_headers_footers(p).strip()
+    ]
+
+
+async def _ocr_scanned_pdf_pages(file_path: str, max_pages: int = 24) -> List[str]:
+    """
+    Last-resort OCR for image-only PDFs: rasterize each page and run the captioner.
+    Used only when text-layer and embedded-image extraction both return nothing.
+    """
+    import fitz
+    import tempfile
+
+    from app.services.ingestion.media.image_ingestor_v1 import ImageIngestorV1
+
+    ingestor = ImageIngestorV1()
+    loop = asyncio.get_running_loop()
+    pages_out: List[str] = []
+
+    def _render_page_to_temp(page_index: int) -> tuple[int, str]:
+        doc = fitz.open(file_path)
+        try:
+            if page_index >= len(doc):
+                return page_index, ""
+            page = doc[page_index]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            fd, temp_path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            pix.save(temp_path)
+            return page_index, temp_path
+        finally:
+            doc.close()
+
+    doc = fitz.open(file_path)
+    n_pages = min(len(doc), max_pages)
+    doc.close()
+
+    for page_index in range(n_pages):
+        _, temp_path = await loop.run_in_executor(None, _render_page_to_temp, page_index)
+        if not temp_path:
+            continue
+        try:
+            result = await ingestor.captioner.caption(temp_path)
+            if not isinstance(result, dict):
+                continue
+            ocr_text = (result.get("ocr_text") or "").strip()
+            caption = (result.get("caption") or "").strip()
+            page_text = ocr_text or caption
+            if page_text:
+                pages_out.append(page_text)
+        except Exception as e:
+            log_warning(
+                f"[pdf_parser_v2] Page render OCR failed for page {page_index + 1}: {e}"
+            )
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+    if pages_out:
+        log_info(
+            f"[pdf_parser_v2] Recovered {len(pages_out)} page(s) via render+OCR fallback"
+        )
+    return pages_out
+
+
 # -------------------------------------------------------------------
 # MAIN PARSER PIPELINE
 # -------------------------------------------------------------------
@@ -389,46 +509,49 @@ async def parse_pdf(file_path: str) -> Dict[str, Any]:
 
     log_info(f"[pdf_parser_v2] Reading PDF: {file_path}")
 
-    pages_text = await _collect_pages_via_stream(file_path)
+    pages_text, page_count, raw_chars = await _collect_pages_via_stream_with_stats(file_path)
+    extraction_source = "stream"
 
     if not pages_text:
-        raise ValueError(f"[pdf_parser_v2] Empty extraction result: {file_path}")
+        try:
+            fallback_pages = await parallel_extract_pdf(file_path)
+            pages_text = _non_empty_stripped_pages(fallback_pages)
+            if pages_text:
+                extraction_source = "parallel_extract"
+                log_info(
+                    f"[pdf_parser_v2] Recovered {len(pages_text)} pages via parallel_extract_pdf"
+                )
+        except ValueError:
+            pass
+
+    visual_texts: List[str] = await _fetch_visual_explanations(file_path)
+
+    if not pages_text and visual_texts:
+        pages_text = [
+            t.strip() for t in visual_texts if isinstance(t, str) and t.strip()
+        ]
+        extraction_source = "visual_ocr"
+        visual_texts = []
+        log_info(
+            f"[pdf_parser_v2] Using {len(pages_text)} visual/OCR page(s) as primary text"
+        )
+
+    if not pages_text and page_count > 0:
+        scanned_pages = await _ocr_scanned_pdf_pages(
+            file_path, max_pages=MAX_VISUAL_EXPLANATIONS
+        )
+        if scanned_pages:
+            pages_text = scanned_pages
+            extraction_source = "page_render_ocr"
+
+    if not pages_text:
+        raise ValueError(
+            f"[pdf_parser_v2] Empty extraction result: {file_path} "
+            f"(pages={page_count}, raw_chars={raw_chars}). "
+            "The PDF may be encrypted, corrupt, or a scanned document with no OCR text layer."
+        )
 
     page_map = build_page_map(pages_text)
-
-    # ----------------------------------------------------------------
-    # Optional visual interception (explanations-only, fail-open)
-    # ----------------------------------------------------------------
-    visual_texts: List[str] = []
-    if LOCAL_VISUAL_INTERCEPT_TOGGLE:
-        try:
-            from app.services.ingestion.media.document_visual_interceptor_v1 import (
-                DocumentVisualInterceptorV1,
-            )
-
-            interceptor = DocumentVisualInterceptorV1()
-            visual_texts = await asyncio.wait_for(
-                interceptor.intercept_explanations_only(
-                    file_path=file_path,
-                    parsed_output={},
-                    file_type="pdf",
-                    max_visuals=MAX_VISUAL_EXPLANATIONS,
-                ),
-                timeout=VISUAL_INTERCEPT_TIMEOUT_SEC,
-            )
-            if visual_texts:
-                log_info(
-                    f"[pdf_parser_v2] Extracted {len(visual_texts)} visual explanations"
-                )
-        except asyncio.TimeoutError:
-            log_warning(
-                f"[pdf_parser_v2] Visual interception timed out after "
-                f"{VISUAL_INTERCEPT_TIMEOUT_SEC}s (non-fatal)"
-            )
-        except Exception as e:
-            log_warning(
-                f"[pdf_parser_v2] Visual interception failed (non-fatal): {e}"
-            )
 
     is_slide_mode = _is_presentation_pdf(pages_text)
     if is_slide_mode:

@@ -43,11 +43,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from app.core.config.secret_ref import (
+    SecretRef,
+    SecretsBackendConfig,
+    SecretsBackendProvider,
+    resolve_vault_token,
+    secret_ref_env_var_name,
+    secret_ref_uses_env_backend,
+)
 from app.core.config.client_config_schema import (
     ClientConfig,
     EmbedderType,
     RerankerType,
     VectorDBType,
+)
+from app.core.config.config_store import (
+    DEFAULT_CONFIG_ID,
+    FileSystemConfigStore,
+    get_config_store,
 )
 from app.utils.path_sanitizer import sanitize_client_id
 from app.utils.tenant_storage_uuid import storage_uuid_str_for_vectordb_metadata
@@ -89,7 +102,17 @@ _CONFIG_DIRS: List[Path] = [
     _REPO_ROOT / "app" / "core" / "configs",
     _REPO_ROOT / "configs",
 ]
-_DEFAULT_CONFIG_ID = "default"
+_DEFAULT_CONFIG_ID = DEFAULT_CONFIG_ID
+
+
+def _filesystem_store() -> FileSystemConfigStore:
+    store = get_config_store()
+    if not isinstance(store, FileSystemConfigStore):
+        raise TypeError(
+            "Filesystem config path helpers require FileSystemConfigStore; "
+            f"got {type(store).__name__}."
+        )
+    return store
 
 
 def _find_config_path(client_id: str) -> Optional[Path]:
@@ -97,19 +120,7 @@ def _find_config_path(client_id: str) -> Optional[Path]:
     Search known config directories for a client config file.
     Returns the first match or None. Blocks path traversal.
     """
-    safe_id = sanitize_client_id(client_id)
-    for base in _CONFIG_DIRS:
-        for ext in ("json", "yaml", "yml"):
-            candidate = (base / f"{safe_id}.{ext}").resolve()
-            if not str(candidate).startswith(str(base.resolve())):
-                logger.warning(
-                    "[ConfigResolver] Path traversal blocked for client_id=%.30s",
-                    client_id[:30],
-                )
-                continue
-            if candidate.exists():
-                return candidate
-    return None
+    return _filesystem_store().find_config_path(client_id)
 
 
 def _resolve_client_id_for_config_lookup(client_id: str) -> str:
@@ -184,12 +195,7 @@ def load_default_client_raw_dict() -> Dict[str, Any]:
     Loads app/core/configs/default.json (or YAML) as a plain dict — no env overlay.
     Used when creating tenant config files seeded from canonical defaults.
     """
-    path = _find_config_path(_DEFAULT_CONFIG_ID)
-    if path is None:
-        raise FileNotFoundError(
-            f"Default config not found. Searched: {[str(d) for d in _CONFIG_DIRS]}"
-        )
-    return deepcopy(_load_raw(path))
+    return deepcopy(get_config_store().load_raw(_DEFAULT_CONFIG_ID))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -259,19 +265,7 @@ def get_config_fingerprint(config: ClientConfig) -> str:
 
 def _load_raw(path: Path) -> Dict[str, Any]:
     """Load a config file as a raw dict. Supports JSON and YAML."""
-    import json
-
-    text = path.read_text(encoding="utf-8")
-    suffix = path.suffix.lower()
-
-    if suffix in (".yaml", ".yml"):
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError("PyYAML required for YAML configs: pip install pyyaml")
-        return yaml.safe_load(text) or {}
-
-    return json.loads(text)
+    return _filesystem_store()._read_file(path)
 
 
 def _load_config_from_path(
@@ -421,35 +415,32 @@ def get_client_config(
         ValidationError:         Pydantic schema validation failed.
     """
     client_id = _resolve_client_id_for_config_lookup(client_id)
+    store = get_config_store()
 
-    # ── Step 1: Load default config (base) ────────────────────────────────
-    default_path = _find_config_path(_DEFAULT_CONFIG_ID)
-    if default_path is None:
-        raise FileNotFoundError(
-            f"Default config not found. Searched: {[str(d) for d in _CONFIG_DIRS]}"
+    # ── Steps 1–3: Load merged raw dict via ConfigStore ─────────────────────
+    try:
+        merged_raw = deepcopy(store.load_raw(client_id))
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(str(exc)) from exc
+
+    fs_store = store if isinstance(store, FileSystemConfigStore) else None
+    had_client_file = bool(fs_store and fs_store.has_client_override(client_id))
+    config_source = (
+        fs_store.load_source_label(client_id)
+        if fs_store is not None
+        else (f"default+{client_id}" if had_client_file else "default")
+    )
+    if not had_client_file and client_id != _DEFAULT_CONFIG_ID:
+        logger.debug(
+            "[ConfigResolver] No override for '%s' — using default only",
+            client_id,
         )
-    base_raw = _load_raw(default_path)
-    config_source = "default"
-
-    # ── Step 2: Load client-specific config (override) ────────────────────
-    client_path = _find_config_path(client_id)
-    if client_path is not None and client_id != _DEFAULT_CONFIG_ID:
-        client_raw = _load_raw(client_path)
-        # ── Step 3: Deep merge ────────────────────────────────────────────
-        merged_raw = _deep_merge(base_raw, client_raw)
-        had_client_file = True
-        config_source = f"default+{client_id}"
+    elif had_client_file:
         logger.debug(
             "[ConfigResolver] Merged client config '%s' onto default", client_id,
         )
-    else:
-        merged_raw = base_raw
-        had_client_file = False
-        if client_id != _DEFAULT_CONFIG_ID:
-            logger.debug(
-                "[ConfigResolver] No override for '%s' — using default only",
-                client_id,
-            )
+
+    base_raw = deepcopy(store.load_raw(_DEFAULT_CONFIG_ID))
 
     _maybe_warn_tenant_blueprint_drift(client_id, base_raw, merged_raw, had_client_file)
 
@@ -624,40 +615,51 @@ def _check_api_keys(config: ClientConfig, issues: List[ConfigIssue]) -> None:
     embedder_key_env = _EMBEDDERS_REQUIRING_API_KEY.get(config.embedder.type)
     if embedder_key_env:
         sub = getattr(config.embedder, config.embedder.type.value, None)
-        env_var = getattr(sub, "api_key_env", None) if sub else None
-        actual_env = env_var or embedder_key_env
-        if not os.getenv(actual_env):
-            issues.append(ConfigIssue(
-                severity=IssueSeverity.ERROR,
-                component="embedder",
-                message=(
-                    f"Embedder '{config.embedder.type.value}' requires API key "
-                    f"via env var '{actual_env}' — not set."
-                ),
-            ))
+        secret_ref = getattr(sub, "secret_ref", None) if sub else None
+        if secret_ref and not secret_ref_uses_env_backend(secret_ref):
+            pass
+        else:
+            env_var = secret_ref_env_var_name(secret_ref) or embedder_key_env
+            if not os.getenv(env_var):
+                issues.append(ConfigIssue(
+                    severity=IssueSeverity.ERROR,
+                    component="embedder",
+                    message=(
+                        f"Embedder '{config.embedder.type.value}' requires API key "
+                        f"via env var '{env_var}' — not set."
+                    ),
+                ))
 
     vdb_key_env = _VECTORDB_REQUIRING_API_KEY.get(config.vectordb.type)
-    if vdb_key_env and not os.getenv(vdb_key_env):
-        issues.append(ConfigIssue(
-            severity=IssueSeverity.WARNING,
-            component="vectordb",
-            message=(
-                f"VectorDB '{config.vectordb.type.value}' may require API key "
-                f"via '{vdb_key_env}' — not set. Will fail at connection time."
-            ),
-        ))
+    if vdb_key_env:
+        vdb_sub = getattr(config.vectordb, config.vectordb.type.value, None)
+        vdb_secret_ref = getattr(vdb_sub, "secret_ref", None) if vdb_sub else None
+        if not (vdb_secret_ref and not secret_ref_uses_env_backend(vdb_secret_ref)):
+            if not os.getenv(vdb_key_env):
+                issues.append(ConfigIssue(
+                    severity=IssueSeverity.WARNING,
+                    component="vectordb",
+                    message=(
+                        f"VectorDB '{config.vectordb.type.value}' may require API key "
+                        f"via '{vdb_key_env}' — not set. Will fail at connection time."
+                    ),
+                ))
 
     if config.llm and config.llm.single:
-        llm_key_env = config.llm.single.api_key_env
-        if llm_key_env and not os.getenv(llm_key_env):
-            issues.append(ConfigIssue(
-                severity=IssueSeverity.WARNING,
-                component="llm",
-                message=(
-                    f"LLM '{config.llm.single.type.value}' API key env var "
-                    f"'{llm_key_env}' is not set."
-                ),
-            ))
+        llm_secret_ref = config.llm.single.secret_ref
+        if llm_secret_ref and not secret_ref_uses_env_backend(llm_secret_ref):
+            pass  # vault/aws/azure/gcp — resolved at runtime via SecretResolver
+        else:
+            llm_key_env = secret_ref_env_var_name(llm_secret_ref)
+            if llm_key_env and not os.getenv(llm_key_env):
+                issues.append(ConfigIssue(
+                    severity=IssueSeverity.WARNING,
+                    component="llm",
+                    message=(
+                        f"LLM '{config.llm.single.type.value}' API key env var "
+                        f"'{llm_key_env}' is not set."
+                    ),
+                ))
 
 
 def _check_embedder_vectordb_compat(
@@ -791,16 +793,17 @@ def _check_reranker_compat(
         return
 
     if rr.type == RerankerType.COHERE:
-        env_var = rr.api_key_env or "COHERE_API_KEY"
-        if not os.getenv(env_var):
-            issues.append(ConfigIssue(
-                severity=IssueSeverity.ERROR,
-                component="reranker",
-                message=(
-                    f"Cohere reranker requires API key via env var '{env_var}' "
-                    f"— not set. Pipeline build will fail."
-                ),
-            ))
+        if not rr.secret_ref or secret_ref_uses_env_backend(rr.secret_ref):
+            env_var = secret_ref_env_var_name(rr.secret_ref) or "COHERE_API_KEY"
+            if not os.getenv(env_var):
+                issues.append(ConfigIssue(
+                    severity=IssueSeverity.ERROR,
+                    component="reranker",
+                    message=(
+                        f"Cohere reranker requires API key via env var '{env_var}' "
+                        f"— not set. Pipeline build will fail."
+                    ),
+                ))
 
     if rr.type == RerankerType.LLM_JUDGE:
         judge_provider = getattr(rr, "judge_provider", None) or "openai"
@@ -813,15 +816,18 @@ def _check_reranker_compat(
                     "OPENAI_API_KEY — not set."
                 ),
             ))
-        elif judge_provider == "gemini" and not os.getenv(rr.api_key_env or "GEMINI_API_KEY"):
-            issues.append(ConfigIssue(
-                severity=IssueSeverity.ERROR,
-                component="reranker",
-                message=(
-                    "LLM-Judge reranker with provider='gemini' requires "
-                    f"'{rr.api_key_env or 'GEMINI_API_KEY'}' — not set."
-                ),
-            ))
+        elif judge_provider == "gemini":
+            if not rr.secret_ref or secret_ref_uses_env_backend(rr.secret_ref):
+                env_var = secret_ref_env_var_name(rr.secret_ref) or "GEMINI_API_KEY"
+                if not os.getenv(env_var):
+                    issues.append(ConfigIssue(
+                        severity=IssueSeverity.ERROR,
+                        component="reranker",
+                        message=(
+                            "LLM-Judge reranker with provider='gemini' requires "
+                            f"'{env_var}' — not set."
+                        ),
+                    ))
 
     if rr.top_k and config.retrieval.top_k_final:
         if rr.top_k < config.retrieval.top_k_final:

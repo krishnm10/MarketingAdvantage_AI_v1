@@ -3,7 +3,7 @@ Canonical JSON merge templates for pipeline PATCH and env-bootstrap paths.
 
 Provider semantics (models, base URLs, devices) come from merged default.json
 or static literals here — never from process environment.
-Secrets are referenced only via api_key_env names on the resolved dicts.
+Secrets are referenced only via secret_ref URIs on the resolved dicts.
 """
 
 from __future__ import annotations
@@ -12,6 +12,12 @@ from copy import deepcopy
 from typing import Any, Dict, Optional
 
 from app.core.config.client_config_resolver import load_default_client_raw_dict
+
+
+def _secret_ref_from_env(env_var: Optional[str]) -> Optional[Dict[str, str]]:
+    if not env_var or not str(env_var).strip():
+        return None
+    return {"uri": f"env://{str(env_var).strip()}"}
 
 
 def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -45,7 +51,11 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
                 "host": prev_chroma.get("host", base_chroma.get("host")),
                 "port": int(prev_chroma.get("port") or base_chroma.get("port") or 8000),
                 "ssl": bool(prev_chroma.get("ssl", base_chroma.get("ssl", False))),
-                "api_key_env": prev_chroma.get("api_key_env", base_chroma.get("api_key_env")),
+                "secret_ref": _secret_ref_from_env(
+                    (prev_chroma.get("secret_ref") or {}).get("uri")
+                    if isinstance(prev_chroma.get("secret_ref"), dict)
+                    else prev_chroma.get("api_key_env") or base_chroma.get("api_key_env")
+                ),
                 "tenant": str(prev_chroma.get("tenant") or base_chroma.get("tenant") or "default_tenant"),
                 "database": str(
                     prev_chroma.get("database") or base_chroma.get("database") or "default_database"
@@ -62,7 +72,11 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
             "collection": coll,
             "qdrant": {
                 "url": pq.get("url"),
-                "api_key_env": pq.get("api_key_env"),
+                "secret_ref": _secret_ref_from_env(
+                    (pq.get("secret_ref") or {}).get("uri")
+                    if isinstance(pq.get("secret_ref"), dict)
+                    else pq.get("api_key_env")
+                ),
                 "host": str(pq.get("host") or "localhost"),
                 "port": int(pq.get("port") or 6333),
                 "transport": str(pq.get("transport") or "auto"),
@@ -74,21 +88,27 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
         pp = prev.get("pinecone") if isinstance(prev.get("pinecone"), dict) else {}
         mode = str(pp.get("mode") or "cloud").strip().lower()
         pine_mode = "local" if mode == "local" else "cloud"
-        api_env = None if pine_mode == "local" else pp.get("api_key_env")
+        api_ref = None if pine_mode == "local" else _secret_ref_from_env(
+            (pp.get("secret_ref") or {}).get("uri")
+            if isinstance(pp.get("secret_ref"), dict)
+            else pp.get("api_key_env")
+        )
+        pinecone_block: Dict[str, Any] = {
+            "mode": pine_mode,
+            "index_name": str(pp.get("index_name") or "ingested-content"),
+            "namespace": str(pp.get("namespace") or "default"),
+            "embedding_dim": int(pp.get("embedding_dim") or 768),
+            "metric": str(pp.get("metric") or "cosine"),
+            "cloud": str(pp.get("cloud") or "aws"),
+            "region": str(pp.get("region") or "us-east-1"),
+            "local_path": pp.get("local_path"),
+        }
+        if api_ref is not None:
+            pinecone_block["secret_ref"] = api_ref
         return {
             "type": "pinecone",
             "collection": coll,
-            "pinecone": {
-                "mode": pine_mode,
-                "api_key_env": api_env,
-                "index_name": str(pp.get("index_name") or "ingested-content"),
-                "namespace": str(pp.get("namespace") or "default"),
-                "embedding_dim": int(pp.get("embedding_dim") or 768),
-                "metric": str(pp.get("metric") or "cosine"),
-                "cloud": str(pp.get("cloud") or "aws"),
-                "region": str(pp.get("region") or "us-east-1"),
-                "local_path": pp.get("local_path"),
-            },
+            "pinecone": pinecone_block,
         }
     if vt == "weaviate":
         pw = prev.get("weaviate") if isinstance(prev.get("weaviate"), dict) else {}
@@ -97,7 +117,11 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
             "collection": coll,
             "weaviate": {
                 "url": str(pw.get("url") or "http://localhost:8080"),
-                "api_key_env": pw.get("api_key_env"),
+                "secret_ref": _secret_ref_from_env(
+                    (pw.get("secret_ref") or {}).get("uri")
+                    if isinstance(pw.get("secret_ref"), dict)
+                    else pw.get("api_key_env")
+                ),
             },
         }
     if vt == "milvus":
@@ -107,7 +131,11 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
             "collection": coll,
             "milvus": {
                 "uri": pm.get("uri"),
-                "token_env": pm.get("token_env"),
+                "secret_ref": _secret_ref_from_env(
+                    (pm.get("secret_ref") or {}).get("uri")
+                    if isinstance(pm.get("secret_ref"), dict)
+                    else pm.get("token_env")
+                ),
                 "host": str(pm.get("host") or "localhost"),
                 "port": int(pm.get("port") or 19530),
             },
@@ -127,13 +155,20 @@ def default_vectordb_dict_for_type(vt: str, prev: Optional[Dict[str, Any]] = Non
 _STATIC_EMBEDDERS: Dict[str, Dict[str, Any]] = {
     "huggingface": {
         "type": "huggingface",
-        "huggingface": {"model": "BAAI/bge-large-en-v1.5", "device": "auto"},
+        "huggingface": {
+            "model": "BAAI/bge-large-en-v1.5",
+            "device": "auto",
+            "trust_remote_code": False,
+        },
         "query_prefix": "",
         "document_prefix": "",
     },
     "openai": {
         "type": "openai",
-        "openai": {"model": "text-embedding-3-small", "api_key_env": "OPENAI_API_KEY"},
+        "openai": {
+            "model": "text-embedding-3-small",
+            "secret_ref": {"uri": "env://OPENAI_API_KEY"},
+        },
     },
     "ollama": {
         "type": "ollama",
@@ -141,11 +176,17 @@ _STATIC_EMBEDDERS: Dict[str, Dict[str, Any]] = {
     },
     "cohere": {
         "type": "cohere",
-        "cohere": {"model": "embed-english-v3.0", "api_key_env": "COHERE_API_KEY"},
+        "cohere": {
+            "model": "embed-english-v3.0",
+            "secret_ref": {"uri": "env://COHERE_API_KEY"},
+        },
     },
     "gemini": {
         "type": "gemini",
-        "gemini": {"model": "gemini-embedding-001", "api_key_env": "GOOGLE_API_KEY"},
+        "gemini": {
+            "model": "gemini-embedding-001",
+            "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
+        },
     },
 }
 
@@ -185,32 +226,50 @@ _STATIC_LLMS: Dict[str, Dict[str, Any]] = {
     "openai": {
         "type": "openai",
         "model": "gpt-4o-mini",
-        "api_key_env": "OPENAI_API_KEY",
+        "secret_ref": {"uri": "env://OPENAI_API_KEY"},
         "base_url": "https://api.openai.com/v1",
     },
     "gemini": {
         "type": "gemini",
         "model": "gemini-1.5-flash",
-        "api_key_env": "GOOGLE_API_KEY",
+        "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
         "base_url": "https://generativelanguage.googleapis.com/v1",
     },
     "google": {
         "type": "gemini",
         "model": "gemini-1.5-flash",
-        "api_key_env": "GOOGLE_API_KEY",
+        "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
         "base_url": "https://generativelanguage.googleapis.com/v1",
     },
     "groq": {
         "type": "groq",
         "model": "llama-3.1-8b-instant",
-        "api_key_env": "GROQ_API_KEY",
+        "secret_ref": {"uri": "env://GROQ_API_KEY"},
         "base_url": "https://api.groq.com/openai/v1",
     },
     "anthropic": {
         "type": "anthropic",
         "model": "claude-3-5-sonnet-20241022",
-        "api_key_env": "ANTHROPIC_API_KEY",
+        "secret_ref": {"uri": "env://ANTHROPIC_API_KEY"},
         "base_url": "https://api.anthropic.com",
+    },
+    "xai": {
+        "type": "xai",
+        "model": "grok-2",
+        "secret_ref": {"uri": "env://XAI_API_KEY"},
+        "base_url": "https://api.x.ai/v1",
+    },
+    "deepseek": {
+        "type": "deepseek",
+        "model": "deepseek-chat",
+        "secret_ref": {"uri": "env://DEEPSEEK_API_KEY"},
+        "base_url": "https://api.deepseek.com",
+    },
+    "huggingface": {
+        "type": "huggingface",
+        "model": "meta-llama/Meta-Llama-3-8B-Instruct",
+        "secret_ref": {"uri": "env://HF_TOKEN"},
+        "base_url": "https://router.huggingface.co/v1",
     },
 }
 
@@ -219,6 +278,8 @@ def default_llm_root_dict_for_provider(llm_provider: str, prev: Optional[Dict[st
     lt = llm_provider.strip().lower()
     if lt == "google":
         lt = "gemini"
+    if lt == "grok":
+        lt = "xai"
     prev = prev or {}
     prev_single = prev.get("single") if isinstance(prev.get("single"), dict) else {}
 
@@ -233,7 +294,7 @@ def default_llm_root_dict_for_provider(llm_provider: str, prev: Optional[Dict[st
             raise ValueError(f"Unsupported LLM provider '{llm_provider}'.")
         single = deepcopy(static)
 
-    # When switching providers, do not let prev_single.type / model / api_key_env / base_url
+    # When switching providers, do not let prev_single.type / model / secret_ref / base_url
     # from the old provider overwrite the new static single (would leave e.g. gemini after PATCH ollama).
     prev_t = str(prev_single.get("type", "")).strip().lower()
     if prev_t == "google":

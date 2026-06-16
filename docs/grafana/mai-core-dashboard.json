@@ -1,0 +1,25 @@
+{
+  "title": "MAI Core Metrics",
+  "panels": [
+    {
+      "type": "graph",
+      "title": "Retrieval throughput",
+      "targets": [{ "expr": "sum(rate(mai_retrieval_total[5m])) by (route)" }]
+    },
+    {
+      "type": "graph",
+      "title": "Trust / faithfulness gate outcomes",
+      "targets": [{ "expr": "sum(rate(mai_trust_gate_total[5m])) by (outcome)" }]
+    },
+    {
+      "type": "graph",
+      "title": "LLM judge reranker fallbacks",
+      "targets": [{ "expr": "sum(rate(mai_llm_judge_fallback_total[5m])) by (fallback_reranker)" }]
+    },
+    {
+      "type": "graph",
+      "title": "HTTP request latency (p95)",
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(mai_http_request_duration_seconds_bucket[5m])) by (le))" }]
+    }
+  ]
+}

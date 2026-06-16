@@ -18,6 +18,7 @@ import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
 import { cn } from "@/lib/utils";
 import { useTenant } from "@/contexts/TenantContext";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 
 interface OverviewData {
   client_id: string;
@@ -65,6 +66,12 @@ export default function TenantIsolationDashboardPage() {
   const [data, setData] = useState<OverviewData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [erasureDialogOpen, setErasureDialogOpen] = useState(false);
+  const [erasureLoading, setErasureLoading] = useState(false);
+  const [erasureToast, setErasureToast] = useState<{
+    type: "success" | "warning" | "error";
+    msg: string;
+  } | null>(null);
 
   const load = useCallback(async () => {
     if (!clientId) return;
@@ -88,6 +95,46 @@ export default function TenantIsolationDashboardPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  const handleCorpusErasure = async () => {
+    if (!clientId) return;
+    setErasureLoading(true);
+    setErasureToast(null);
+    try {
+      const { data: result } = await apiClient.delete<{
+        deleted_chunks: number;
+        failed_chunks: number;
+        deleted_files?: number;
+      }>(`/api/v2/ingestion-admin/tenant/${encodeURIComponent(clientId)}/corpus`);
+
+      const deleted = result.deleted_chunks ?? 0;
+      const failed = result.failed_chunks ?? 0;
+
+      if (failed > 0) {
+        setErasureToast({
+          type: "warning",
+          msg: `Partial erasure: ${deleted} chunks deleted, ${failed} failed. Retry or contact support.`,
+        });
+      } else {
+        setErasureToast({
+          type: "success",
+          msg: `Corpus deleted: ${deleted} chunks removed.`,
+        });
+      }
+      setErasureDialogOpen(false);
+      await load();
+    } catch (e: unknown) {
+      const msg =
+        (e as { response?: { data?: { detail?: string } } }).response?.data
+          ?.detail ?? (e instanceof Error ? e.message : "Corpus erasure failed.");
+      setErasureToast({
+        type: "error",
+        msg: typeof msg === "string" ? msg : "Corpus erasure failed.",
+      });
+    } finally {
+      setErasureLoading(false);
+    }
+  };
 
   return (
     <div className="space-y-6 animate-fade-in -mx-1">
@@ -130,6 +177,19 @@ export default function TenantIsolationDashboardPage() {
           Refresh
         </button>
       </div>
+
+      {erasureToast && (
+        <div
+          className={cn(
+            "rounded-xl border px-4 py-3 text-sm",
+            erasureToast.type === "success" && "border-emerald-200 bg-emerald-50 text-emerald-900",
+            erasureToast.type === "warning" && "border-amber-200 bg-amber-50 text-amber-900",
+            erasureToast.type === "error" && "border-red-200 bg-red-50 text-red-900"
+          )}
+        >
+          {erasureToast.msg}
+        </div>
+      )}
 
       {error && (
         <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-4 text-red-900 text-sm">
@@ -191,7 +251,7 @@ export default function TenantIsolationDashboardPage() {
             </dl>
             <div className="mt-4 flex flex-wrap gap-3">
               <Link
-                href={`/settings/pipeline?client=${encodeURIComponent(data.client_id)}`}
+                href={`/pipeline/ai-models?client=${encodeURIComponent(data.client_id)}`}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-primary-700"
               >
                 Open pipeline builder
@@ -274,8 +334,34 @@ export default function TenantIsolationDashboardPage() {
             Generated {new Date(data.generated_at).toLocaleString()} · admin-only APIs enforce
             role checks; tenant filters are applied on the server.
           </p>
+
+          <div className="rounded-xl border border-red-200 bg-red-50/50 p-5 shadow-card">
+            <h2 className="text-sm font-semibold text-red-900">Danger Zone</h2>
+            <p className="mt-1 text-sm text-red-800">
+              Permanently delete all ingested chunks, vectors, and file records for tenant{" "}
+              <span className="font-mono font-semibold">{clientId}</span>. This cannot be undone.
+            </p>
+            <button
+              type="button"
+              onClick={() => setErasureDialogOpen(true)}
+              className="mt-4 rounded-lg bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700"
+            >
+              Delete Tenant Corpus
+            </button>
+          </div>
         </>
       )}
+
+      <ConfirmDialog
+        open={erasureDialogOpen}
+        title="Delete all ingested content for this tenant?"
+        description={`This permanently deletes all chunks, vectors, and files for tenant "${clientId}". This cannot be undone.`}
+        confirmLabel={`Delete corpus for ${clientId}`}
+        requireTypedConfirmation={clientId}
+        loading={erasureLoading}
+        onConfirm={handleCorpusErasure}
+        onCancel={() => setErasureDialogOpen(false)}
+      />
     </div>
   );
 }

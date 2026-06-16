@@ -17,7 +17,7 @@ COVERS:
 
 DESIGN RULES:
   1. ZERO hardcoding. ZERO defaults that silently hide config errors.
-  2. Every secret is referenced by ENV VAR NAME only — never the value.
+  2. Every secret uses SecretRef URIs — never raw keys or inline values.
   3. REQUIRED fields raise ValueError at load time — never at runtime.
   4. Optional fields = feature not enabled for that client.
   5. Supports JSON and YAML formats equally.
@@ -34,9 +34,19 @@ from __future__ import annotations
 import json
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, Literal
+from typing import Any, Dict, List, Optional, Union, Literal, TYPE_CHECKING
 
 from pydantic import BaseModel, Field, model_validator
+
+from app.core.config.secret_ref import (
+    SecretRef,
+    SecretsBackendConfig,
+    SecretsBackendProvider,
+    reject_legacy_secret_fields,
+)
+
+if TYPE_CHECKING:
+    from app.core.config.public_tenant_config import PublicTenantConfig
 
 
 # ══════════════════════════════════════════════════════════════
@@ -66,6 +76,8 @@ class LLMType(str, Enum):
     GROQ      = "groq"
     ANTHROPIC = "anthropic"
     GEMINI    = "gemini"
+    XAI       = "xai"
+    DEEPSEEK  = "deepseek"
     MISTRAL   = "mistral"
     AZURE_OPENAI = "azure_openai"
     HUGGINGFACE = "huggingface"
@@ -128,18 +140,18 @@ class ChromaConfig(BaseModel):
     )
     port:         int            = 8000
     ssl:          bool           = False
-    api_key_env:  Optional[str]  = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Env var NAME holding ChromaDB API key (for auth-enabled servers)."
-    )
-    secret_ref: Optional[str] = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the API key "
-        "(e.g. ARN or resource path). Unused at runtime unless a vault adapter is enabled.",
+        description="SecretRef for ChromaDB API key (auth-enabled servers).",
     )
     tenant:       str            = "default_tenant"
     database:     str            = "default_database"
     anonymized_telemetry: bool   = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
     @model_validator(mode="after")
     def validate_local_or_remote(self) -> "ChromaConfig":
@@ -157,19 +169,20 @@ class QdrantConfig(BaseModel):
         None,
         description="Qdrant Cloud URL. Takes precedence over host/port."
     )
-    api_key_env: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Env var NAME holding Qdrant API key. Never the key itself."
-    )
-    secret_ref: Optional[str] = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the Qdrant API key.",
+        description="SecretRef for Qdrant API key.",
     )
     host:         str   = "localhost"
     port:         int   = 6333
     transport:    Literal["auto", "http", "grpc"] = "auto"
     prefer_grpc:  bool  = False
     timeout:      float = 30.0
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
     @model_validator(mode="after")
     def validate_cloud_or_local(self) -> "QdrantConfig":
@@ -181,12 +194,9 @@ class QdrantConfig(BaseModel):
 class WeaviateConfig(BaseModel):
     """Weaviate — WCS cloud or local Docker."""
     url: str = Field(..., description="e.g. http://localhost:8080 or WCS URL")
-    api_key_env: Optional[str] = Field(
-        None, description="Env var NAME for WCS API key."
-    )
-    secret_ref: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for the Weaviate API key.",
+        description="SecretRef for Weaviate API key.",
     )
     embedded:           bool             = False
     transport:          Literal["auto", "http", "grpc"] = "auto"
@@ -195,14 +205,18 @@ class WeaviateConfig(BaseModel):
     skip_init_checks:   bool             = False
     additional_headers: Dict[str, str]   = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
+
 
 class PineconeConfig(BaseModel):
     """Pinecone — fully managed cloud VectorDB."""
     mode:           Literal["cloud", "local"] = "cloud"
-    api_key_env:    Optional[str] = Field(None, description="Env var NAME for Pinecone API key.")
-    secret_ref: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for the Pinecone API key.",
+        description="SecretRef for Pinecone API key (required when mode='cloud').",
     )
     index_name:     str  = Field(..., description="Pinecone index name — unique per client.")
     namespace:      str  = "default"
@@ -213,26 +227,35 @@ class PineconeConfig(BaseModel):
     pod_type: Optional[str] = None
     local_path: Optional[str] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
+
     @model_validator(mode="after")
     def validate_mode(self) -> "PineconeConfig":
-        if self.mode == "cloud" and not self.api_key_env:
-            raise ValueError("PineconeConfig: 'api_key_env' is required when mode='cloud'.")
+        if self.mode == "cloud" and not self.secret_ref:
+            raise ValueError("PineconeConfig: 'secret_ref' is required when mode='cloud'.")
         return self
 
 
 class MilvusConfig(BaseModel):
     """Milvus — standalone, cluster, or Zilliz Cloud."""
     uri:           Optional[str] = Field(None, description="Zilliz Cloud URI.")
-    token_env:     Optional[str] = Field(None, description="Env var for Zilliz token.")
-    secret_ref: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for the Milvus / Zilliz token.",
+        description="SecretRef for Milvus / Zilliz token.",
     )
     host:          str  = "localhost"
     port:          int  = 19530
     db_name:       str  = "default"
     alias:         str  = "default"
     transport:     Literal["auto", "grpc"] = "grpc"
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class RedisConfig(BaseModel):
@@ -246,12 +269,9 @@ class RedisConfig(BaseModel):
     )
     host:           str  = "localhost"
     port:           int  = 6379
-    password_env:   Optional[str] = Field(
-        None, description="Env var NAME holding Redis password."
-    )
-    secret_ref: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for the Redis password.",
+        description="SecretRef for Redis password.",
     )
     username:       Optional[str] = None
     db:             int  = 0
@@ -260,6 +280,11 @@ class RedisConfig(BaseModel):
         None, description="Path to CA cert file for TLS verification."
     )
     prefix:         str  = "vec:"
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class VectorDBConfig(BaseModel):
@@ -312,13 +337,14 @@ class OllamaEmbedderConfig(BaseModel):
 
 class OpenAIEmbedderConfig(BaseModel):
     model:            str            = Field(..., description="e.g. text-embedding-3-small")
-    api_key_env:      str            = Field(..., description="Env var NAME for API key.")
-    secret_ref:       Optional[str]  = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the embedding API key.",
-    )
+    secret_ref:       SecretRef        = Field(..., description="SecretRef for OpenAI API key.")
     organization_env: Optional[str] = None
     normalize:        bool           = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 # ✅ EXACT FIX — change only device default
@@ -327,16 +353,37 @@ class HuggingFaceEmbedderConfig(BaseModel):
     device: str = "auto"         # ← "auto" → _resolve_device() in HuggingFaceSTEmbedder
     batch_size: int = 32
     normalize: bool = True
+    trust_remote_code: bool = Field(
+        False,
+        description=(
+            "Allow HuggingFace to execute custom Python from the model repo. "
+            "Required for some models (e.g. nomic-ai/nomic-embed-text-v1.5)."
+        ),
+    )
+    revision: Optional[str] = Field(
+        None,
+        description="Optional HuggingFace Hub revision (branch, tag, or commit).",
+    )
+    secret_ref: Optional[SecretRef] = Field(
+        None,
+        description="SecretRef for HuggingFace Hub token (gated models).",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class CohereEmbedderConfig(BaseModel):
     model:       str = Field(..., description="e.g. embed-english-v3.0")
-    api_key_env: str = Field(..., description="Env var NAME for Cohere API key.")
-    secret_ref:  Optional[str] = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the Cohere API key.",
-    )
+    secret_ref:  SecretRef = Field(..., description="SecretRef for Cohere API key.")
     normalize:   bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class GeminiEmbedderConfig(BaseModel):
@@ -345,15 +392,16 @@ class GeminiEmbedderConfig(BaseModel):
         "gemini-embedding-001",
         description="Gemini embedding model ID (e.g. 'gemini-embedding-001').",
     )
-    api_key_env: str = Field(
-        "GOOGLE_API_KEY",
-        description="Env var NAME holding the Google AI API key.",
-    )
-    secret_ref: Optional[str] = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the Google AI API key.",
+    secret_ref: SecretRef = Field(
+        ...,
+        description="SecretRef for Google AI API key.",
     )
     normalize:   bool = True
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class EmbedderConfig(BaseModel):
@@ -449,10 +497,9 @@ class SingleLLMConfig(BaseModel):
     """Single LLM for RAG generation."""
     type:          LLMType       = Field(..., description="REQUIRED.")
     model:         str           = Field(..., description="Model name e.g. llama3.2")
-    api_key_env:   Optional[str] = Field(None, description="Env var NAME for API key.")
-    secret_ref:    Optional[str] = Field(
+    secret_ref:    Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for the LLM API key.",
+        description="SecretRef for LLM API key (cloud providers).",
     )
     base_url:      str           = Field(..., description="LLM server URL — per client.")
     temperature:   float         = 0.3
@@ -460,21 +507,27 @@ class SingleLLMConfig(BaseModel):
     system_prompt: Optional[str] = None
     timeout:       int           = 60
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
+
 
 class ChainStepConfig(BaseModel):
     """One step in a multi-LLM chain (e.g. extract → summarize → generate)."""
     step_name:     str           = Field(..., description="e.g. extract, summarize, answer")
     type:          LLMType       = Field(..., description="REQUIRED.")
     model:         str           = Field(..., description="Model name.")
-    api_key_env:   Optional[str] = None
-    secret_ref:    Optional[str] = Field(
-        None,
-        description="Optional vault / secrets-manager reference for the LLM API key.",
-    )
+    secret_ref:    Optional[SecretRef] = None
     base_url:      str           = Field(..., description="LLM server URL.")
     system_prompt: Optional[str] = None
     temperature:   float         = 0.3
     max_tokens:    int           = 1024
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 class LLMConfig(BaseModel):
@@ -503,10 +556,9 @@ class RerankerConfig(BaseModel):
     """
     type:        RerankerType  = Field(..., description="REQUIRED if reranker block present.")
     model:       Optional[str] = Field(None, description="Model path, HF model ID, or LLM model name for llm_judge.")
-    api_key_env: Optional[str] = Field(None, description="Env var NAME for API key (Cohere, OpenAI LLM judge, Gemini LLM judge).")
-    secret_ref: Optional[str] = Field(
+    secret_ref: Optional[SecretRef] = Field(
         None,
-        description="Optional vault / secrets-manager reference for reranker / judge credentials.",
+        description="SecretRef for reranker / judge credentials (Cohere, LLM judge).",
     )
     device:      str           = "cpu"
     top_k:       int           = Field(5, description="Final results returned after reranking.")
@@ -514,6 +566,11 @@ class RerankerConfig(BaseModel):
     # LLM judge-specific settings (used when type=llm_judge)
     judge_provider: Optional[str] = Field(None, description="LLM provider for judge: 'openai' | 'gemini'. Defaults to 'openai'.")
     judge_strategy: Optional[str] = Field(None, description="Judge strategy: 'pointwise' | 'listwise'. Defaults to 'pointwise'.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -621,6 +678,29 @@ class RetrievalConfig(BaseModel):
         description="Allow multi-turn query rewrite before retrieval (chat UI toggle).",
     )
 
+    # ── Grounding gate (opt-in; calibrate threshold from golden-set p10) ───
+    enforce_grounding: bool = Field(
+        False,
+        description=(
+            "When true, refuse answers whose faithfulness score is below "
+            "grounding_threshold. Default OFF — enable only after golden-set calibration."
+        ),
+    )
+    grounding_threshold: float = Field(
+        0.0,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Minimum faithfulness score (0–1) when enforce_grounding is true. "
+            "Set from RAGEvaluator golden-set p10 — not an arbitrary constant."
+        ),
+    )
+    grounding_refusal_message: str = Field(
+        "I cannot verify this answer against the retrieved context. "
+        "Please try a more specific question.",
+        description="User-visible message when the grounding gate refuses an answer.",
+    )
+
 
 # ══════════════════════════════════════════════════════════════
 # SECTION 6 — INGESTION CONFIG  ← NEW
@@ -702,6 +782,70 @@ class IngestionPhantomConfig(BaseModel):
     stage_collapse_concurrency: int = Field(4, ge=1)
 
 
+class IngestionVisionConfig(BaseModel):
+    """
+    Per-tenant multimodal / vision execution profile.
+
+    Replaces global ``AI_PROFILE`` and ``VISION_*`` env vars from ``app/config/ai_config.py``.
+    """
+
+    ai_profile: Literal["cpu", "gpu", "api", "dist"] = Field(
+        "cpu",
+        description="Execution profile: cpu | gpu | api | dist.",
+    )
+    vision_model_cpu: str = Field(
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        description="Local CPU vision model id.",
+    )
+    vision_model_gpu: str = Field(
+        "Qwen/Qwen2.5-VL-7B-Instruct",
+        description="Local GPU vision model id.",
+    )
+    vision_api_provider: Literal["openai", "anthropic", "google"] = Field(
+        "openai",
+        description="Cloud vision provider when ai_profile='api'.",
+    )
+    vision_api_model: str = Field(
+        "gpt-4o",
+        description="Cloud vision model when ai_profile='api'.",
+    )
+    vision_api_secret_ref: Optional[SecretRef] = Field(
+        None,
+        description="SecretRef for cloud vision API key.",
+    )
+    vision_quantize: Literal["none", "4bit", "8bit"] = Field(
+        "4bit",
+        description="GPU quantization mode for local vision models.",
+    )
+    vision_flash_attention: bool = True
+    vision_max_pixels: int = Field(
+        1280 * 28 * 28,
+        description="Max pixel budget (Qwen2.5-VL token budget).",
+    )
+    vision_min_pixels: int = Field(
+        256 * 28 * 28,
+        description="Min pixel budget for vision resize.",
+    )
+    vision_batch_size_cpu: int = Field(1, ge=1)
+    vision_batch_size_gpu: int = Field(4, ge=1)
+    video_frame_sample_rate: float = Field(1.0, gt=0.0)
+    video_max_duration_sec: int = Field(1800, ge=1)
+    video_vision_frames: int = Field(8, ge=1)
+    audio_model_cpu: str = Field("base", description="Whisper size on CPU.")
+    audio_model_gpu: str = Field("large", description="Whisper size on GPU.")
+    image_caption_model_cpu: str = "light"
+    image_caption_model_gpu: str = "large"
+    enable_visual_explanation: bool = True
+    enable_audio_language_detection: bool = True
+    max_concurrent_media_tasks: int = Field(2, ge=1)
+    media_timeout_seconds: int = Field(900, ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def reject_legacy_secrets(cls, data: Any) -> Any:
+        return reject_legacy_secret_fields(data)
+
+
 class IngestionConfig(BaseModel):
     """Controls the ingestion pipeline behaviour for this client."""
     batch_size:      int                 = Field(256, description="Vectors per VectorDB upsert.")
@@ -735,6 +879,10 @@ class IngestionConfig(BaseModel):
     enable_visual_llm_explanation: bool  = Field(
         True,
         description="Use LLM to explain charts/graphs/tables during ingestion."
+    )
+    vision: IngestionVisionConfig = Field(
+        default_factory=IngestionVisionConfig,
+        description="Multimodal vision/audio profile for this tenant.",
     )
 
 
@@ -1056,8 +1204,8 @@ class ContextWindowConfig(BaseModel):
 # EFFECTIVE TENANT RUNTIME — server-computed SSOT bridge (read-only)
 # ══════════════════════════════════════════════════════════════
 
-LLMSource = Literal["tenant_json", "system_default", "legacy_env_fallback"]
-RuntimeMode = Literal["authoritative_config", "legacy_env_fallback"]
+LLMSource = Literal["tenant_json", "system_default"]
+RuntimeMode = Literal["authoritative_config"]
 StackProfile = Literal["local_ollama", "cloud", "mixed"]
 PromptSSOTSource = Literal[
     "library",
@@ -1195,6 +1343,14 @@ class ClientConfig(BaseModel):
     description: str = Field("",  description="Notes about this configuration.")
     version:     str = Field("1.0", description="Config schema version for migration tracking.")
 
+    secrets_backend: Optional[SecretsBackendConfig] = Field(
+        None,
+        description=(
+            "Tenant-scoped secrets store connector. One backend per tenant; "
+            "integration blocks reference paths via SecretRef URIs."
+        ),
+    )
+
     # ── Pipeline components (REQUIRED) ─────────────────────
     vectordb: VectorDBConfig = Field(..., description="REQUIRED.")
     embedder: EmbedderConfig = Field(..., description="REQUIRED.")
@@ -1259,3 +1415,8 @@ class ClientConfig(BaseModel):
 
     def is_rag_enabled(self) -> bool:
         return self.llm is not None and self.features.enable_rag
+
+    def to_public(self) -> "PublicTenantConfig":
+        from app.core.config.public_tenant_config import PublicTenantConfig
+
+        return PublicTenantConfig.build_from_client_config(self)

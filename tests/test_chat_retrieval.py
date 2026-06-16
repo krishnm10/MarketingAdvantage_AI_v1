@@ -157,8 +157,9 @@ class TestQueryRewriter:
     def test_single_message_returns_raw(self):
         from app.api.v2.retrieve_chat_api import _rewrite_query, ChatMessage
         msgs = [ChatMessage(role="user", content="What is marketing?")]
-        result = _rewrite_query(msgs, llm=None, llm_model="test")
-        assert result == "What is marketing?"
+        text, llm_resp = _rewrite_query(msgs, llm=None, llm_model="test")
+        assert text == "What is marketing?"
+        assert llm_resp is None
 
     def test_multi_turn_with_no_llm_falls_back(self):
         """When LLM is None, multi-turn should still return last user message."""
@@ -173,8 +174,9 @@ class TestQueryRewriter:
             ChatMessage(role="assistant", content="AI is..."),
             ChatMessage(role="user", content="What are the risks?"),
         ]
-        result = _rewrite_query(msgs, llm=FakeLLM(), llm_model="test")
-        assert result == "What are the risks?"
+        text, llm_resp = _rewrite_query(msgs, llm=FakeLLM(), llm_model="test")
+        assert text == "What are the risks?"
+        assert llm_resp is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

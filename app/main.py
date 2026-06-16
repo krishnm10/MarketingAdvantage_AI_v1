@@ -124,9 +124,28 @@ else:
 _rate_limit_default = os.getenv("RATE_LIMIT_DEFAULT", "200/minute")
 _redis_url = os.getenv("REDIS_URL", "memory://")
 
+
+def _extract_tenant_or_ip(request: Request) -> str:
+    """Rate-limit key: tenant when JWT resolves, else client IP (never raises)."""
+    auth_header = request.headers.get("Authorization", "")
+    if auth_header.startswith("Bearer "):
+        try:
+            from app.auth.generate_token import verify_access_token
+
+            payload = verify_access_token(auth_header[7:].strip())
+            tenant_key = payload.get("client_id") or payload.get("sub")
+            if tenant_key:
+                return f"tenant:{tenant_key}"
+        except Exception:
+            pass
+    if _slowapi_available:
+        return get_remote_address(request)
+    return "anonymous"
+
+
 if _slowapi_available:
     limiter = Limiter(
-        key_func=get_remote_address,
+        key_func=_extract_tenant_or_ip,
         default_limits=[_rate_limit_default],
         storage_uri=_redis_url,
     )
@@ -155,6 +174,7 @@ from app.api.v2.model_discovery_api     import router as model_discovery_router
 # New Pluggable RAG Router (NEW — additive only)
 # ─────────────────────────────────────────────────────────────────────────────
 from app.api.v2.rag_api import router as rag_router
+from app.auth.guards import require_role
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 1 — Embedding Alignment Router (NEW — additive only)
@@ -253,6 +273,23 @@ async def lifespan(app: FastAPI):
         # Non-fatal: log and continue so the app starts (API calls will fail at request time)
     else:
         logger.info("✅ Environment validation passed (AI_PROFILE=%s)", _ai_profile)
+
+    # ─────────────────────────────────────────────────────────────────
+    # STEP 0.1: AUTH_USERS production guard — fail fast without credentials
+    # ─────────────────────────────────────────────────────────────────
+    _environment = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).lower()
+    _is_dev_mode = _environment in (
+        "development", "dev", "local", "debug", "test",
+    ) or os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
+    if not os.getenv("AUTH_USERS", "").strip() and not _is_dev_mode:
+        raise RuntimeError(
+            "AUTH_USERS must be set in non-dev environments. "
+            "Configure SHA-256 hashed user credentials before starting."
+        )
+    if not os.getenv("AUTH_USERS", "").strip():
+        logger.warning(
+            "AUTH_USERS not set — development default credentials are active (admin/admin)"
+        )
 
     # ─────────────────────────────────────────────────────────────────
     try:
@@ -393,24 +430,31 @@ async def lifespan(app: FastAPI):
         logger.warning("⚠️  Pluggable RAG unavailable — existing Chroma RAG still works")
 
     # ─────────────────────────────────────────────────────────────────
-    # STEP 4b: L0 Query Router (semantic prototypes at startup)
+    # STEP 4b: L0 Query Router — warm semantic prototypes in background (non-blocking)
     # ─────────────────────────────────────────────────────────────────
-    logger.info("\n[Startup] STEP 4b: L0 Query Router...")
-    try:
-        import asyncio
+    logger.info("\n[Startup] STEP 4b: L0 Query Router (background warmup)...")
 
-        from app.services.query_routing import get_orchestrator, init_orchestrator
-        from app.services.retrieval.query_embedder import embed_query
+    async def _warm_l0_router() -> None:
+        try:
+            import asyncio as _asyncio
 
-        async def _embed_for_router(text: str) -> list:
-            return await asyncio.to_thread(embed_query, text)
+            from app.services.query_routing import get_orchestrator, init_orchestrator
+            from app.services.retrieval.query_embedder import embed_query
 
-        init_orchestrator(embed_fn=_embed_for_router)
-        await get_orchestrator().startup()
-        logger.info("✅ L0 Query Router ready (semantic prototypes built)")
-    except Exception as e:
-        logger.warning("⚠️  L0 Query Router startup failed: %s", e)
-        logger.warning("⚠️  Chat routing falls back to rule layer + KNOWLEDGE default")
+            async def _embed_for_router(text: str) -> list:
+                return await _asyncio.to_thread(embed_query, text)
+
+            init_orchestrator(embed_fn=_embed_for_router)
+            await get_orchestrator().startup()
+            logger.info("✅ L0 Query Router ready (semantic prototypes built)")
+        except Exception as e:
+            logger.warning("⚠️  L0 Query Router warmup failed: %s", e)
+            logger.warning("⚠️  Chat routing falls back to rule layer + KNOWLEDGE default")
+
+    import asyncio as _asyncio
+
+    _asyncio.create_task(_warm_l0_router())
+    logger.info("   Semantic router warming in background — startup not blocked")
 
     # ─────────────────────────────────────────────────────────────────
     # STEP 5: PHANTOM Hardware Profiler (NEW — Phase 0)
@@ -690,7 +734,7 @@ async def _http_tracing_middleware(request: Request, call_next):
 # Dev default: localhost:3000 and localhost:8000 (explicit, not wildcard)
 # Production: set CORS_ORIGINS="https://app.yourdomain.com,..." in .env
 # =============================================================================
-_env = os.getenv("ENVIRONMENT", "production").lower()
+_env = os.getenv("ENVIRONMENT", os.getenv("ENV", "development")).lower()
 _raw_origins = os.getenv("CORS_ORIGINS", "").strip()
 
 if _raw_origins and _raw_origins != "*":
@@ -749,6 +793,9 @@ app.include_router(auth_router,                tags=["Auth"])
 app.include_router(ingestion_health_router,    tags=["Health"])
 app.include_router(ingestion_ws_router,        tags=["WebSocket"])
 app.include_router(config_router,              tags=["Configuration"])
+from app.api.v2.public_tenant_config_api import router as public_tenant_config_router
+app.include_router(public_tenant_config_router)
+
 app.include_router(retrieve_router,            tags=["Retrieval"])
 app.include_router(retrieve_chat_router,       tags=["Retrieval Chat"])
 app.include_router(model_discovery_router,     tags=["Model Discovery"])
@@ -793,11 +840,15 @@ app.include_router(
     tags=["Tenant Prompt Config"],
 )
 
+from app.api.v2.tenant_secrets_api import router as tenant_secrets_router
+app.include_router(tenant_secrets_router)
+
 from app.api.v2.rag_eval_api import router as rag_eval_router
 app.include_router(
     rag_eval_router,
     tags=["RAG Evaluation"],
 )
+
 
 # ── Phase 3 — Pipeline Template Gallery ────────────────────────────────────
 try:
@@ -1200,7 +1251,7 @@ async def chromadb_stats(refresh: bool = False):
 # =============================================================================
 
 @app.get("/phantom/stats", tags=["PHANTOM"])
-async def phantom_stats():
+async def phantom_stats(_user=Depends(require_role("admin"))):
     """
     PHANTOM Protocol runtime diagnostics.
 
@@ -1272,7 +1323,11 @@ async def phantom_stats():
 # =============================================================================
 
 @app.get("/api/v2/stats/token-usage", tags=["Stats"])
-async def token_usage_stats(tenant_id: str = "", month: str = ""):
+async def token_usage_stats(
+    tenant_id: str = "",
+    month: str = "",
+    _user=Depends(require_role("admin")),
+):
     """
     Get token usage summary for cost tracking.
 

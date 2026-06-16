@@ -523,7 +523,7 @@ function LinksCell({
       </a>
       <Link
         className="text-slate-600 hover:text-primary-600 hover:underline"
-        href={`/settings/pipeline?client=${encodeURIComponent(clientId)}`}
+        href={`/pipeline/ai-models?client=${encodeURIComponent(clientId)}`}
       >
         Pipeline config
       </Link>

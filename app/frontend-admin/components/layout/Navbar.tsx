@@ -13,23 +13,18 @@ import {
   Check,
   Loader2,
   AlertCircle,
+  Plus,
 } from "lucide-react";
-import { clearAuthToken, getAuthToken } from "@/lib/authToken";
+import { clearAuthToken, hasAuthHint } from "@/lib/authToken";
 import { cn } from "@/lib/utils";
 import { useTenantOptional } from "@/contexts/TenantContext";
-
-function getBreadcrumbs(pathname: string) {
-  const parts = pathname.split("/").filter(Boolean);
-  return parts.map((part, i) => ({
-    label: part.charAt(0).toUpperCase() + part.slice(1).replace(/-/g, " "),
-    href: "/" + parts.slice(0, i + 1).join("/"),
-    isLast: i === parts.length - 1,
-  }));
-}
+import { resolveBreadcrumbs } from "@/lib/breadcrumbs";
+import CreateTenantDialog from "@/components/tenant/CreateTenantDialog";
 
 function TenantSelector() {
   const tenant = useTenantOptional();
   const [open, setOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const dropdownRef = useRef<HTMLDivElement>(null);
 
@@ -61,6 +56,7 @@ function TenantSelector() {
   const isInList = tenants.some((t) => t.id === clientId);
 
   return (
+    <>
     <div className="relative" ref={dropdownRef}>
       {/* Trigger button */}
       <button
@@ -151,27 +147,51 @@ function TenantSelector() {
             )}
           </div>
 
-          {/* Footer with count */}
-          <div className="px-3 py-2 bg-slate-50 border-t border-slate-100 text-[11px] text-slate-400">
-            {tenants.length} tenant{tenants.length !== 1 ? "s" : ""} available
+          {/* Footer with count + create */}
+          <div className="border-t border-slate-100">
+            <button
+              type="button"
+              onClick={() => {
+                setOpen(false);
+                setFilter("");
+                setCreateOpen(true);
+              }}
+              className="w-full flex items-center gap-2 px-3 py-2.5 text-sm font-medium text-primary-700 hover:bg-primary-50 transition-colors"
+            >
+              <Plus className="h-3.5 w-3.5" />
+              New tenant…
+            </button>
+            <div className="px-3 py-2 bg-slate-50 text-[11px] text-slate-400">
+              {tenants.length} tenant{tenants.length !== 1 ? "s" : ""} available
+            </div>
           </div>
         </div>
       )}
     </div>
+    <CreateTenantDialog open={createOpen} onClose={() => setCreateOpen(false)} />
+    </>
   );
 }
 
 export default function Navbar() {
   const pathname = usePathname();
   const router = useRouter();
-  const breadcrumbs = getBreadcrumbs(pathname);
+  const breadcrumbs = resolveBreadcrumbs(pathname).map((crumb, index, all) => ({
+    ...crumb,
+    isLast: index === all.length - 1,
+  }));
   const [isLoggedIn, setIsLoggedIn] = useState(false);
 
   useEffect(() => {
-    setIsLoggedIn(!!getAuthToken());
+    setIsLoggedIn(hasAuthHint());
   }, []);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST", credentials: "include" });
+    } catch {
+      // Best-effort — clear local hint regardless.
+    }
     clearAuthToken();
     router.push("/auth/login");
   };

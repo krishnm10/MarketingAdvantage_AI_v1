@@ -26,12 +26,14 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from opentelemetry import trace as otel_trace
 
 from app.observability.rag_chat_trace import (
+    aggregate_query_token_usage,
     chunk_text_digest,
     llm_usage_payload,
     maybe_start_rag_chat_trace,
@@ -556,6 +558,10 @@ class ChatRetrieveRequest(BaseModel):
 class ChatResultItem(BaseModel):
     rank: int
     chunk_id: str
+    chunk_source: str = Field(
+        "postgres",
+        description="postgres | vector_payload — identity contract source",
+    )
     text: str
     score: float
     trust_decision: Optional[str] = None
@@ -727,6 +733,12 @@ def _build_direct_chat_response(
             ],
             "fail_reason": _direct_verification.fail_reason,
         },
+        "observability": {
+            "retrieval_latency_ms": elapsed_ms,
+            "generation_latency_ms": 0.0,
+            "total_latency_ms": round((time.perf_counter() - start) * 1000, 2),
+            "token_usage": aggregate_query_token_usage([]),
+        },
     }
     logger.info(
         "[ChatRetrieve] L0 direct response route=%s session=%s latency=%.0fms",
@@ -756,10 +768,11 @@ def _build_direct_chat_response(
 # LLM Resolver (shared by rewrite + answer generation)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _resolve_llm(
+async def _resolve_llm(
     provider: str,
     model: Optional[str],
     *,
+    config: "ClientConfig",
     api_key_env: Optional[str] = None,
     base_url: Optional[str] = None,
 ):
@@ -767,19 +780,22 @@ def _resolve_llm(
     Resolve an LLM connector instance for the given provider/model.
     Returns (llm_instance, resolved_model_name) or raises HTTPException.
     """
-    from app.retrieval.components import instantiate_llm
+    from app.retrieval.components import instantiate_llm_resolved
 
     provider = provider.lower()
     if provider == "google":
         provider = "gemini"
     if provider == "grok":
-        provider = "groq"
+        provider = "xai"
+    if provider == "hf":
+        provider = "huggingface"
 
     try:
         eff_model = model or ""
-        llm, resolved = instantiate_llm(
+        llm, resolved = await instantiate_llm_resolved(
             provider,
             eff_model,
+            config=config,
             api_key_env=api_key_env,
             base_url=base_url,
         )
@@ -792,13 +808,17 @@ def _resolve_llm(
 # Query Rewriter (multi-turn → standalone question)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _rewrite_query(messages: List[ChatMessage], llm, llm_model: str) -> str:
+def _rewrite_query(
+    messages: List[ChatMessage], llm, llm_model: str
+) -> Tuple[str, Optional[Any]]:
     """
     Given a multi-turn conversation, rewrite the last user message into a
     self-contained query suitable for embedding search.
+
+    Returns (rewritten_or_fallback_text, llm_response_or_none).
     """
     if len(messages) <= 1:
-        return messages[-1].content
+        return messages[-1].content, None
 
     history_lines = []
     for msg in messages[-_MAX_HISTORY_TURNS:]:
@@ -819,11 +839,12 @@ def _rewrite_query(messages: List[ChatMessage], llm, llm_model: str) -> str:
         resp = llm.generate(prompt, temperature=0.0, max_tokens=_QUERY_REWRITE_MAX_TOKENS)
         rewritten = (resp.text or "").strip()
         if len(rewritten) > 5:
-            return rewritten
+            return rewritten, resp
+        return messages[-1].content, resp
     except Exception as e:
         logger.warning("[ChatRetrieve] Query rewrite failed, using raw query: %s", e)
 
-    return messages[-1].content
+    return messages[-1].content, None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -865,9 +886,8 @@ async def chat_retrieve(
     )
     from app.retrieval.components import (
         log_runtime_telemetry,
-        resolve_config_or_fail,
+        resolve_client_config,
         resolve_runtime_components,
-        resolve_runtime_components_legacy,
     )
     from app.retrieval.runtime import RetrievalRuntime
     from app.retrieval.repository import RetrievalRepository
@@ -914,11 +934,8 @@ async def chat_retrieve(
     try:
         _trace_prev = time.perf_counter()
 
-        _cfg_chat, runtime_mode_chat = resolve_config_or_fail(retrieve_cid)
-        if _cfg_chat is not None:
-            rc = resolve_runtime_components(_cfg_chat)
-        else:
-            rc = resolve_runtime_components_legacy()
+        _cfg_chat = resolve_client_config(retrieve_cid)
+        rc = resolve_runtime_components(_cfg_chat)
 
         _active_template_id: Optional[str] = None
         if _cfg_chat is not None and _cfg_chat.retrieval:
@@ -941,7 +958,7 @@ async def chat_retrieve(
 
         # Resolve effective search parameters (tenant config is authoritative when
         # request fields are absent; explicit request values always win).
-        search_mode, effective_top_k = _resolve_search_params(req, rc, runtime_mode_chat)
+        search_mode, effective_top_k = _resolve_search_params(req, rc, rc.runtime_mode)
 
         # ── L0 Query Router (before embed / retrieve / LLM) ─────────────────────
         session_ctx = _ChatSessionCtx(chat_history=req.messages)
@@ -1027,9 +1044,10 @@ async def chat_retrieve(
         llm_provider = (req.llm_provider or cfg_llm).lower()
         llm_model_name: Optional[str] = req.llm_model or rc.llm_model
         try:
-            llm, llm_model_name = _resolve_llm(
+            llm, llm_model_name = await _resolve_llm(
                 llm_provider,
                 llm_model_name,
+                config=_cfg_chat,
                 api_key_env=rc.llm_api_key_env,
                 base_url=rc.llm_base_url,
             )
@@ -1038,10 +1056,18 @@ async def chat_retrieve(
         except Exception as e:
             raise HTTPException(400, f"Failed to initialize LLM ({llm_provider}): {e}")
 
+        rewrite_llm_resp: Optional[Any] = None
+        hyde_llm_resp: Optional[Any] = None
+        rewrite_executed = False
+        hyde_executed = False
+
         # ── Query rewrite (multi-turn → standalone) ──────────────────────────────
         rewritten_query: Optional[str] = None
         if _rewrite_enabled and len(req.messages) > 1:
-            rewritten_query = _rewrite_query(req.messages, llm, llm_model_name)
+            rewrite_executed = True
+            rewritten_query, rewrite_llm_resp = _rewrite_query(
+                req.messages, llm, llm_model_name
+            )
             # Security scan on rewritten query too
             rw_scan = _security_scan_text(rewritten_query, context="chat_rewrite")
             if rw_scan.injection_detected:
@@ -1092,18 +1118,20 @@ async def chat_retrieve(
                     "[ChatRetrieve] HyDE skipped — explicit identifier / order pin in query (retrieval-aligned embed)",
                 )
             else:
+                hyde_executed = True
                 try:
                     hyde_prompt = (
                         "Write a short factual paragraph that would answer this question. "
                         "Do not say you don't know. Just give a plausible answer in 2-3 sentences.\n\n"
                         f"Question: {embed_text}\n\nAnswer:"
                     )
-                    resp = llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
-                    text = (resp.text or "").strip()
+                    hyde_llm_resp = llm.generate(hyde_prompt, temperature=0.0, max_tokens=200)
+                    text = (hyde_llm_resp.text or "").strip()
                     if len(text) > 20:
                         embed_text = text
                         logger.info("[ChatRetrieve] HyDE expansion applied (%d chars)", len(text))
                 except Exception as e:
+                    hyde_llm_resp = None
                     logger.warning("[ChatRetrieve] HyDE failed: %s", e)
     
         if trace:
@@ -1159,13 +1187,10 @@ async def chat_retrieve(
             search_mode, _recall_limit, effective_top_k
         )
 
-        # Instantiate tenant-scoped retrieval pipeline components when config
-        # resolution succeeded; otherwise fall back to legacy repository wiring.
-        _pipe_c = None
-        if runtime_mode_chat == "authoritative_config" and _cfg_chat is not None:
-            from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client
+        # Instantiate tenant-scoped retrieval pipeline (required for repository wiring).
+        from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client_async
 
-            _pipe_c = get_query_pipeline_for_client(retrieve_cid)
+        _pipe_c = await get_query_pipeline_for_client_async(retrieve_cid)
 
         ctx = QueryContext(
             query=raw_query,
@@ -1184,14 +1209,14 @@ async def chat_retrieve(
             - Applies the router's recall window for hybrid/keyword modes.
             - Leaves DB session lifecycle to the caller.
             """
-            if _pipe_c is not None:
-                repository_local = RetrievalRepository(
-                    db_session=db_session,
-                    vectordb=_pipe_c.vectordb,
-                    collection=rc.collection,
-                )
-            else:
-                repository_local = RetrievalRepository(db_session=db_session)
+            from app.services.ingestion.ingestion_service_v2 import get_query_pipeline_for_client_async
+
+            _pipe_c = await get_query_pipeline_for_client_async(retrieve_cid)
+            repository_local = RetrievalRepository(
+                db_session=db_session,
+                vectordb=_pipe_c.vectordb,
+                collection=rc.collection or _pipe_c.config.vectordb.collection,
+            )
 
             runtime_local = RetrievalRuntime(
                 repository=repository_local,
@@ -1654,6 +1679,7 @@ async def chat_retrieve(
                     ChatResultItem(
                         rank=idx,
                         chunk_id=r.chunk_id,
+                        chunk_source="postgres",
                         text=r.text,
                         score=round(r.score, 6),
                         trust_decision=(
@@ -1823,6 +1849,8 @@ async def chat_retrieve(
         answer_integrity_snapshot: Optional[Dict[str, Any]] = None
         knowledge_verifier_debug: Optional[Dict[str, Any]] = None
         _trust_gate_outcome_override: Optional[str] = None
+        rag_llm_resp: Any = None
+        answer_llm_executed = False
     
         if req.generate_answer:
             if not results:
@@ -1991,7 +2019,6 @@ async def chat_retrieve(
     
                         refusal_scrubbed = False
                         raw_answer = ""
-                        rag_llm_resp: Any = None
                         rag_prompt = ""
                         if skipped_llm_grounding_miss:
                             answer = _GROUNDING_REFUSAL_PHRASE
@@ -2012,6 +2039,7 @@ async def chat_retrieve(
                             )
 
                             resp = None
+                            answer_llm_executed = True
                             try:
                                 resp = llm.generate(rag_prompt, temperature=0.0, max_tokens=1200)
                             except BaseException as _gen_exc:
@@ -2099,6 +2127,30 @@ async def chat_retrieve(
                             route=_route_decision.route.value,
                         )
                         answer = _llm_answer
+
+                        # Config-gated grounding refusal (default OFF).
+                        if getattr(rc, "enforce_grounding", False):
+                            from app.services.faithfulness_verifier import VerificationStatus
+
+                            _vstatus = _verification.status
+                            if _vstatus == VerificationStatus.PASS:
+                                _fscore = 1.0
+                            elif _vstatus == VerificationStatus.WARNING:
+                                _fscore = 0.75
+                            elif _vstatus == VerificationStatus.FAIL:
+                                _fscore = 0.0
+                            else:
+                                _fscore = 1.0  # SKIPPED — do not gate
+
+                            if (
+                                _vstatus != VerificationStatus.SKIPPED
+                                and _fscore < float(getattr(rc, "grounding_threshold", 0.0))
+                            ):
+                                answer = getattr(
+                                    rc,
+                                    "grounding_refusal_message",
+                                    "I cannot verify this answer against the retrieved context.",
+                                )
 
                         # Phase 6A: KNOWLEDGE/docset claim-level verifier (flag-gated).
                         _kv_shadow = bool(
@@ -2493,6 +2545,21 @@ async def chat_retrieve(
                     "format_version": SUMMARY_FORMAT_VERSION,
                 }
 
+        _token_steps: List[Optional[Tuple[str, Any]]] = []
+        if rewrite_executed:
+            _token_steps.append(("rewrite", rewrite_llm_resp))
+        if hyde_executed:
+            _token_steps.append(("hyde", hyde_llm_resp))
+        if answer_llm_executed:
+            _token_steps.append(("answer", rag_llm_resp))
+
+        debug_info["observability"] = {
+            "retrieval_latency_ms": elapsed_ms,
+            "generation_latency_ms": answer_latency_ms,
+            "total_latency_ms": round((time.perf_counter() - start) * 1000, 2),
+            "token_usage": aggregate_query_token_usage(_token_steps),
+        }
+
         logger.info(
             "[ChatRetrieve] session=%s query='%s' rewritten=%s results=%d latency=%.0fms",
             req.session_id, raw_query[:60], rewritten_query is not None, len(results), elapsed_ms,
@@ -2538,3 +2605,28 @@ async def chat_retrieve(
     finally:
         if trace:
             trace.emit_final()
+
+
+@router.post("/chat/stream")
+async def chat_retrieve_stream(
+    request: Request,
+    req: ChatRetrieveRequest,
+    db: AsyncSession = Depends(get_db),
+    _user=Depends(require_role("admin")),
+):
+    """SSE streaming variant of chat retrieval — aborts when client disconnects."""
+
+    async def stream_response():
+        try:
+            result = await chat_retrieve(req, db=db, _user=_user)
+            text = result.answer or ""
+            for token in text.split():
+                if await request.is_disconnected():
+                    return
+                yield f"data: {token}\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
+        finally:
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream")

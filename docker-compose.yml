@@ -1,0 +1,45 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: mai
+      POSTGRES_PASSWORD: mai
+      POSTGRES_DB: mai
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://mai:mai@postgres:5432/mai
+      REDIS_URL: redis://redis:6379/0
+      ENVIRONMENT: development
+      JWT_SECRET_KEY: change-me-in-production
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+
+  frontend-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend-admin
+    environment:
+      NEXT_PUBLIC_BACKEND_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

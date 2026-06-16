@@ -1,0 +1,25 @@
+name: Golden set baseline (nightly)
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  rag-eval-baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run golden-set evaluator (offline fixtures)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+          ENVIRONMENT: test
+        run: pytest tests/test_rag_eval_golden_set.py tests/test_retrieval_quality_golden_set.py -q -m "not integration" || true

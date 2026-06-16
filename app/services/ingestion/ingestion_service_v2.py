@@ -110,14 +110,19 @@ def _safe_env_bool(key: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-def _vector_transport_env(prefix: str) -> str:
-    mode = (
-        os.getenv(f"{prefix}_TRANSPORT")
-        or os.getenv("MAI_VECTOR_TRANSPORT")
-        or "auto"
-    )
-    mode = str(mode).strip().lower()
-    return mode if mode in ("auto", "http", "grpc") else "auto"
+def _pipeline_telemetry_labels(client_id: Optional[Any]) -> tuple[str, str]:
+    """Embedder + vectordb labels from merged tenant JSON (never MAI_* env)."""
+    if client_id is None or str(client_id).strip() == "":
+        return "unknown", "unknown"
+    try:
+        from app.core.config.pipeline_runtime import get_pipeline_identity
+
+        ident = get_pipeline_identity(str(client_id))
+        embedder = ident.get("embedder_model") or ident.get("embedder") or "unknown"
+        vectordb = ident.get("vectordb") or "unknown"
+        return str(embedder), str(vectordb)
+    except Exception:
+        return "unknown", "unknown"
 
 
 BATCH_SIZE: int = _safe_env_int("INGEST_BATCH_SIZE", 256)
@@ -722,25 +727,10 @@ async def _chunk_text_with_strategy(
 
 
 # ============================================================
-# PLUGGABLE PIPELINE RESOLVER  (env-var driven — no JSON files)
+# PLUGGABLE PIPELINE RESOLVER (tenant JSON via PipelineFactory)
 #
-# Priority order:
-#   1. Per-business env var:  MAI_{BUSINESS_ID}_VECTORDB / _EMBEDDER
-#   2. Global default env var: MAI_VECTORDB / MAI_EMBEDDER
-#   3. Hard default: chroma / ollama
-#
-# .env reference:
-#   MAI_VECTORDB           = chroma | qdrant | pinecone | milvus | weaviate | redis
-#   MAI_EMBEDDER           = ollama | openai | huggingface (default: ollama)
-#   CHROMA_PATH            = ./chroma_db
-#   MAI_COLLECTION         = ingested_content
-#   OLLAMA_EMBED_MODEL     = nomic-embed-text
-#   OLLAMA_BASE_URL        = http://localhost:11434
-#   OPENAI_EMBED_MODEL     = text-embedding-3-small
-#   OPENAI_API_KEY         = sk-...
-#   HF_EMBED_MODEL         = BAAI/bge-large-en
-#   QDRANT_URL             = http://localhost:6333
-#   QDRANT_API_KEY         = ...
+# Pipeline identity (embedder, vectordb, LLM, chunking, secrets) comes from
+# merged Client JSON — configure via Admin → Settings → Pipeline Builder.
 # ============================================================
 
 # ── Pipeline-per-client cache ─────────────────────────────────────────
@@ -840,48 +830,71 @@ def _get_ingestion_pipeline(business_id: Optional[Any] = None):
     return _get_ingestion_pipeline_for_client(client_id)
 
 
-def _build_config_from_env(
-    client_id: str,
-    vectordb_type: str,
-    embedder_type: str,
-    llm_type: str,
-) -> ClientConfig:
-    """Build a ClientConfig purely from environment variables."""
+if _HAS_CACHETOOLS:
 
-    allow_bootstrap = os.getenv("ALLOW_ENV_PIPELINE_BOOTSTRAP", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if client_id != "default" and not allow_bootstrap:
-        raise ValueError(
-            "_build_config_from_env is disabled for non-default tenants unless "
-            "ALLOW_ENV_PIPELINE_BOOTSTRAP=true. Use merged ClientConfig JSON and "
-            "get_client_config instead."
-        )
-    log_warning(
-        "[IngestionV2] _build_config_from_env used | client_id=%s — prefer merged JSON configs",
-        client_id,
-    )
+    async def _get_ingestion_pipeline_for_client_async(client_id: str):
+        """Async ingestion pipeline resolver (embedder + vectordb only)."""
+        from app.core.config.client_config_resolver import get_client_config_for_ingestion
 
-    from copy import deepcopy
+        with _ingestion_pipeline_lock:
+            if client_id in _ingestion_pipeline_cache:
+                return _ingestion_pipeline_cache[client_id]
 
-    from app.core.config.client_config_resolver import load_default_client_raw_dict
-    from app.core.config.default_config_templates import (
-        default_embedder_dict_for_type,
-        default_llm_root_dict_for_provider,
-        default_vectordb_dict_for_type,
-    )
+        cfg = get_client_config_for_ingestion(client_id)
+        cfg_ingestion = cfg.model_copy(update={"reranker": None, "llm": None})
+        result = await pipeline_factory.build_async(cfg_ingestion, skip_cache=True)
+        with _ingestion_pipeline_lock:
+            _ingestion_pipeline_cache[client_id] = result
+        return result
 
-    raw = deepcopy(load_default_client_raw_dict())
-    raw["client_id"] = client_id
-    raw["vectordb"] = default_vectordb_dict_for_type(vectordb_type, raw.get("vectordb") or {})
-    raw["embedder"] = default_embedder_dict_for_type(embedder_type, raw.get("embedder") or {})
-    raw["llm"] = default_llm_root_dict_for_provider(llm_type, raw.get("llm"))
+else:
 
-    return ClientConfig.from_dict(raw)
+    async def _get_ingestion_pipeline_for_client_async(client_id: str):  # type: ignore[no-redef]
+        from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+        cfg = get_client_config_for_ingestion(client_id)
+        cfg_ingestion = cfg.model_copy(update={"reranker": None, "llm": None})
+        return await pipeline_factory.build_async(cfg_ingestion, skip_cache=True)
 
 
+async def _get_ingestion_pipeline_async(business_id: Optional[Any] = None):
+    """Async variant of :func:`_get_ingestion_pipeline` for FastAPI async routes."""
+    client_id = _normalize_business_id(business_id)
+    return await _get_ingestion_pipeline_for_client_async(client_id)
+
+
+if _HAS_CACHETOOLS:
+
+    async def _get_pipeline_for_client_async(client_id: str):
+        """Async query-time pipeline resolver (embedder + vectordb + LLM + reranker)."""
+        from app.core.config.client_config_resolver import get_client_config
+
+        with _query_pipeline_lock:
+            if client_id in _query_pipeline_cache:
+                return _query_pipeline_cache[client_id]
+
+        cfg = get_client_config(client_id)
+        result = await pipeline_factory.build_async(cfg)
+        with _query_pipeline_lock:
+            _query_pipeline_cache[client_id] = result
+        return result
+
+else:
+
+    async def _get_pipeline_for_client_async(client_id: str):  # type: ignore[no-redef]
+        from app.core.config.client_config_resolver import get_client_config
+
+        cfg = get_client_config(client_id)
+        return await pipeline_factory.build_async(cfg)
+
+
+get_query_pipeline_for_client_async = _get_pipeline_for_client_async
+
+
+async def _get_pipeline_async(business_id: Optional[Any] = None):
+    """Async FULL pipeline resolver for RAG chat / retrieve endpoints."""
+    client_id = _normalize_business_id(business_id)
+    return await _get_pipeline_for_client_async(client_id)
 
 
 # ============================================================
@@ -1323,6 +1336,26 @@ def get_chroma_collection(
     return None, _CollectionAdapter(pipeline.vectordb, coll, client_id=client_id)
 
 
+async def get_chroma_collection_async(
+    skip_count: bool = False,
+    business_id: Optional[str] = None,
+) -> Tuple[None, _CollectionAdapter]:
+    """Async-safe variant of :func:`get_chroma_collection` for FastAPI handlers."""
+    del skip_count  # same semantics as sync shim; count is lazy on adapter
+    client_id = _normalize_business_id(business_id)
+    pipeline = await _get_ingestion_pipeline_async(business_id)
+    from app.core.config.client_config_resolver import get_client_config_for_ingestion
+
+    cfg = get_client_config_for_ingestion(client_id)
+    coll = (cfg.vectordb.collection or "").strip()
+    if not coll:
+        raise ValueError(
+            f"vectordb.collection is required for client_id={client_id!r}; "
+            "set it via pipeline-pluggable PATCH or Client JSON."
+        )
+    return None, _CollectionAdapter(pipeline.vectordb, coll, client_id=client_id)
+
+
 def get_embedder(business_id: Optional[str] = None) -> _EmbedderAdapter:
     """
     Returns _EmbedderAdapter.
@@ -1336,6 +1369,12 @@ def get_embedder(business_id: Optional[str] = None) -> _EmbedderAdapter:
     Uses the same ingestion pipeline as ``get_chroma_collection`` (embedder + vectordb only).
     """
     pipeline = _get_ingestion_pipeline(business_id)
+    return _EmbedderAdapter(pipeline.embedder)
+
+
+async def get_embedder_async(business_id: Optional[str] = None) -> _EmbedderAdapter:
+    """Async-safe variant of :func:`get_embedder` for FastAPI handlers."""
+    pipeline = await _get_ingestion_pipeline_async(business_id)
     return _EmbedderAdapter(pipeline.embedder)
 
 
@@ -1461,11 +1500,12 @@ class IngestionServiceV2:
                     f"STRICT_INGESTION_SECURITY: pre_embed_hook is required for "
                     f"process_file (file_id={file_id}). Route through IngestionOrchestrator."
                 )
+        _emb_label, _vdb_label = _pipeline_telemetry_labels(business_id)
         _plog = PipelineLogger(
             request_path="ingestion",
             client_id=business_id,
-            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
-            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+            embedder_model=_emb_label,
+            vectordb_backend=_vdb_label,
         )
         _plog.info("Starting file ingestion", file_id=file_id)
         async with async_session() as db:
@@ -1596,6 +1636,7 @@ class IngestionServiceV2:
         parsed_output: Dict[str, Any],
         *,
         pre_embed_hook: Optional[Any] = None,
+        client_id: Optional[str] = None,
     ):
         if pre_embed_hook is None:
             log_error(
@@ -1609,10 +1650,11 @@ class IngestionServiceV2:
                     f"STRICT_INGESTION_SECURITY: pre_embed_hook is required for "
                     f"ingest_parsed_output (file_id={file_id}). Route through IngestionOrchestrator."
                 )
+        _emb_label, _vdb_label = _pipeline_telemetry_labels(client_id)
         _plog = PipelineLogger(
             request_path="ingestion",
-            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
-            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+            embedder_model=_emb_label,
+            vectordb_backend=_vdb_label,
         )
         _plog.info("Direct ingestion started", file_id=file_id)
         async with async_session() as db:
@@ -1715,14 +1757,14 @@ class IngestionServiceV2:
         # _extract_chunks and _dedup_chunks now accept an optional `pipeline`
         # argument and skip _get_pipeline() when it is provided.
         # ──────────────────────────────────────────────────────────────────────
-        pipeline        = _get_ingestion_pipeline(business_id)
+        pipeline        = await _get_ingestion_pipeline_async(business_id)
         embedding_model = pipeline.embedder.info.model
         _plog = PipelineLogger(
             request_path="ingestion",
             client_id=str(business_id) if business_id else None,
             pipeline_id=str(file_id),
             embedder_model=embedding_model,
-            vectordb_backend=getattr(pipeline.vectordb, "kind", os.getenv("MAI_VECTORDB", "unknown")),
+            vectordb_backend=getattr(pipeline.vectordb, "kind", "unknown"),
         )
         _plog.info("Pipeline resolved for ingestion", file_id=str(file_id))
         log_info(
@@ -1965,7 +2007,7 @@ class IngestionServiceV2:
                 pre_embed_hook=pre_embed_hook,
             )
 
-        pipeline = _get_ingestion_pipeline(business_id)
+        pipeline = await _get_ingestion_pipeline_async(business_id)
         embedding_model = pipeline.embedder.info.model
         icfg = getattr(pipeline.config, "ingestion", None)
         batch_size = max(
@@ -1978,9 +2020,7 @@ class IngestionServiceV2:
             client_id=str(business_id) if business_id else None,
             pipeline_id=str(file_id),
             embedder_model=embedding_model,
-            vectordb_backend=getattr(
-                pipeline.vectordb, "kind", os.getenv("MAI_VECTORDB", "unknown")
-            ),
+            vectordb_backend=getattr(pipeline.vectordb, "kind", "unknown"),
         )
         _plog.info("Streaming pipeline resolved for ingestion", file_id=str(file_id))
 
@@ -2402,7 +2442,7 @@ class IngestionServiceV2:
         try:
             # FIX-D (carried forward): resolve pipeline once, never re-resolve
             if pipeline is None:
-                pipeline = _get_ingestion_pipeline(business_id)
+                pipeline = await _get_ingestion_pipeline_async(business_id)
             embedding_model = pipeline.embedder.info.model
             active_chunking_strategy = _resolve_chunking_strategy(pipeline)
 
@@ -2699,7 +2739,7 @@ class IngestionServiceV2:
 
         # FIX-D: Only resolve pipeline if not passed in from _run_pipeline.
         if pipeline is None:
-            pipeline = _get_ingestion_pipeline(business_id)
+            pipeline = await _get_ingestion_pipeline_async(business_id)
 
         dedup_cfg = pipeline.config.ingestion.deduplication
 
@@ -3072,11 +3112,12 @@ class IngestionServiceV2:
           Any exception logs full detail, marks file FAILED in DB, re-raises.
           Never swallow exceptions — silent success = corrupt / missing data.
         """
+        _emb_label, _vdb_label = _pipeline_telemetry_labels(business_id)
         _plog = PipelineLogger(
             request_path="ingestion",
             client_id=business_id,
-            embedder_model=os.getenv("MAI_EMBEDDER", "unknown"),
-            vectordb_backend=os.getenv("MAI_VECTORDB", "unknown"),
+            embedder_model=_emb_label,
+            vectordb_backend=_vdb_label,
         )
         _plog.info(
             "Embed and store started",
@@ -3163,7 +3204,7 @@ class IngestionServiceV2:
             # variables here, then explicitly capture them in every lambda
             # default arg. Zero reference captures from enclosing scope.
             if pipeline is None:
-                pipeline = _get_ingestion_pipeline(business_id)
+                pipeline = await _get_ingestion_pipeline_async(business_id)
     
             embedder:        Any = pipeline.embedder
             vectordb:        Any = pipeline.vectordb
@@ -3481,7 +3522,7 @@ class IngestionServiceV2:
         # Best-effort cleanup for partially written vectors.
         if semantic_hashes:
             try:
-                pipeline = _get_ingestion_pipeline(business_id)
+                pipeline = await _get_ingestion_pipeline_async(business_id)
                 pipeline.vectordb.delete_many(
                     collection=pipeline.config.vectordb.collection,
                     doc_ids=semantic_hashes,

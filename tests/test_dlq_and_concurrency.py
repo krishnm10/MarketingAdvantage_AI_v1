@@ -235,7 +235,7 @@ def test_ingest_file_semaphore_limits_concurrency() -> None:
         ), patch.object(
             IngestionOrchestrator,
             "_make_pii_hook",
-            return_value=lambda chunks: chunks,
+            return_value=(lambda chunks: chunks, []),
         ), patch(
             "app.services.ingestion.ingestion_service_v2.IngestionServiceV2.process_file",
             side_effect=slow_process_file,
@@ -285,7 +285,7 @@ def test_ingest_file_semaphore_released_on_exception() -> None:
         ), patch.object(
             IngestionOrchestrator,
             "_make_pii_hook",
-            return_value=lambda chunks: chunks,
+            return_value=(lambda chunks: chunks, []),
         ), patch(
             "app.services.ingestion.ingestion_service_v2.IngestionServiceV2.process_file",
             side_effect=fail_process,
@@ -297,7 +297,7 @@ def test_ingest_file_semaphore_released_on_exception() -> None:
         with patch.object(
             IngestionOrchestrator,
             "_make_pii_hook",
-            return_value=lambda chunks: chunks,
+            return_value=(lambda chunks: chunks, []),
         ), patch(
             "app.services.ingestion.ingestion_service_v2.IngestionServiceV2.process_file",
             side_effect=ok_process,

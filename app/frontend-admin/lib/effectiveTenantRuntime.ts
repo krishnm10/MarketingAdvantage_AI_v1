@@ -3,8 +3,8 @@
  * Keep in sync with Pydantic models — no `any` in consumers.
  */
 
-export type LLMSource = "tenant_json" | "system_default" | "legacy_env_fallback";
-export type RuntimeMode = "authoritative_config" | "legacy_env_fallback";
+export type LLMSource = "tenant_json" | "system_default";
+export type RuntimeMode = "authoritative_config";
 export type StackProfile = "local_ollama" | "cloud" | "mixed";
 export type PromptSSOTSource =
   | "library"

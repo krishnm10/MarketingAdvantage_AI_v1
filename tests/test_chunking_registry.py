@@ -60,7 +60,7 @@ def test_env_chunking_strategy_is_respected():
             )
         )
         assert len(chunks) >= 1
-        assert chunks[0].get("reasoning_ingestion", {}).get("chunking_strategy") == "smart_check"
+        assert chunks[0].get("reasoning_ingestion", {}).get("chunking_strategy") == "smart_check_v3"
     finally:
         os.environ.pop("CHUNKING_STRATEGY", None)
         clear_chunker_cache()

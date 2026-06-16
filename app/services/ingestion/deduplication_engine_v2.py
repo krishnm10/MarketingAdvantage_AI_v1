@@ -272,6 +272,7 @@ async def check_embedding_similarity(
     similarity_threshold: float = 0.95,
     top_k: int = 1,
     collection_name: str = None,
+    business_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Semantic duplicate check via vector similarity.
@@ -285,6 +286,9 @@ async def check_embedding_similarity(
     """
     try:
         resolved_collection = collection_name or "ingested_content"
+        tenant_filter = None
+        if business_id:
+            tenant_filter = {"business_id": str(business_id)}
 
         loop = asyncio.get_running_loop()
         hits = await loop.run_in_executor(
@@ -293,6 +297,7 @@ async def check_embedding_similarity(
                 collection=resolved_collection,
                 query_embedding=query_embedding,
                 top_k=top_k,
+                filters=tenant_filter,
             ),
         )
         if not hits:
@@ -602,6 +607,7 @@ async def deduplicate_chunks(
             _emb=embedder,
             _col=collection_name,
             _thresh=similarity_threshold,
+            _biz=business_id,
         ) -> Tuple[Dict, Optional[Dict]]:
             """
             Embed + similarity check for one chunk.
@@ -636,7 +642,7 @@ async def deduplicate_chunks(
 
                     sim_result = await check_embedding_similarity(
                         _db, _vdb, _emb, chunk_text, query_embedding,
-                        _thresh, collection_name=_col,
+                        _thresh, collection_name=_col, business_id=_biz,
                     )
                     return chunk, sim_result
 

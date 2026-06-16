@@ -165,6 +165,20 @@ _RETRIEVAL_LATENCY_SECONDS = Histogram(
     ("route", "search_mode"),
 )
 
+_LLM_JUDGE_FALLBACK_TOTAL = Counter(
+    "mai_llm_judge_fallback_total",
+    "Times reranker.type=llm_judge fell back to another plugin.",
+    ("fallback_reranker",),
+)
+
+
+def record_llm_judge_fallback(fallback_reranker: str) -> None:
+    try:
+        _LLM_JUDGE_FALLBACK_TOTAL.labels(fallback_reranker=fallback_reranker).inc()
+    except Exception:  # pragma: no cover
+        logger.debug("Failed to record llm_judge fallback metric", exc_info=True)
+
+
 _TRUST_GATE_TOTAL = Counter(
     "mai_trust_gate_total",
     "Total trust/faithfulness gate outcomes by route and outcome.",

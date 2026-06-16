@@ -17,6 +17,7 @@ from app.core.config.client_config_schema import (
     RerankerConfig,
     RerankerType,
 )
+from app.core.config.secret_ref import SecretRef, secret_ref_env_var_name
 
 if TYPE_CHECKING:
     from app.core.config.client_config_schema import ClientConfig
@@ -180,7 +181,7 @@ def coerce_reranker_config(
                 update={
                     "type": DEFAULT_LOCAL_RERANKER_TYPE,
                     "model": DEFAULT_LOCAL_RERANKER_MODEL,
-                    "api_key_env": None,
+                    "secret_ref": None,
                     "judge_provider": None,
                 }
             )
@@ -193,7 +194,7 @@ def coerce_reranker_config(
     model_raw = (cfg.model or "").strip()
     bare = _bare_llm_model(model_raw)
 
-    if cfg.api_key_env and not local_stack:
+    if secret_ref_env_var_name(cfg.secret_ref) and not local_stack:
         provider = cfg.judge_provider
         if not provider:
             provider = "gemini" if bare.lower().startswith("gemini") else "openai"
@@ -224,7 +225,7 @@ def coerce_reranker_config(
         update={
             "type": DEFAULT_LOCAL_RERANKER_TYPE,
             "model": DEFAULT_LOCAL_RERANKER_MODEL,
-            "api_key_env": None,
+            "secret_ref": None,
             "judge_provider": None,
         }
     )
@@ -331,7 +332,7 @@ def resolve_reranker_runtime(config: "ClientConfig") -> ResolvedRerankerRuntime:
         fallback_applied=fallback_applied,
         fallback_reason=fallback_reason,
         judge_provider=coerced.judge_provider,
-        api_key_env=coerced.api_key_env,
+        api_key_env=secret_ref_env_var_name(coerced.secret_ref),
     )
 
     _audit_reranker_coercion(
@@ -346,10 +347,13 @@ def resolve_reranker_runtime(config: "ClientConfig") -> ResolvedRerankerRuntime:
 
 def resolved_to_reranker_config(resolved: ResolvedRerankerRuntime) -> RerankerConfig:
     """Build a RerankerConfig suitable for persisting after coercion."""
+    secret_ref = None
+    if resolved.api_key_env:
+        secret_ref = SecretRef(uri=f"env://{resolved.api_key_env}")
     return RerankerConfig(
         type=resolved.coerced_type,
         model=resolved.persisted_model,
-        api_key_env=resolved.api_key_env,
+        secret_ref=secret_ref,
         judge_provider=resolved.judge_provider,
     )
 
@@ -373,7 +377,7 @@ def build_registry_kwargs(
         else:
             kwargs["model_name"] = resolved.model_name
     if plugin == "cohere":
-        api_key = _env(cfg.api_key_env)
+        api_key = _env(secret_ref_env_var_name(cfg.secret_ref))
         if api_key:
             kwargs["api_key"] = api_key
     device = cfg.device or "cpu"

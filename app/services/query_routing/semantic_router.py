@@ -104,7 +104,10 @@ class SemanticRouter:
         centroids: Dict[QueryRoute, List[float]] = {}
         for route, examples in PROTOTYPE_EXAMPLES.items():
             vectors: List[List[float]] = []
+            route_failed = False
             for ex in examples:
+                if route_failed:
+                    break
                 try:
                     raw = await self._embed_fn(ex)
                     vectors.append(_l2_normalize(raw))
@@ -114,6 +117,7 @@ class SemanticRouter:
                         route.value,
                         e,
                     )
+                    route_failed = True
             if vectors:
                 centroids[route] = _l2_normalize(_mean_vector(vectors))
         self._centroids = centroids

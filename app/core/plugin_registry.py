@@ -172,5 +172,16 @@ def _bootstrap_connectors() -> None:
     ingestor_registry.register("api", lambda **kw: APIConnector(**kw),
                                 description="REST API — supports APIKey/Basic/OAuth2/AzureAD")
 
+    import os
+
+    if os.getenv("KAFKA_CONNECTOR_ENABLED", "false").lower() in ("1", "true", "yes"):
+        from app.core.connectors.kafka_connector import KafkaConnector
+
+        ingestor_registry.register(
+            "kafka",
+            lambda **kw: KafkaConnector(**kw),
+            description="Kafka consumer — Azure AD auth supported (opt-in)",
+        )
+
 _bootstrap_connectors()
 

@@ -14,7 +14,7 @@ CHANGES IN THIS PATCH:
 
 DESIGN GUARANTEE:
   - NO default VectorDB, Embedder, LLM, or Reranker anywhere
-  - API keys ONLY from environment variables — never from config files
+  - API keys resolved via SecretResolver from tenant SecretRef URIs
   - Existing Chroma ingestion pipeline is completely untouched
   - Thread-safe pipeline caching per client_id
 ================================================================================
@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import logging
 import os
+import time
+from collections import OrderedDict
 from threading import RLock
 from typing import Any, Dict, List, Optional, Union
 
@@ -53,6 +55,7 @@ from app.core.config.client_config_schema import (
     LLMConfig,
     RerankerConfig,
 )
+from app.core.config.secret_ref import SecretRef
 
 # ── Plugin registries ────────────────────────────────────────────────────────
 from app.core.plugin_registry import (
@@ -70,11 +73,18 @@ from app.core.rerankers.base  import BaseReranker
 from app.core.llms.base       import BaseLLM
 from app.core.llms.chain      import LLMChain, ChainStep  # ← NEW
 from app.core.runtime.errors  import ConfigResolutionError
+from app.core.secrets.connectors.base import SecretResolutionError
+from app.core.secrets.credentials import resolve_secret_optional, resolve_secret_required
+from app.core.secrets.resolver import SecretResolver, get_secret_resolver
+from app.core.secrets.sync_bridge import run_async
 
 # ── RAG pipeline (the orchestrator we just built) ───────────────────────────
 from app.core.rag_pipeline import RAGPipeline, RAGResult  # ← NEW
 
 logger = logging.getLogger(__name__)
+
+_MAX_CACHED_PIPELINES = max(10, int(os.getenv("MAX_CACHED_PIPELINES", "100")))
+_MAX_CACHE_AGE_S = max(60, int(os.getenv("MAX_CACHED_PIPELINE_AGE_S", "3600")))
 
 
 def _prefer_grpc_transport(
@@ -227,17 +237,60 @@ class PipelineFactory:
                          on every request. Default: True.
     """
 
-    def __init__(self, *, cache_pipelines: bool = True):
+    def __init__(
+        self,
+        *,
+        cache_pipelines: bool = True,
+        secret_resolver: Optional[SecretResolver] = None,
+    ):
         self._cache_enabled = bool(cache_pipelines)
-        self._cache: Dict[str, AssembledPipeline] = {}
+        self._secret_resolver = secret_resolver
+        self._cache: OrderedDict[str, AssembledPipeline] = OrderedDict()
         self._cache_fingerprints: Dict[str, str] = {}
+        self._cache_inserted_at: Dict[str, float] = {}
         self._lock  = RLock()
+
+    def _evict_oldest_if_over_capacity(self) -> None:
+        """Evict LRU entries until within MAX_CACHED_PIPELINES (caller holds lock)."""
+        while len(self._cache) > _MAX_CACHED_PIPELINES:
+            oldest_id, oldest_pipeline = self._cache.popitem(last=False)
+            self._cache_fingerprints.pop(oldest_id, None)
+            self._cache_inserted_at.pop(oldest_id, None)
+            oldest_pipeline.close()
+            logger.info(
+                "[PipelineFactory] LRU evicted cached pipeline for '%s'.",
+                oldest_id,
+            )
+
+    def _is_cache_entry_stale(self, client_id: str) -> bool:
+        inserted_at = self._cache_inserted_at.get(client_id)
+        if inserted_at is None:
+            return True
+        return (time.time() - inserted_at) > _MAX_CACHE_AGE_S
+
+    def _remove_cache_entry(self, client_id: str) -> Optional[AssembledPipeline]:
+        """Pop a cache entry and close it (caller holds lock)."""
+        pipeline = self._cache.pop(client_id, None)
+        self._cache_fingerprints.pop(client_id, None)
+        self._cache_inserted_at.pop(client_id, None)
+        if pipeline is not None:
+            pipeline.close()
+        return pipeline
+
+    def _resolver(self) -> SecretResolver:
+        return self._secret_resolver or get_secret_resolver()
 
     # =========================================================================
     # Main public entry point
     # =========================================================================
 
     def build(self, config: ClientConfig, *, skip_cache: bool = False) -> AssembledPipeline:
+        """Synchronous wrapper around :meth:`build_async`."""
+        return run_async(self.build_async(config, skip_cache=skip_cache))
+
+    async def build_async(
+        self, config: ClientConfig, *, skip_cache: bool = False,
+    ) -> AssembledPipeline:
         """
         Build a complete pipeline from a validated ClientConfig.
 
@@ -305,20 +358,26 @@ class PipelineFactory:
         if self._cache_enabled and not skip_cache:
             with self._lock:
                 if client_id in self._cache:
-                    cached_fingerprint = self._cache_fingerprints.get(client_id)
-                    if cached_fingerprint == config_fingerprint:
+                    if self._is_cache_entry_stale(client_id):
                         logger.info(
-                            "[PipelineFactory] Cache hit for client '%s'.",
+                            "[PipelineFactory] Cache entry expired for '%s' — rebuilding.",
                             client_id,
                         )
-                        return self._cache[client_id]
-                    logger.info(
-                        "[PipelineFactory] Cache stale for client '%s' — rebuilding.",
-                        client_id,
-                    )
-                    stale_pipeline = self._cache.pop(client_id)
-                    self._cache_fingerprints.pop(client_id, None)
-                    stale_pipeline.close()
+                        self._remove_cache_entry(client_id)
+                    else:
+                        cached_fingerprint = self._cache_fingerprints.get(client_id)
+                        if cached_fingerprint == config_fingerprint:
+                            self._cache.move_to_end(client_id)
+                            logger.info(
+                                "[PipelineFactory] Cache hit for client '%s'.",
+                                client_id,
+                            )
+                            return self._cache[client_id]
+                        logger.info(
+                            "[PipelineFactory] Cache stale for client '%s' — rebuilding.",
+                            client_id,
+                        )
+                        self._remove_cache_entry(client_id)
 
         logger.info(
             "[PipelineFactory] Building pipeline | client=%s | fingerprint=%s | "
@@ -338,14 +397,14 @@ class PipelineFactory:
         )
 
         # ── Build each component ──────────────────────────────────────
-        vectordb = self._build_vectordb(config.vectordb)
+        vectordb = await self._build_vectordb(config.vectordb, config)
         # Wire tenant isolation setting from config into the adapter
         vectordb._tenant_isolation_enabled = (
             config.features.enable_multi_tenant_isolation
         )
-        embedder = self._build_embedder(config.embedder)
-        llm      = self._build_llm(config.llm)
-        reranker = self._build_reranker(config.reranker, parent_config=config)
+        embedder = await self._build_embedder(config.embedder, config)
+        llm      = await self._build_llm(config.llm, config)
+        reranker = await self._build_reranker(config.reranker, parent_config=config)
 
         # ── Ensure VectorDB collection exists ─────────────────────────
         # embedding_dim must match what the embedder actually produces.
@@ -450,7 +509,10 @@ class PipelineFactory:
         if self._cache_enabled and not skip_cache:
             with self._lock:
                 self._cache[client_id] = pipeline
+                self._cache.move_to_end(client_id)
                 self._cache_fingerprints[client_id] = config_fingerprint
+                self._cache_inserted_at[client_id] = time.time()
+                self._evict_oldest_if_over_capacity()
                 logger.info(
                     "[PipelineFactory] Cached pipeline for client '%s'.",
                     client_id,
@@ -469,9 +531,7 @@ class PipelineFactory:
         """Remove a cached pipeline — forces rebuild on next .build() call."""
         with self._lock:
             if client_id in self._cache:
-                pipeline = self._cache.pop(client_id)
-                self._cache_fingerprints.pop(client_id, None)
-                pipeline.close()
+                self._remove_cache_entry(client_id)
                 logger.info(
                     "[PipelineFactory] Cache invalidated for '%s'.", client_id
                 )
@@ -483,6 +543,7 @@ class PipelineFactory:
             count = len(cached_pipelines)
             self._cache.clear()
             self._cache_fingerprints.clear()
+            self._cache_inserted_at.clear()
             for pipeline in cached_pipelines:
                 pipeline.close()
             logger.info(
@@ -495,8 +556,14 @@ class PipelineFactory:
             return list(self._cache.keys())
 
     def get_cached(self, client_id: str) -> Optional[AssembledPipeline]:
-        """Return cached pipeline for client_id if present, else None."""
+        """Return cached pipeline for client_id if present and fresh, else None."""
         with self._lock:
+            if client_id not in self._cache:
+                return None
+            if self._is_cache_entry_stale(client_id):
+                self._remove_cache_entry(client_id)
+                return None
+            self._cache.move_to_end(client_id)
             return self._cache.get(client_id)
 
     # =========================================================================
@@ -505,12 +572,20 @@ class PipelineFactory:
 
     # ── VectorDB ─────────────────────────────────────────────────────────────
 
-    def _build_vectordb(self, cfg: VectorDBConfig) -> BaseVectorDB:
+    async def _build_vectordb(
+        self, cfg: VectorDBConfig, config: ClientConfig,
+    ) -> BaseVectorDB:
         t = cfg.type
+        resolver = self._resolver()
 
         if t == VectorDBType.CHROMA:
             c = cfg.chroma
-            api_key = _env(c.api_key_env) if c.api_key_env else None
+            api_key = await resolve_secret_optional(
+                c.secret_ref,
+                config=config,
+                purpose="vectordb.chroma",
+                resolver=resolver,
+            )
             return vectordb_registry.build(
                 "chroma",
                 persist_directory=c.persist_directory,
@@ -526,9 +601,13 @@ class PipelineFactory:
         if t == VectorDBType.QDRANT:
             c = cfg.qdrant
 
-            # If URL is provided, use URL mode (cloud or self-hosted endpoint).
             if c.url:
-                api_key = _env(c.api_key_env) if c.api_key_env else None
+                api_key = await resolve_secret_optional(
+                    c.secret_ref,
+                    config=config,
+                    purpose="vectordb.qdrant",
+                    resolver=resolver,
+                )
 
                 logger.info(
                     "[PipelineFactory] Qdrant URL mode | url=%s | api_key=%s",
@@ -547,7 +626,6 @@ class PipelineFactory:
                     timeout=c.timeout,
                 )
 
-            # ---- LOCAL MODE (default) ----
             logger.info(
                 "[PipelineFactory] Qdrant LOCAL mode | host=%s | port=%s",
                 c.host or "localhost",
@@ -566,10 +644,16 @@ class PipelineFactory:
             )
         if t == VectorDBType.WEAVIATE:
             c = cfg.weaviate
+            api_key = await resolve_secret_optional(
+                c.secret_ref,
+                config=config,
+                purpose="vectordb.weaviate",
+                resolver=resolver,
+            )
             return vectordb_registry.build(
                 "weaviate",
                 url=c.url,
-                api_key=_env(c.api_key_env) if c.api_key_env else None,
+                api_key=api_key,
                 embedded=c.embedded,
                 prefer_grpc=_prefer_grpc_transport(c.transport, fallback=True),
                 grpc_host=c.grpc_host,
@@ -580,7 +664,18 @@ class PipelineFactory:
 
         if t == VectorDBType.PINECONE:
             c = cfg.pinecone
-            api_key = _env(c.api_key_env) if (c.mode == "cloud" and c.api_key_env) else None
+            api_key = None
+            if c.mode == "cloud":
+                if c.secret_ref is None:
+                    raise SecretResolutionError(
+                        "Pinecone cloud mode requires vectordb.pinecone.secret_ref."
+                    )
+                api_key = await resolve_secret_required(
+                    c.secret_ref,
+                    config=config,
+                    purpose="vectordb.pinecone",
+                    resolver=resolver,
+                )
             return vectordb_registry.build(
                 "pinecone",
                 mode=c.mode,
@@ -602,10 +697,16 @@ class PipelineFactory:
                     "[PipelineFactory] Milvus transport '%s' requested, but PyMilvus uses gRPC. Proceeding with gRPC.",
                     c.transport,
                 )
+            token = await resolve_secret_optional(
+                c.secret_ref,
+                config=config,
+                purpose="vectordb.milvus",
+                resolver=resolver,
+            )
             return vectordb_registry.build(
                 "milvus",
                 uri=c.uri,
-                token=_env(c.token_env) if c.token_env else None,
+                token=token,
                 host=c.host,
                 port=c.port,
                 db_name=c.db_name,
@@ -614,12 +715,18 @@ class PipelineFactory:
 
         if t == VectorDBType.REDIS:
             c = cfg.redis
+            password = await resolve_secret_optional(
+                c.secret_ref,
+                config=config,
+                purpose="vectordb.redis",
+                resolver=resolver,
+            )
             return vectordb_registry.build(
                 "redis",
                 url=c.url,
                 host=c.host,
                 port=c.port,
-                password=_env(c.password_env) if c.password_env else None,
+                password=password,
                 username=c.username,
                 db=c.db,
                 ssl=c.ssl,
@@ -632,19 +739,31 @@ class PipelineFactory:
             f"Registered: {vectordb_registry.list()}"
         )
 
-    # ── Embedder ──────────────────────────────────────────────────────────────
-
-    def _build_embedder(self, cfg: EmbedderConfig) -> BaseEmbedder:
+    async def _build_embedder(
+        self, cfg: EmbedderConfig, config: ClientConfig,
+    ) -> BaseEmbedder:
         t = cfg.type
+        resolver = self._resolver()
 
         if t == EmbedderType.HUGGINGFACE:
             c = cfg.huggingface
+            hf_token = None
+            if c.secret_ref is not None:
+                hf_token = await resolve_secret_optional(
+                    c.secret_ref,
+                    config=config,
+                    purpose="embedder.huggingface",
+                    resolver=resolver,
+                )
             raw = embedder_registry.build(
                 "huggingface",
                 model=c.model,
                 device=c.device,
                 batch_size=c.batch_size,
                 normalize=c.normalize,
+                trust_remote_code=c.trust_remote_code,
+                revision=c.revision,
+                hf_token=hf_token,
             )
 
         elif t == EmbedderType.OLLAMA:
@@ -659,28 +778,50 @@ class PipelineFactory:
 
         elif t == EmbedderType.OPENAI:
             c = cfg.openai
+            api_key = await resolve_secret_required(
+                c.secret_ref,
+                config=config,
+                purpose="embedder.openai",
+                resolver=resolver,
+            )
+            organization = None
+            if c.organization_env:
+                import os
+                organization = os.environ.get(c.organization_env) or None
             raw = embedder_registry.build(
                 "openai",
-                api_key=_env(c.api_key_env),
+                api_key=api_key,
                 model=c.model,
-                organization=_env(c.organization_env) if c.organization_env else None,
+                organization=organization,
                 normalize=c.normalize,
             )
 
         elif t == EmbedderType.COHERE:
             c = cfg.cohere
+            api_key = await resolve_secret_required(
+                c.secret_ref,
+                config=config,
+                purpose="embedder.cohere",
+                resolver=resolver,
+            )
             raw = embedder_registry.build(
                 "cohere",
-                api_key=_env(c.api_key_env),
+                api_key=api_key,
                 model=c.model,
                 normalize=c.normalize,
             )
 
         elif t == EmbedderType.GEMINI:
             c = cfg.gemini
+            api_key = await resolve_secret_required(
+                c.secret_ref,
+                config=config,
+                purpose="embedder.gemini",
+                resolver=resolver,
+            )
             raw = embedder_registry.build(
                 "gemini",
-                api_key=_env(c.api_key_env),
+                api_key=api_key,
                 model=c.model,
                 normalize=c.normalize,
             )
@@ -710,16 +851,16 @@ class PipelineFactory:
 
     # ── LLM / LLMChain ───────────────────────────────────────────────────────
 
-    def _build_llm(
+    async def _build_llm(
         self,
         cfg: Optional[LLMConfig],
+        config: ClientConfig,
     ) -> Optional[Union[BaseLLM, LLMChain]]:
 
         if cfg is None:
             logger.info("[PipelineFactory] No LLM configured (retrieval-only mode).")
             return None
 
-        # ── Chain of LLMs ─────────────────────────────────────────────
         if cfg.chain:
             logger.info(
                 "[PipelineFactory] Building LLMChain | %d steps.",
@@ -727,11 +868,12 @@ class PipelineFactory:
             )
             steps: List[ChainStep] = []
             for i, step_cfg in enumerate(cfg.chain):
-                llm_instance = self._build_single_llm(
+                llm_instance = await self._build_single_llm(
                     llm_type=step_cfg.type,
                     model=step_cfg.model,
-                    api_key_env=step_cfg.api_key_env,
+                    secret_ref=step_cfg.secret_ref,
                     base_url=step_cfg.base_url,
+                    config=config,
                 )
                 steps.append(
                     ChainStep(
@@ -748,33 +890,41 @@ class PipelineFactory:
                 )
             return LLMChain(steps)
 
-        # ── Single LLM ────────────────────────────────────────────────
         if cfg.single:
             s = cfg.single
             logger.info(
                 "[PipelineFactory] Building single LLM | %s / %s",
                 s.type.value, s.model,
             )
-            return self._build_single_llm(
+            return await self._build_single_llm(
                 llm_type=s.type,
                 model=s.model,
-                api_key_env=s.api_key_env,
+                secret_ref=s.secret_ref,
                 base_url=s.base_url,
+                config=config,
             )
 
         return None
 
-    def _build_single_llm(
+    async def _build_single_llm(
         self,
         *,
         llm_type:    LLMType,
         model:       str,
-        api_key_env: Optional[str],
+        secret_ref:  Optional[SecretRef],
         base_url:    str,
+        config:      ClientConfig,
     ) -> BaseLLM:
-        """Build one LLM instance from registry. Resolves API key from env."""
+        """Build one LLM instance from registry using SecretResolver."""
 
-        api_key = _env(api_key_env) if api_key_env else None
+        api_key: Optional[str] = None
+        if secret_ref is not None:
+            api_key = await resolve_secret_required(
+                secret_ref,
+                config=config,
+                purpose=f"llm.{llm_type.value}",
+                resolver=self._resolver(),
+            )
 
         if llm_type == LLMType.OLLAMA:
             return llm_registry.build(
@@ -811,6 +961,20 @@ class PipelineFactory:
                 api_key=api_key,
             )
 
+        if llm_type == LLMType.HUGGINGFACE:
+            hf_base = (base_url or "https://router.huggingface.co/v1").strip()
+            if not api_key:
+                raise ValueError(
+                    "[PipelineFactory] HuggingFace LLM requires secret_ref "
+                    "(vault:// or env://) with a valid API token."
+                )
+            return llm_registry.build(
+                "openai",
+                model=model,
+                api_key=api_key,
+                base_url=hf_base,
+            )
+
         raise ValueError(
             f"[PipelineFactory] Unknown LLM type '{llm_type}'. "
             f"Registered: {llm_registry.list()}"
@@ -818,7 +982,7 @@ class PipelineFactory:
 
     # ── Reranker ──────────────────────────────────────────────────────────────
 
-    def _build_reranker(
+    async def _build_reranker(
         self,
         cfg: Optional[RerankerConfig],
         *,
@@ -848,7 +1012,14 @@ class PipelineFactory:
             _TYPE_TO_PLUGIN.get(t, t.value),
             cfg.model,
         )
-        api_key   = _env(cfg.api_key_env) if cfg.api_key_env else None
+        api_key: Optional[str] = None
+        if cfg.secret_ref is not None and parent_config is not None:
+            api_key = await resolve_secret_optional(
+                cfg.secret_ref,
+                config=parent_config,
+                purpose="reranker",
+                resolver=self._resolver(),
+            )
         device    = cfg.device or "cpu"
 
         logger.info(
@@ -876,9 +1047,8 @@ class PipelineFactory:
 
         if t == RerankerType.COHERE:
             if not api_key:
-                raise EnvironmentError(
-                    "[PipelineFactory] Cohere reranker requires 'api_key_env' "
-                    "in RerankerConfig."
+                raise SecretResolutionError(
+                    "[PipelineFactory] Cohere reranker requires secret_ref in RerankerConfig."
                 )
             kwargs = {"api_key": api_key}
             if model:
@@ -1089,35 +1259,7 @@ class PipelineFactory:
 # One instance serves all client pipelines in the entire application.
 # =============================================================================
 
-pipeline_factory = PipelineFactory(cache_pipelines=True)
-
-
-# =============================================================================
-# Private helper
-# =============================================================================
-
-def _env(name: Optional[str]) -> str:
-    """
-    Read a secret from environment variables.
-
-    Args:
-        name: The environment variable NAME (e.g. 'OPENAI_API_KEY_ACME').
-              NOT the value — the name.
-
-    Returns:
-        The string value of the env var.
-
-    Raises:
-        EnvironmentError: If env var is missing or empty.
-    """
-    if not name:
-        raise ValueError(
-            "[PipelineFactory] env var name is None — cannot read secret."
-        )
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise EnvironmentError(
-            f"[PipelineFactory] Required env var '{name}' is not set or empty.\n"
-            f"Set it with: export {name}=your_value"
-        )
-    return value
+pipeline_factory = PipelineFactory(
+    cache_pipelines=True,
+    secret_resolver=get_secret_resolver(),
+)

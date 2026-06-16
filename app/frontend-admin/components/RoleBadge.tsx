@@ -1,9 +1,9 @@
 "use client";
 
-import { getUserRole } from "../lib/auth";
+import { useAuth } from "@/lib/useAuth";
 
 export default function RoleBadge() {
-  const role = getUserRole();
+  const { role } = useAuth();
   if (!role) return null;
 
   return (

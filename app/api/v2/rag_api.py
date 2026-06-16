@@ -24,9 +24,10 @@ import json as _json_module
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from app.auth.guards import require_role
 from app.core.pipeline_factory import pipeline_factory
 from app.core.prompts.ssot import resolve_prompt_ssot
 from app.core.config.client_config_schema import ClientConfig
@@ -106,6 +107,10 @@ class RAGRetrievedChunkItem(BaseModel):
 
     rank: int
     chunk_id: str
+    chunk_source: str = Field(
+        "vector_payload",
+        description="postgres | vector_payload — identity contract source",
+    )
     score: float
     stage: str = Field(
         "context",
@@ -124,6 +129,7 @@ def _build_retrieved_chunks_for_eval(result: Any) -> List[RAGRetrievedChunkItem]
     Prefer reranked order when available; otherwise pre-rerank retrieval list.
     """
     from app.ai.evaluation.chunk_id_normalize import chunk_id_from_payload
+    from app.retrieval.types_retrieve import chunk_ref_from_vector_payload
 
     if result.reranked and result.reranked_chunks:
         source = result.reranked_chunks
@@ -139,6 +145,7 @@ def _build_retrieved_chunks_for_eval(result: Any) -> List[RAGRetrievedChunkItem]
         cid = chunk_id_from_payload(ch)
         if not cid:
             continue
+        cref = chunk_ref_from_vector_payload(ch)
         text = str(ch.get("text") or "").strip()
         if len(text) > 2000:
             text = text[:2000] + "…"
@@ -146,6 +153,7 @@ def _build_retrieved_chunks_for_eval(result: Any) -> List[RAGRetrievedChunkItem]
             RAGRetrievedChunkItem(
                 rank=rank,
                 chunk_id=cid,
+                chunk_source=cref.source,
                 score=float(ch.get("score") or 0.0),
                 stage=stage,
                 text=text or None,
@@ -175,7 +183,10 @@ class RAGQueryResponse(BaseModel):
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.post("/query", response_model=RAGQueryResponse)
-async def rag_query(req: RAGQueryRequest):
+async def rag_query(
+    req: RAGQueryRequest,
+    _user=Depends(require_role("admin")),
+):
     """
     Run a full RAG query using a pre-built client pipeline.
 
@@ -352,7 +363,10 @@ async def rag_query(req: RAGQueryRequest):
 
 
 @router.post("/pipeline/build")
-async def build_pipeline(req: BuildPipelineRequest):
+async def build_pipeline(
+    req: BuildPipelineRequest,
+    _user=Depends(require_role("admin")),
+):
     """
     Build (or rebuild) a client pipeline.
 
@@ -426,6 +440,7 @@ async def build_pipeline(req: BuildPipelineRequest):
 @router.delete("/pipeline/cache")
 async def invalidate_pipeline(
     client_id: str = Query(..., description="Client ID to remove from cache"),
+    _user=Depends(require_role("admin")),
 ):
     """
     Invalidate a cached pipeline.
@@ -441,6 +456,7 @@ async def invalidate_pipeline(
 @router.get("/pipeline/health")
 async def pipeline_health(
     client_id: str = Query(..., description="Client ID to check"),
+    _user=Depends(require_role("admin")),
 ):
     """Per-client pipeline health check (VectorDB reachability, etc.)"""
     tenant = _validated_tenant(
@@ -456,7 +472,7 @@ async def pipeline_health(
 
 
 @router.get("/pipeline/list")
-async def list_pipelines():
+async def list_pipelines(_user=Depends(require_role("admin"))):
     """List all currently cached client pipeline IDs."""
     return {
         "cached_pipelines": pipeline_factory.list_cached(),

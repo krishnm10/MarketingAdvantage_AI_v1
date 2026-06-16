@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
 from fastapi import APIRouter, HTTPException, Query
@@ -175,15 +177,208 @@ def _validate_config_dict_raises(merged_raw: Dict[str, Any]) -> None:
         )
 
 
+def _assert_config_path_allowed(path: Path) -> Path:
+    """Resolve *path* and ensure it lives under the primary configs directory."""
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(_CONFIGS_DIR.resolve())):
+        raise HTTPException(status_code=400, detail="Invalid configuration path.")
+    return resolved
+
+
 def _atomic_write_json(path: Path, data: Dict[str, Any]) -> None:
     """Write JSON atomically (temp + rename) under `_CONFIGS_DIR` containment."""
-    path = path.resolve()
-    if not str(path).startswith(str(_CONFIGS_DIR.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid configuration path.")
+    path = _assert_config_path_allowed(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     tmp.replace(path)
+
+
+def _atomic_write_json_exclusive(path: Path, data: Dict[str, Any]) -> None:
+    """
+    Create a new JSON config file exclusively (``O_CREAT | O_EXCL``).
+
+    Prevents TOCTOU races when two admins create the same tenant concurrently.
+    Raises ``FileExistsError`` if the target file already exists.
+    """
+    path = _assert_config_path_allowed(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(str(path), flags, 0o644)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+# Top-level Client JSON blocks safe to clone when seeding a new tenant.
+_TENANT_COPY_ALLOWLIST: Tuple[str, ...] = (
+    "retrieval",
+    "ingestion",
+    "parsers",
+    "features",
+    "prompt",
+)
+
+# Keys stripped recursively from allowlisted blocks (never copy secret material).
+_SECRET_FIELD_KEYS: frozenset[str] = frozenset(
+    {
+        "secret_ref",
+        "secrets_backend",
+        "vision_api_secret_ref",
+        "api_key_env",
+        "token_env",
+        "password_env",
+    }
+)
+
+
+def _scrub_secret_fields(obj: Any) -> Any:
+    """Deep-copy *obj* while removing secret-bearing keys at every level."""
+    if isinstance(obj, dict):
+        cleaned: Dict[str, Any] = {}
+        for key, value in obj.items():
+            if key in _SECRET_FIELD_KEYS:
+                continue
+            cleaned[key] = _scrub_secret_fields(value)
+        return cleaned
+    if isinstance(obj, list):
+        return [_scrub_secret_fields(item) for item in obj]
+    return obj
+
+
+def _copy_allowlisted_blocks(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    """Overlay only behavioural blocks from *source* onto *target* (no secrets)."""
+    from app.core.config.client_config_resolver import _deep_merge
+
+    for key in _TENANT_COPY_ALLOWLIST:
+        block = source.get(key)
+        if block is None and key == "parsers":
+            block = source.get("parser")
+        if not isinstance(block, dict):
+            continue
+        safe_block = _scrub_secret_fields(deepcopy(block))
+        existing = target.get(key)
+        if key == "parsers" and not isinstance(existing, dict):
+            existing = target.get("parser") if isinstance(target.get("parser"), dict) else {}
+        elif not isinstance(existing, dict):
+            existing = {}
+        merged = _deep_merge(existing, safe_block)
+        target[key] = merged
+        if key == "parsers" and "parser" in target:
+            del target["parser"]
+
+
+def _copy_provider_identities(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    """
+    Copy embedder / vectordb / LLM provider *types* and model names only.
+
+    Does not copy collection names, hosts, namespaces, persist paths, or secret_ref URIs.
+    """
+    from app.core.config.default_config_templates import (
+        default_embedder_dict_for_type,
+        default_llm_root_dict_for_provider,
+    )
+
+    embedder = source.get("embedder")
+    if isinstance(embedder, dict):
+        et = str(embedder.get("type") or "").strip().lower()
+        if et == "google":
+            et = "gemini"
+        if et:
+            sub = embedder.get(et) if isinstance(embedder.get(et), dict) else {}
+            safe_prev: Dict[str, Any] = {}
+            model = sub.get("model") if isinstance(sub, dict) else None
+            if model:
+                safe_prev[et] = {"model": model}
+            for prefix_key in ("query_prefix", "document_prefix"):
+                if prefix_key in embedder:
+                    safe_prev[prefix_key] = embedder[prefix_key]
+            target["embedder"] = default_embedder_dict_for_type(et, safe_prev)
+
+    vectordb = source.get("vectordb")
+    if isinstance(vectordb, dict):
+        vt = str(vectordb.get("type") or "").strip().lower()
+        if vt:
+            _apply_vectordb_type(target, vt)
+
+    llm = source.get("llm")
+    if isinstance(llm, dict):
+        single = llm.get("single") if isinstance(llm.get("single"), dict) else {}
+        chain = llm.get("chain") if isinstance(llm.get("chain"), list) else None
+        if chain:
+            safe_chain: List[Dict[str, Any]] = []
+            for step in chain:
+                if not isinstance(step, dict):
+                    continue
+                lt = str(step.get("type") or "").strip().lower()
+                if lt == "google":
+                    lt = "gemini"
+                if not lt:
+                    continue
+                safe_step = {"type": lt}
+                if step.get("model"):
+                    safe_step["model"] = step["model"]
+                if step.get("base_url"):
+                    safe_step["base_url"] = step["base_url"]
+                if step.get("temperature") is not None:
+                    safe_step["temperature"] = step["temperature"]
+                if step.get("max_tokens") is not None:
+                    safe_step["max_tokens"] = step["max_tokens"]
+                safe_chain.append(safe_step)
+            if safe_chain:
+                from app.core.config.default_config_templates import default_llm_root_dict_for_provider
+
+                first = safe_chain[0]
+                lt0 = str(first.get("type") or "").strip().lower()
+                root = default_llm_root_dict_for_provider(lt0, {"single": first})
+                root["chain"] = safe_chain
+                if "single" in root:
+                    del root["single"]
+                target["llm"] = root
+        elif single:
+            lt = str(single.get("type") or "").strip().lower()
+            if lt == "google":
+                lt = "gemini"
+            if lt:
+                safe_single: Dict[str, Any] = {"type": lt}
+                if single.get("model"):
+                    safe_single["model"] = single["model"]
+                if single.get("base_url"):
+                    safe_single["base_url"] = single["base_url"]
+                if single.get("temperature") is not None:
+                    safe_single["temperature"] = single["temperature"]
+                if single.get("max_tokens") is not None:
+                    safe_single["max_tokens"] = single["max_tokens"]
+                target["llm"] = default_llm_root_dict_for_provider(lt, {"single": safe_single})
+
+    reranker = source.get("reranker")
+    if isinstance(reranker, dict):
+        safe_rr = _scrub_secret_fields(deepcopy(reranker))
+        from app.core.config.client_config_resolver import _deep_merge
+
+        base_rr = target.get("reranker") if isinstance(target.get("reranker"), dict) else {}
+        target["reranker"] = _deep_merge(base_rr, safe_rr)
+
+
+def build_tenant_config_from_copy(new_id: str, copy_from_id: str) -> Dict[str, Any]:
+    """
+    Build a new tenant config by cloning only safe behavioural blocks from *copy_from_id*.
+
+    Starts from canonical defaults for *new_id*, then overlays allowlisted sections.
+    Never copies ``secrets_backend``, ``secret_ref`` URIs, or vectordb infra identifiers.
+    """
+    safe_new = sanitize_client_id(new_id)
+    source = _merged_effective_client_dict(copy_from_id)
+    cfg = _build_default_config_dict(safe_new)
+    _copy_allowlisted_blocks(cfg, source)
+    _copy_provider_identities(cfg, source)
+    cfg.pop("secrets_backend", None)
+    cfg["client_id"] = safe_new
+    from app.core.prompts.ssot import enforce_library_first_prompt_persist
+
+    return enforce_library_first_prompt_persist(cfg, client_id=safe_new)
 
 
 def _apply_vectordb_type(cfg: Dict[str, Any], vt: str) -> None:
@@ -204,11 +399,44 @@ def _apply_embedder_type(cfg: Dict[str, Any], et: str) -> None:
     cfg["embedder"] = default_embedder_dict_for_type(et, prev)
 
 
+def _apply_embedder_model(cfg: Dict[str, Any], model: str) -> None:
+    """Set embedder.{active_type}.model on merged Client JSON."""
+    emb = cfg.setdefault("embedder", {})
+    et = str(emb.get("type", "")).strip().lower()
+    if et == "google":
+        et = "gemini"
+    if not et:
+        raise ValueError("Cannot set embedder_model without embedder.type.")
+    sub = emb.setdefault(et, {})
+    if not isinstance(sub, dict):
+        sub = {}
+        emb[et] = sub
+    sub["model"] = model.strip()
+
+
 def _apply_llm_provider(cfg: Dict[str, Any], llm_provider: str) -> None:
     from app.core.config.default_config_templates import default_llm_root_dict_for_provider
 
     prev = cfg.get("llm") or {}
     cfg["llm"] = default_llm_root_dict_for_provider(llm_provider, prev)
+
+
+_LLM_MODEL_MAX_LEN = 200
+
+
+def _apply_llm_model(cfg: Dict[str, Any], model: str) -> None:
+    """Set llm.single.model on merged Client JSON (does not change type/base_url/secret_ref)."""
+    model = model.strip()
+    if not model:
+        raise ValueError("llm_model cannot be empty")
+    if len(model) > _LLM_MODEL_MAX_LEN:
+        raise ValueError(f"llm_model exceeds maximum length of {_LLM_MODEL_MAX_LEN}")
+    llm = cfg.setdefault("llm", {})
+    single = llm.get("single")
+    if not isinstance(single, dict):
+        single = {}
+        llm["single"] = single
+    single["model"] = model
 
 
 def _build_synthetic_pipeline_response(client_id: str) -> dict:
@@ -275,7 +503,15 @@ class PipelinePluggablePatch(BaseModel):
     """Sparse patch for pipeline fields stored in Client JSON (not .env)."""
     vectordb_type: Optional[str] = Field(None, description="e.g. chroma, qdrant, pinecone")
     embedder_type: Optional[str] = Field(None, description="e.g. ollama, openai, huggingface, gemini")
-    llm_provider:  Optional[str] = Field(None, description="e.g. ollama, openai, gemini")
+    embedder_model: Optional[str] = Field(
+        None,
+        description="Updates embedder.{active_type}.model in Client JSON.",
+    )
+    llm_provider:  Optional[str] = Field(None, description="e.g. ollama, openai, gemini, xai, deepseek")
+    llm_model: Optional[str] = Field(
+        None,
+        description="Updates llm.single.model in Client JSON.",
+    )
     collection:    Optional[str] = Field(None, description="Vector collection / logical name")
     search_mode:   Optional[str] = Field(None, description="semantic | hybrid | keyword")
     chroma_persist_directory: Optional[str] = Field(
@@ -833,9 +1069,25 @@ async def patch_pipeline_pluggable(client_id: str, patch: PipelinePluggablePatch
             _apply_embedder_type(merged, patch.embedder_type)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
+    if patch.embedder_model is not None:
+        model_raw = str(patch.embedder_model).strip()
+        if not model_raw:
+            raise HTTPException(status_code=400, detail="embedder_model must be non-empty when provided.")
+        try:
+            _apply_embedder_model(merged, model_raw)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
     if patch.llm_provider:
         try:
             _apply_llm_provider(merged, patch.llm_provider)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
+    if patch.llm_model is not None:
+        model_raw = str(patch.llm_model).strip()
+        if not model_raw:
+            raise HTTPException(status_code=400, detail="llm_model must be non-empty when provided.")
+        try:
+            _apply_llm_model(merged, model_raw)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
     if patch.collection is not None:
@@ -929,32 +1181,6 @@ async def patch_pipeline_pluggable(client_id: str, patch: PipelinePluggablePatch
     if not str(out_path).startswith(str(_CONFIGS_DIR.resolve())):
         raise HTTPException(status_code=400, detail="Invalid client_id.")
     _atomic_write_json(out_path, merged)
-
-    # #region agent log
-    try:
-        _dbg_path = Path(__file__).resolve().parents[3] / "debug-2bf9cb.log"
-        _vdb = merged.get("vectordb") or {}
-        _ch = _vdb.get("chroma") if isinstance(_vdb.get("chroma"), dict) else {}
-        _line = {
-            "sessionId": "2bf9cb",
-            "hypothesisId": "H1",
-            "location": "rag_config_api.py:patch_pipeline_pluggable",
-            "message": "wrote tenant client json",
-            "data": {
-                "client_id": cid,
-                "written_file": out_path.name,
-                "vectordb_type": _vdb.get("type"),
-                "collection": _vdb.get("collection"),
-                "chroma_persist": (_ch or {}).get("persist_directory"),
-                "client_name": merged.get("client_name"),
-            },
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_dbg_path, "a", encoding="utf-8") as _df:
-            _df.write(json.dumps(_line) + "\n")
-    except Exception:
-        pass
-    # #endregion
 
     from app.core.pipeline_factory import pipeline_factory
     from app.core.config.effective_tenant_runtime import (

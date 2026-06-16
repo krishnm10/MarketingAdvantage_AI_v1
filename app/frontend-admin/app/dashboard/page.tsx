@@ -30,6 +30,10 @@ import IngestionFeed from "./ingestion-feed";
 import apiClient from "@/lib/apiClient";
 import { API } from "@/lib/apiRoutes";
 import { useTenant } from "@/contexts/TenantContext";
+import { useConfig } from "@/contexts/ConfigContext";
+import { probeTenantSetupStatus } from "@/lib/tenantSetupStatus";
+import { ingestionFileBucket } from "@/lib/ingestionFileStatus";
+import NewTenantEmptyState from "@/components/tenant/NewTenantEmptyState";
 
 /* ─── Types ─── */
 interface SystemConfig {
@@ -198,6 +202,7 @@ function StatusBadge({ status }: { status: string }) {
 /* ═══════════════════════════════════════════════ */
 export default function UnifiedDashboard() {
   const { clientId } = useTenant();
+  const { config: publicConfig } = useConfig();
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
   const [files, setFiles] = useState<any[]>([]);
   const [health, setHealth] = useState<HealthData | null>(null);
@@ -207,33 +212,42 @@ export default function UnifiedDashboard() {
   const { formatDateTime } = useFormatDate();
   const [refreshKey, setRefreshKey] = useState(0);
   const [fetching, setFetching] = useState(false);
+  const [isFreshTenant, setIsFreshTenant] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
+  const [healthError, setHealthError] = useState<string | null>(null);
 
   /* ─── Fetchers ─── */
   const fetchFiles = useCallback(async () => {
     try {
+      setFilesError(null);
       const res = await apiClient.get(API.INGESTION_ADMIN.FILES(clientId));
       setFiles(res.data ?? []);
     } catch {
+      setFilesError("Failed to load files — check your connection or permissions.");
       setFiles([]);
     }
   }, [clientId]);
 
-  const fetchHealth = useCallback(async () => {
+  const fetchHealth = useCallback(async (): Promise<HealthData | null> => {
     try {
+      setHealthError(null);
       const res = await apiClient.get(`/api/v2/ingestion/health?client_id=${encodeURIComponent(clientId)}&scope=active`);
       setHealth(res.data);
+      return res.data;
     } catch {
+      setHealthError("Failed to load ingestion health.");
       setHealth({ status: "offline" });
+      return null;
     }
   }, [clientId]);
 
-  const fetchConfig = useCallback(async () => {
+  const fetchConfig = useCallback(async (healthData?: HealthData | null) => {
     try {
-      const [healthRes, configRes, plugRes] = await Promise.all([
-        apiClient.get(`/api/v2/ingestion/health?client_id=${encodeURIComponent(clientId)}&scope=active`),
+      const [configRes, plugRes] = await Promise.all([
         apiClient.get("/api/v2/config/").catch(() => null),
         apiClient.get(API.RAG_CONFIG.PIPELINE_PLUGGABLE_GET(clientId)).catch(() => null),
       ]);
+      const activeHealth = healthData ?? null;
       const env = configRes?.data?.config || {};
       const plug = plugRes?.data as {
         vectordb?: string;
@@ -266,9 +280,9 @@ export default function UnifiedDashboard() {
       const openaiLlm =
         llmP === "openai" && llmModel ? llmModel : env.OPENAI_LLM_MODEL || "gpt-4o-mini";
       setConfig({
-        vectordb: healthRes.data?.active?.vectordb || plug?.vectordb || "qdrant",
-        embedder: healthRes.data?.active?.embedder || plug?.embedder || "huggingface",
-        llm: healthRes.data?.active?.llm || plug?.llm || "ollama",
+        vectordb: activeHealth?.active?.vectordb || plug?.vectordb || "qdrant",
+        embedder: activeHealth?.active?.embedder || plug?.embedder || "huggingface",
+        llm: activeHealth?.active?.llm || plug?.llm || "ollama",
         collection: plug?.collection || "ingested_content",
         ollama_base: env.OLLAMA_BASE_URL || "http://localhost:11434",
         ollama_model: env.OLLAMA_LLM_MODEL || "llama3.1:8b",
@@ -330,7 +344,8 @@ export default function UnifiedDashboard() {
 
   const refreshAll = useCallback(async () => {
     setFetching(true);
-    await Promise.all([fetchFiles(), fetchHealth(), fetchConfig()]);
+    const healthData = await fetchHealth();
+    await Promise.all([fetchFiles(), fetchConfig(healthData)]);
     setFetching(false);
     setLastRefresh(new Date().toLocaleTimeString());
     setRefreshKey((k) => k + 1);
@@ -339,11 +354,23 @@ export default function UnifiedDashboard() {
   // Fetch once on mount
   useEffect(() => {
     refreshAll().finally(() => setLoading(false));
-  }, [refreshAll]);
+    // Only re-fetch when tenant changes — not when refreshAll identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [clientId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void probeTenantSetupStatus(clientId).then((result) => {
+      if (!cancelled) setIsFreshTenant(result.isFreshTenant);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [clientId]);
 
   const totalFiles = files.length;
-  const completedFiles = files.filter((f) => f.status === "completed" || f.status === "success").length;
-  const failedFiles = files.filter((f) => f.status === "failed" || f.status === "error").length;
+  const completedFiles = files.filter((f) => ingestionFileBucket(f.status) === "completed").length;
+  const failedFiles = files.filter((f) => ingestionFileBucket(f.status) === "failed").length;
   const isOnline = health?.status === "ok" || health?.status === "online" || health?.status === "healthy" || health?.status === "degraded";
   const activeVectorDb = (health?.active?.vectordb || config?.vectordb || "").toLowerCase();
   const activeEmbedder = (health?.active?.embedder || config?.embedder || "").toLowerCase();
@@ -397,6 +424,25 @@ export default function UnifiedDashboard() {
           )}
         </div>
       </div>
+
+      {isFreshTenant && !loading && (
+        <NewTenantEmptyState clientId={clientId} compact />
+      )}
+
+      {(filesError || healthError) && (
+        <div className="space-y-2">
+          {healthError && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              {healthError}
+            </div>
+          )}
+          {filesError && (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-900">
+              {filesError}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 rounded-xl bg-slate-100 p-1">
@@ -670,7 +716,9 @@ export default function UnifiedDashboard() {
               </div>
               <div>
                 <h2 className="text-base font-semibold text-slate-900">Pluggable Pipeline</h2>
-                <p className="text-xs text-slate-400">Resolved from merged Client JSON (tenant in NEXT_PUBLIC_DEFAULT_TENANT)</p>
+                <p className="text-xs text-slate-400">
+                  Resolved from public tenant config ({publicConfig?.client_name || clientId})
+                </p>
               </div>
             </div>
             <div className="grid grid-cols-1 gap-0 sm:grid-cols-2">

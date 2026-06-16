@@ -105,6 +105,7 @@ class EmbedderCatalogEntry:
         "embedder_type",
         "lang_support",
         "notes",
+        "requires_trust_remote_code",
     )
 
     # ------------------------------------------------------------------
@@ -218,6 +219,13 @@ class EmbedderCatalogEntry:
                 f"must be one of {sorted(self._VALID_STATUSES)}, got {vs!r}"
             )
 
+        # ── requires_trust_remote_code (optional, default false) ───
+        rtrc = raw.get("requires_trust_remote_code", False)
+        if not isinstance(rtrc, bool):
+            errors["requires_trust_remote_code"] = (
+                f"must be a boolean, got {rtrc!r}"
+            )
+
         # ── Fail fast on any schema error ────────────────────────────
         if errors:
             raise EmbedderCatalogValidationError(
@@ -242,6 +250,7 @@ class EmbedderCatalogEntry:
         object.__setattr__(self, "embedder_type",       raw.get("embedder_type") or None)
         object.__setattr__(self, "lang_support",        raw.get("lang_support") or "en")
         object.__setattr__(self, "notes",               raw.get("notes") or None)
+        object.__setattr__(self, "requires_trust_remote_code", bool(rtrc))
 
     def __setattr__(self, key: str, value: Any) -> None:
         raise AttributeError(

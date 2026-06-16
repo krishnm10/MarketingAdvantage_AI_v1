@@ -40,6 +40,7 @@ import json
 import logging
 import subprocess
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -567,6 +568,14 @@ _MODEL_TYPE_FAMILY_MAP: Dict[str, TokenizerFamily] = {
 }
 
 
+def _hf_pretrained_kwargs(entry: EmbedderCatalogEntry) -> Dict[str, Any]:
+    """Build kwargs for AutoTokenizer / AutoConfig when catalog requires remote code."""
+    kwargs: Dict[str, Any] = {}
+    if getattr(entry, "requires_trust_remote_code", False):
+        kwargs["trust_remote_code"] = True
+    return kwargs
+
+
 def _resolve_hf_tokenizer(
     entry: EmbedderCatalogEntry,
 ) -> Tuple[TokenizerContract, VerificationStatus]:
@@ -591,8 +600,9 @@ def _resolve_hf_tokenizer(
         ) from exc
 
     # Step 1 — load tokenizer
+    hf_kwargs = _hf_pretrained_kwargs(entry)
     try:
-        hf_tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+        hf_tok = AutoTokenizer.from_pretrained(model_id, use_fast=True, **hf_kwargs)
     except Exception as exc:
         raise TokenizerResolutionError(
             model_id=model_id,
@@ -605,7 +615,7 @@ def _resolve_hf_tokenizer(
     discovered_model_type: Optional[str] = None
     try:
         from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(model_id)
+        cfg = AutoConfig.from_pretrained(model_id, **hf_kwargs)
         discovered_max = getattr(cfg, "max_position_embeddings", None)
         discovered_model_type = getattr(cfg, "model_type", None)
     except Exception as exc:
@@ -863,8 +873,19 @@ _CLOUD_SPECIAL_TOKENS: Dict[str, Dict[str, str]] = {
 }
 
 
+@dataclass(frozen=True)
+class CloudEmbedderApiKeys:
+    """Explicit cloud credentials — never read from os.environ in registry paths."""
+
+    openai: Optional[str] = None
+    cohere: Optional[str] = None
+    google: Optional[str] = None
+
+
 def _resolve_cloud_tokenizer(
     entry: EmbedderCatalogEntry,
+    *,
+    api_keys: Optional[CloudEmbedderApiKeys] = None,
 ) -> Tuple[TokenizerContract, VerificationStatus]:
     """
     Resolve tokenizer for cloud providers (OpenAI, Cohere, Anthropic, etc.)
@@ -886,30 +907,27 @@ def _resolve_cloud_tokenizer(
         )
         return tokenizer, VerificationStatus.VERIFIED
 
+    keys = api_keys or CloudEmbedderApiKeys()
+
     if provider == EmbedderProvider.COHERE:
-        # Attempt to get Cohere API key from environment for SDK-backed counting.
-        import os
-        api_key = os.environ.get("COHERE_API_KEY") or None
-        special_tokens: Dict[str, str] = {}  # Cohere BPE has no exposed sentinels
+        cohere_key = (keys.cohere or "").strip() or None
+        special_tokens: Dict[str, str] = {}
         tokenizer = _CohereTokenizer(
             model_id=model_id,
             max_length=catalog_max,
-            api_key=api_key,
+            api_key=cohere_key,
             special_tokens=special_tokens,
         )
         return tokenizer, VerificationStatus.VERIFIED
 
     if provider == EmbedderProvider.GOOGLE:
-        # Use GeminiTokenizerContract (SentencePiece via countTokens API).
-        # Falls back to tiktoken approximation if the key is missing/invalid.
-        import os
-        api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+        google_key = (keys.google or "").strip()
         try:
             from app.core.tokenization.gemini_tokenizer import GeminiTokenizerContract
             model_name = model_id.removeprefix("google/")
             gemini_tok = GeminiTokenizerContract(
                 model_id=model_name,
-                api_key_env="GOOGLE_API_KEY",
+                api_key=google_key or None,
                 timeout_sec=5.0,
             )
             return gemini_tok, VerificationStatus.VERIFIED
@@ -1152,14 +1170,18 @@ class EmbedderRegistry:
 
         return adapter
 
-    def _build_base_embedder(self, entry: EmbedderCatalogEntry) -> "Any":
+    def _build_base_embedder(
+        self,
+        entry: EmbedderCatalogEntry,
+        *,
+        api_keys: Optional[CloudEmbedderApiKeys] = None,
+    ) -> "Any":
         """
         Build a raw ``BaseEmbedder`` using the existing plugin registry.
 
-        Environment variables provide credentials; no key is accepted from
-        the catalog entry directly.  API keys are always resolved from env.
+        Cloud provider API keys MUST be supplied explicitly via ``api_keys``.
         """
-        import os
+        keys = api_keys or CloudEmbedderApiKeys()
         from app.core.plugin_registry import embedder_registry as plugin_registry  # noqa: F401 (import triggers auto-register)
 
         # Trigger plugin registration if needed.
@@ -1173,12 +1195,12 @@ class EmbedderRegistry:
         provider = entry.provider
 
         if provider == EmbedderProvider.OPENAI:
-            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+            api_key = (keys.openai or "").strip()
             if not api_key:
                 raise TokenizerResolutionError(
                     model_id=entry.model_id,
                     provider="openai",
-                    reason="OPENAI_API_KEY environment variable is not set.",
+                    reason="OpenAI api_key must be supplied explicitly to EmbedderRegistry.",
                 )
             model_name = entry.model_id.removeprefix("openai/")
             return er.build(
@@ -1189,12 +1211,12 @@ class EmbedderRegistry:
             )
 
         if provider == EmbedderProvider.COHERE:
-            api_key = os.environ.get("COHERE_API_KEY", "").strip()
+            api_key = (keys.cohere or "").strip()
             if not api_key:
                 raise TokenizerResolutionError(
                     model_id=entry.model_id,
                     provider="cohere",
-                    reason="COHERE_API_KEY environment variable is not set.",
+                    reason="Cohere api_key must be supplied explicitly to EmbedderRegistry.",
                 )
             model_name = entry.model_id.removeprefix("cohere/")
             return er.build(
@@ -1211,12 +1233,11 @@ class EmbedderRegistry:
                 device="auto",
                 batch_size=32,
                 normalize=entry.is_normalized,
+                trust_remote_code=entry.requires_trust_remote_code,
             )
 
         if provider == EmbedderProvider.OLLAMA:
-            base_url = os.environ.get(
-                "OLLAMA_BASE_URL", "http://localhost:11434"
-            ).strip()
+            base_url = "http://localhost:11434"
             model_name = entry.model_id.removeprefix("ollama/")
             return er.build(
                 "ollama",
@@ -1226,13 +1247,12 @@ class EmbedderRegistry:
             )
 
         if provider == EmbedderProvider.GOOGLE:
-            # Google Gemini embedder — registered in plugin registry as "gemini"
-            api_key = os.environ.get("GOOGLE_API_KEY", "").strip()
+            api_key = (keys.google or "").strip()
             if not api_key:
                 raise TokenizerResolutionError(
                     model_id=entry.model_id,
                     provider="google",
-                    reason="GOOGLE_API_KEY environment variable is not set.",
+                    reason="Google api_key must be supplied explicitly to EmbedderRegistry.",
                 )
             model_name = entry.model_id.removeprefix("google/")
             return er.build(

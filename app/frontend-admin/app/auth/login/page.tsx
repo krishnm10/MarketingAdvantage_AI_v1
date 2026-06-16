@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { Zap, Loader2, AlertCircle, Eye, EyeOff } from "lucide-react";
-import apiClient from "@/lib/apiClient";
 import { setAuthToken } from "@/lib/authToken";
 
 export default function LoginPage() {
@@ -21,14 +20,29 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const res = await apiClient.post("/api/v2/auth/login", {
-        username,
-        password,
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ username, password }),
       });
-      setAuthToken(res.data.access_token);
+
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
+        throw new Error(
+          typeof data?.detail === "string"
+            ? data.detail
+            : "Invalid username or password"
+        );
+      }
+
+      setAuthToken(data.access_token);
       router.push("/dashboard");
-    } catch (err: any) {
-      setError(err?.response?.data?.detail || "Invalid username or password");
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : "Invalid username or password";
+      setError(message);
     } finally {
       setLoading(false);
     }
@@ -36,12 +50,10 @@ export default function LoginPage() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 relative overflow-hidden">
-      {/* Background effects */}
       <div className="absolute inset-0 bg-[linear-gradient(to_right,#1e293b_1px,transparent_1px),linear-gradient(to_bottom,#1e293b_1px,transparent_1px)] bg-[size:3rem_3rem] opacity-20" />
       <div className="absolute top-1/3 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-primary-500/10 rounded-full blur-[120px]" />
 
       <div className="relative z-10 w-full max-w-md px-6">
-        {/* Logo */}
         <div className="text-center mb-8">
           <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-primary-500 to-primary-700 shadow-2xl shadow-primary-600/30">
             <Zap className="h-7 w-7 text-white" />
@@ -50,12 +62,10 @@ export default function LoginPage() {
           <p className="mt-1 text-sm text-slate-400">Sign in to Marketing Advantage AI Admin</p>
         </div>
 
-        {/* Login Card */}
         <form
           onSubmit={handleSubmit}
           className="rounded-2xl border border-slate-700/50 bg-slate-900/80 backdrop-blur-xl p-8 shadow-2xl"
         >
-          {/* Error */}
           {error && (
             <div className="mb-5 flex items-center gap-2 rounded-lg bg-red-500/10 border border-red-500/20 px-4 py-3">
               <AlertCircle className="h-4 w-4 text-red-400 flex-shrink-0" />
@@ -63,7 +73,6 @@ export default function LoginPage() {
             </div>
           )}
 
-          {/* Username */}
           <div className="mb-4">
             <label className="block text-xs font-medium text-slate-400 mb-1.5">Username</label>
             <input
@@ -76,7 +85,6 @@ export default function LoginPage() {
             />
           </div>
 
-          {/* Password */}
           <div className="mb-6">
             <label className="block text-xs font-medium text-slate-400 mb-1.5">Password</label>
             <div className="relative">
@@ -98,7 +106,6 @@ export default function LoginPage() {
             </div>
           </div>
 
-          {/* Submit */}
           <button
             type="submit"
             disabled={loading}
@@ -112,7 +119,6 @@ export default function LoginPage() {
           </button>
         </form>
 
-        {/* Footer */}
         <p className="mt-6 text-center text-xs text-slate-600">
           Marketing Advantage AI — Enterprise Admin Console
         </p>

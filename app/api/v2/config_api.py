@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import signal
-import time
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -152,6 +151,7 @@ _PIPELINE_ENV_FROM_UI_FORBIDDEN = re.compile(
 
 # Keys migrated to merged Client JSON — reject writes from admin .env UI.
 _TENANT_JSON_PIPELINE_ENV_KEYS = frozenset({
+    "CHUNKING_STRATEGY",
     "CHUNK_SIZE",
     "CHUNK_OVERLAP",
     "MIN_CHUNK_TOKENS",
@@ -188,6 +188,172 @@ _TENANT_JSON_PIPELINE_ENV_KEYS = frozenset({
 })
 
 
+# Pipeline / provider secrets and tuning — never returned by GET /config (tenant JSON only).
+_PIPELINE_ENV_KEY_PREFIXES: tuple[str, ...] = (
+    "CHROMA_",
+    "QDRANT_",
+    "PINECONE_",
+    "MILVUS_",
+    "WEAVIATE_",
+    "OLLAMA_",
+    "OPENAI_",
+    "HF_",
+    "HUGGINGFACE_",
+    "COHERE_",
+    "GROQ_",
+    "ANTHROPIC_",
+    "GEMINI_",
+    "GOOGLE_",
+    "SERPER_",
+    "DEEPAI_",
+    "CHUNK",
+    "EMBED_",
+    "INGEST_",
+    "PHANTOM_",
+    "DEDUP_",
+    "VISION_",
+    "AI_PROFILE",
+    "DEFAULT_TOKENIZER",
+    "HF_TOKENIZER",
+    "USE_MODEL_NATIVE",
+    "MIN_CHUNK",
+    "VISUAL_LLM",
+    "MAI_DEDUP",
+    "MAI_VECTOR",
+    "MAI_EMBED",
+    "MAI_LLM",
+    "MAI_COLLECTION",
+    "MAI_SEARCH",
+    "MAI_RERANKER",
+    "ENABLE_LEGACY_ENV",
+)
+
+# Infra-only keys the deployment panel may display (aligned with AppSettings + platform boot).
+_DEPLOYMENT_ENV_ALLOWLIST: frozenset[str] = frozenset({
+    "DATABASE_URL",
+    "POSTGRES_USER",
+    "POSTGRES_PASSWORD",
+    "POSTGRES_HOST",
+    "POSTGRES_PORT",
+    "POSTGRES_DB",
+    "JWT_SECRET_KEY",
+    "JWT_SECRET",
+    "JWT_ALGORITHM",
+    "ACCESS_TOKEN_EXPIRE_MINUTES",
+    "AUTH_USERS",
+    "CORS_ORIGINS",
+    "ENVIRONMENT",
+    "PORT",
+    "LOG_FORMAT",
+    "PIPELINE_LOG_LEVEL",
+    "SENTRY_DSN",
+    "SENTRY_TRACES_SAMPLE_RATE",
+    "RATE_LIMIT_DEFAULT",
+    "REDIS_URL",
+    "REDIS_HOST",
+    "REDIS_PORT",
+    "REDIS_PASSWORD",
+    "REDIS_USERNAME",
+    "REDIS_DB",
+    "REDIS_SSL",
+    "CELERY_ENABLED",
+    "CELERY_BROKER",
+    "CELERY_BROKER_URL",
+    "CELERY_RESULT_BACKEND",
+    "CELERY_REDIS_URL",
+    "CELERY_WORKER_POOL",
+    "CELERY_WORKER_CONCURRENCY",
+    "CELERY_WORKER_LOGLEVEL",
+    "CELERY_WORKER_QUEUES",
+    "CELERY_WORKER_MAX_TASKS_PER_CHILD",
+    "CELERY_WORKER_PREFETCH_MULTIPLIER",
+    "CELERY_TASK_SOFT_TIME_LIMIT",
+    "CELERY_TASK_HARD_TIME_LIMIT",
+    "CELERY_TASK_MAX_RETRIES",
+    "CELERY_TASK_RETRY_DELAY",
+    "CELERY_RESULT_EXPIRES",
+    "CELERY_WORKER_DISABLE_HEARTBEAT",
+    "CELERY_WORKER_DISABLE_GOSSIP",
+    "CELERY_WORKER_DISABLE_MINGLE",
+    "RABBITMQ_URL",
+    "KAFKA_BOOTSTRAP_SERVERS",
+    "KAFKA_SECURITY_PROTOCOL",
+    "KAFKA_SASL_MECHANISM",
+    "KAFKA_SASL_USERNAME",
+    "KAFKA_SASL_PASSWORD",
+    "KAFKA_SSL_KEY_PASSWORD",
+    "KAFKA_SCHEMA_REGISTRY_AUTH",
+    "KAFKA_OAUTHBEARER_CONFIG",
+    "NATS_URL",
+    "PULSAR_URL",
+    "SQS_REGION",
+    "SQS_QUEUE_PREFIX",
+    "GOOGLE_CLOUD_PROJECT",
+    "PUBSUB_SUBSCRIPTION_PREFIX",
+    "UPSTASH_BROKER_TYPE",
+    "VALIDATION_INTERVAL",
+    "CONFLICT_INTERVAL",
+    "TEMPORAL_INTERVAL",
+    "VALIDATION_BATCH_SIZE",
+    "CONFLICT_BATCH_SIZE",
+    "TEMPORAL_BATCH_SIZE",
+    "ENABLE_AGENTIC_VALIDATION",
+    "ENABLE_CONFLICT_ANALYSIS",
+    "ENABLE_TEMPORAL_REVALIDATION",
+    "ENABLE_VALIDATION",
+    "ENABLE_CONFLICT",
+    "ENABLE_TEMPORAL",
+    "TENANT_ENFORCEMENT_MODE",
+    "INTERNAL_HEALTH_TOKEN",
+    "MAI_DEFAULT_BUSINESS_ID",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_HEADERS",
+    "OTEL_SERVICE_NAME",
+    "GOLDEN_SET_PATH",
+    "GOLDEN_MIN_PRECISION",
+    "GOLDEN_MIN_RECALL",
+    "COST_TRACKING_ENABLED",
+    "COST_DAILY_LIMIT_USD",
+})
+
+
+def _is_deployment_env_key(key: str) -> bool:
+    """True when *key* is platform infrastructure — safe to expose in the deployment panel."""
+    if key in _DEPLOYMENT_ENV_ALLOWLIST:
+        return True
+    if key.startswith("OTEL_"):
+        return True
+    if key.startswith("CELERY_") and key not in _TENANT_JSON_PIPELINE_ENV_KEYS:
+        return True
+    if key.startswith("KAFKA_"):
+        return True
+    return False
+
+
+def _is_pipeline_env_key(key: str) -> bool:
+    """True when *key* belongs in tenant JSON, not the deployment .env panel."""
+    if key in DEPRECATED_PIPELINE_ENV_VARS:
+        return True
+    if key in _TENANT_JSON_PIPELINE_ENV_KEYS:
+        return True
+    if _PIPELINE_ENV_FROM_UI_FORBIDDEN.match(key):
+        return True
+    if key.startswith(_PIPELINE_ENV_KEY_PREFIXES):
+        return True
+    if key.startswith("MAI_") and key != "MAI_DEFAULT_BUSINESS_ID":
+        return True
+    return False
+
+
+def _filter_deployment_env(raw: Dict[str, str]) -> Dict[str, str]:
+    """Return only infrastructure keys — strip pipeline semantics even if present in .env."""
+    return {
+        k: v
+        for k, v in raw.items()
+        if _is_deployment_env_key(k) and not _is_pipeline_env_key(k)
+    }
+
+
 def _mask(key: str, val: str) -> str:
     """Return masked value for sensitive keys."""
     if key in _SENSITIVE_KEYS and val:
@@ -213,7 +379,8 @@ async def get_config(
         raise HTTPException(status_code=404, detail=".env file not found")
 
     raw = _parse_env(_ENV_PATH)
-    masked = {k: _mask(k, v) for k, v in raw.items()}
+    deployment_only = _filter_deployment_env(raw)
+    masked = {k: _mask(k, v) for k, v in deployment_only.items()}
     return {"env_path": str(_ENV_PATH), "config": masked}
 
 
@@ -229,10 +396,10 @@ async def update_config(
     user=Depends(require_role("admin")),
 ):
     """
-    Write key-value pairs to the .env file.
-    Only admin users can call this.
-    If reload_backend=true, sends SIGHUP (on Unix) or sets a flag to
-    let uvicorn --reload pick up changes automatically.
+    Write key-value pairs to the .env file (deployment / infra secrets only).
+
+    Pipeline semantics (chunking, embedder, vectordb, LLM, MAI_*) MUST be saved
+    via ConfigStore tenant JSON APIs — never through this endpoint.
     """
     if not payload.updates:
         raise HTTPException(
@@ -248,10 +415,6 @@ async def update_config(
         if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', key):
             blocked.add(key)
             continue
-        if key == "CHUNKING_STRATEGY":
-            value = str(payload.updates[key]).strip().lower()
-            if value not in _VALID_CHUNKING_STRATEGIES:
-                invalid_values[key] = value
         if key == "DEFAULT_TOKENIZER_BACKEND":
             value = str(payload.updates[key]).strip().lower()
             if value not in _VALID_TOKENIZER_BACKENDS:
@@ -306,27 +469,6 @@ async def update_config(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=" ".join(detail_parts),
         )
-
-    # #region agent log
-    if "CHROMA_PATH" in payload.updates:
-        try:
-            _dbg_path = Path(__file__).resolve().parents[3] / "debug-2bf9cb.log"
-            _line = {
-                "sessionId": "2bf9cb",
-                "hypothesisId": "H2",
-                "location": "config_api.py:update_config",
-                "message": "global .env update includes CHROMA_PATH",
-                "data": {
-                    "keys": list(payload.updates.keys()),
-                    "chroma_path_len": len(str(payload.updates.get("CHROMA_PATH", ""))),
-                },
-                "timestamp": int(time.time() * 1000),
-            }
-            with open(_dbg_path, "a", encoding="utf-8") as _df:
-                _df.write(json.dumps(_line) + "\n")
-        except Exception:
-            pass
-    # #endregion
 
     # Read old values for audit diff BEFORE writing
     old_values = _parse_env(_ENV_PATH)

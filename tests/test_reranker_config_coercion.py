@@ -77,7 +77,7 @@ def test_ollama_stack_forces_local_flashrank():
         reranker={
             "type": "crossencoder",
             "model": "gpt-4o-mini",
-            "api_key_env": "OPENAI_API_KEY",
+            "secret_ref": {"uri": "env://OPENAI_API_KEY"},
             "top_k": 5,
         }
     )
@@ -92,7 +92,7 @@ def test_coerce_crossencoder_gpt_to_llm_judge_when_api_key_non_local():
     cfg = RerankerConfig(
         type=RerankerType.CROSS_ENCODER,
         model="gpt-4o-mini",
-        api_key_env="OPENAI_API_KEY",
+        secret_ref={"uri": "env://OPENAI_API_KEY"},
     )
     out = coerce_reranker_config(cfg, local_stack=False)
     assert out.type == RerankerType.LLM_JUDGE
@@ -104,7 +104,7 @@ def test_resolve_runtime_components_matha_like():
         reranker={
             "type": "crossencoder",
             "model": "gpt-4o-mini",
-            "api_key_env": "OPENAI_API_KEY",
+            "secret_ref": {"uri": "env://OPENAI_API_KEY"},
         }
     )
     rc = resolve_runtime_components(cfg)
@@ -123,13 +123,16 @@ def test_circuit_breaker_falls_back_to_flashrank():
             },
             "embedder": {
                 "type": "gemini",
-                "gemini": {"model": "gemini-embedding-2", "api_key_env": "GOOGLE_API_KEY"},
+                "gemini": {
+                    "model": "gemini-embedding-2",
+                    "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
+                },
             },
             "llm": {
                 "single": {
                     "type": "gemini",
                     "model": "gemini-2.5-flash",
-                    "api_key_env": "GOOGLE_API_KEY",
+                    "secret_ref": {"uri": "env://GOOGLE_API_KEY"},
                     "base_url": "https://generativelanguage.googleapis.com",
                 }
             },
@@ -137,7 +140,7 @@ def test_circuit_breaker_falls_back_to_flashrank():
             "reranker": {
                 "type": "llm_judge",
                 "model": "gpt-4o-mini",
-                "api_key_env": "OPENAI_API_KEY",
+                "secret_ref": {"uri": "env://OPENAI_API_KEY"},
                 "judge_provider": "openai",
             },
         }

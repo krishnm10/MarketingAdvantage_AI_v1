@@ -9,7 +9,6 @@ Responsibilities:
 - Candidate construction (zero data loss)
 """
 
-import os
 from typing import List, Tuple, Optional, Dict, Any
 from sqlalchemy import select
 from datetime import datetime, timezone
@@ -242,12 +241,19 @@ class RetrievalRepository:
     - Zero data loss
     """
     
-    def __init__(self, db_session, vectordb=None, collection: str = None):
+    def __init__(self, db_session, vectordb, collection: str):
+        if vectordb is None:
+            raise ValueError(
+                "RetrievalRepository requires an injected vectordb client from "
+                "AssembledPipeline / ClientConfig — env-based construction is removed."
+            )
+        if not collection or not str(collection).strip():
+            raise ValueError(
+                "RetrievalRepository requires an explicit collection name from tenant JSON."
+            )
         self.db = db_session
-        
-        # Pluggable vector DB (lazy-loaded from .env if not provided)
         self._vectordb = vectordb
-        self._collection = collection or os.getenv("MAI_COLLECTION", "ingested_content")
+        self._collection = str(collection).strip()
 
     def close(self) -> None:
         vectordb = self._vectordb
@@ -265,97 +271,7 @@ class RetrievalRepository:
             pass
     
     def _get_vectordb(self):
-        """Lazy-load vector DB from .env config (pluggable: qdrant, chroma, pinecone, milvus, weaviate, redis)"""
-        if self._vectordb is None:
-            db_type = os.getenv("MAI_VECTORDB", "chroma").lower()
-            log_info(f"[REPO] Initializing pluggable vector DB: {db_type}")
-            vector_transport = (os.getenv("MAI_VECTOR_TRANSPORT", "auto") or "auto").strip().lower()
-            if vector_transport not in ("auto", "http", "grpc"):
-                vector_transport = "auto"
-            
-            if db_type == "qdrant":
-                from app.core.vectordb.qdrant_v1 import QdrantVectorDB
-                qdrant_transport = (os.getenv("QDRANT_TRANSPORT") or vector_transport).strip().lower()
-                self._vectordb = QdrantVectorDB(
-                    url=os.getenv("QDRANT_URL") or None,
-                    host=os.getenv("QDRANT_HOST", "localhost"),
-                    port=int(os.getenv("QDRANT_PORT") or "6333"),
-                    api_key=os.getenv("QDRANT_API_KEY") or None,
-                    prefer_grpc=(
-                        True if qdrant_transport == "grpc" else
-                        False if qdrant_transport == "http" else
-                        os.getenv("QDRANT_PREFER_GRPC", "").lower() in ("1", "true", "yes")
-                    ),
-                    timeout=float(os.getenv("QDRANT_TIMEOUT") or "30"),
-                )
-            elif db_type == "chroma":
-                from app.core.vectordb.chroma_v1 import ChromaVectorDB
-                chroma_host = os.getenv("CHROMA_HOST") or None
-                chroma_port = int(os.getenv("CHROMA_PORT") or "8000")
-                use_ssl = os.getenv("CHROMA_SSL", "").lower() in ("1", "true", "yes")
-                api_key = os.getenv("CHROMA_API_KEY") or None
-                self._vectordb = ChromaVectorDB(
-                    host=chroma_host,
-                    port=chroma_port,
-                    ssl=use_ssl,
-                    api_key=api_key,
-                    persist_directory=os.getenv("CHROMA_PATH", "./pluggable_db") if not chroma_host else None,
-                    anonymized_telemetry=False,
-                )
-            elif db_type == "pinecone":
-                from app.core.vectordb.pinecone_v1 import PineconeVectorDB
-                pinecone_mode = os.getenv("PINECONE_MODE", "cloud").strip().lower()
-                self._vectordb = PineconeVectorDB(
-                    mode="local" if pinecone_mode == "local" else "cloud",
-                    api_key=(os.getenv("PINECONE_API_KEY") or None),
-                    index_name=os.getenv("PINECONE_INDEX_NAME", "ingested-content"),
-                    namespace=os.getenv("PINECONE_NAMESPACE", "default"),
-                    embedding_dim=int(os.getenv("PINECONE_EMBEDDING_DIM", "1024")),
-                    metric=os.getenv("PINECONE_METRIC", "cosine"),
-                    cloud=os.getenv("PINECONE_CLOUD", "aws"),
-                    region=os.getenv("PINECONE_REGION", "us-east-1"),
-                    local_path=os.getenv("PINECONE_LOCAL_PATH") or None,
-                )
-            elif db_type == "milvus":
-                from app.core.vectordb.milvus_v1 import MilvusVectorDB
-                self._vectordb = MilvusVectorDB(
-                    uri=os.getenv("MILVUS_URI") or None,
-                    token=os.getenv("MILVUS_TOKEN") or None,
-                    host=os.getenv("MILVUS_HOST", "localhost"),
-                    port=int(os.getenv("MILVUS_PORT") or "19530"),
-                )
-            elif db_type == "weaviate":
-                from app.core.vectordb.weaviate_v1 import WeaviateVectorDB
-                headers_raw = os.getenv("WEAVIATE_ADDITIONAL_HEADERS_JSON", "").strip()
-                weaviate_transport = (os.getenv("WEAVIATE_TRANSPORT") or vector_transport).strip().lower()
-                self._vectordb = WeaviateVectorDB(
-                    url=os.getenv("WEAVIATE_URL", "http://localhost:8080"),
-                    api_key=os.getenv("WEAVIATE_API_KEY") or None,
-                    additional_headers=__import__("json").loads(headers_raw) if headers_raw else {},
-                    embedded=os.getenv("WEAVIATE_EMBEDDED", "false").lower() in ("1", "true", "yes"),
-                    prefer_grpc=(weaviate_transport != "http"),
-                    grpc_host=os.getenv("WEAVIATE_GRPC_HOST") or None,
-                    grpc_port=int(os.getenv("WEAVIATE_GRPC_PORT", "50051")),
-                    skip_init_checks=os.getenv("WEAVIATE_SKIP_INIT_CHECKS", "false").lower() in ("1", "true", "yes"),
-                )
-            elif db_type == "redis":
-                from app.core.vectordb.redis_v1 import RedisVectorDB
-                self._vectordb = RedisVectorDB(
-                    url=os.getenv("REDIS_URL") or None,
-                    host=os.getenv("REDIS_HOST", "localhost"),
-                    port=int(os.getenv("REDIS_PORT") or "6379"),
-                    password=os.getenv("REDIS_PASSWORD") or None,
-                    username=os.getenv("REDIS_USERNAME") or None,
-                    db=int(os.getenv("REDIS_DB") or "0"),
-                    ssl=os.getenv("REDIS_SSL", "false").lower() == "true",
-                )
-            else:
-                raise ValueError(
-                    f"Unsupported MAI_VECTORDB='{db_type}'. "
-                    f"Supported: qdrant, chroma, pinecone, milvus, weaviate, redis"
-                )
-            
-            log_info(f"[REPO] Vector DB ready: {self._vectordb.kind}")
+        """Return the tenant-scoped VectorDB injected at construction time."""
         return self._vectordb
     
     async def fetch_candidates(

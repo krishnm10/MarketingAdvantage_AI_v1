@@ -20,3 +20,6 @@ def _phase7_test_environment() -> None:
         "pytest_phase7_only_" + ("k" * 48),
     )
     os.environ.setdefault("ENVIRONMENT", "test")
+    os.environ.setdefault("GOOGLE_API_KEY", "pytest-dummy-google-key")
+    os.environ.setdefault("OPENAI_API_KEY", "pytest-dummy-openai-key")
+    os.environ.setdefault("GROQ_API_KEY", "pytest-dummy-groq-key")

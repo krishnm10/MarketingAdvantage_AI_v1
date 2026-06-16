@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from app.ai.contracts.tokenizer_contract import (
     TokenizerContract,
@@ -79,6 +79,7 @@ class GeminiTokenizerContract(TokenizerContract):
         *,
         model_id:    str = "gemini-embedding-001",
         api_key_env: str = "GOOGLE_API_KEY",
+        api_key:     Optional[str] = None,
         timeout_sec: float = 5.0,
     ) -> None:
         try:
@@ -88,13 +89,14 @@ class GeminiTokenizerContract(TokenizerContract):
                 "google-genai is not installed. Run: pip install google-genai"
             )
 
-        api_key = os.environ.get(api_key_env, "").strip()
-        if not api_key:
+        resolved_key = (api_key or os.environ.get(api_key_env, "")).strip()
+        if not resolved_key:
             raise EnvironmentError(
-                f"[GeminiTokenizerContract] Env var {api_key_env!r} is not set."
+                f"[GeminiTokenizerContract] Google API key is not set "
+                f"(pass api_key= or set env {api_key_env!r})."
             )
 
-        self._client     = _genai_pkg.Client(api_key=api_key)
+        self._client     = _genai_pkg.Client(api_key=resolved_key)
         self._model_id   = model_id
         self._timeout    = timeout_sec
         self._max_length = _CONTEXT_LIMITS.get(model_id, _DEFAULT_LIMIT)

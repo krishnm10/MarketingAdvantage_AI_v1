@@ -279,6 +279,40 @@ embedders:
       against model config hidden_size before production use.
 
   # ──────────────────────────────────────────────────────────────────────────
+  # HUGGINGFACE — nomic-ai/nomic-embed-text-v1.5
+  # Custom nomic-bert-2048 architecture — requires trust_remote_code=True.
+  # Python dep: einops (listed in requirements.txt; imported by custom model code).
+  # Encode-time prefixes are applied via tenant embedder.query_prefix /
+  # document_prefix (PromptedEmbedder); catalog prefixes document F-07 intent.
+  # ──────────────────────────────────────────────────────────────────────────
+
+  - model_id: "nomic-ai/nomic-embed-text-v1.5"
+    provider: "huggingface"
+    tokenizer_class: "transformers.AutoTokenizer"
+    tokenizer_encoding: null
+    tokenizer_source: "hf_config"
+    tokenizer_family: "wordpiece"
+    dimension: 768
+    distance_metric: "cosine"
+    is_normalized: true
+    embed_max_tokens: 2048
+    default_reranker_id: "cohere/rerank-v3.0"
+    query_prefix: "search_query: "
+    passage_prefix: "search_document: "
+    requires_trust_remote_code: true
+    verification_status: "verified"
+    embedder_type: "symmetric_encoder"
+    lang_support: "en"
+    notes: >
+      Nomic v1.5 uses custom nomic-bert-2048 code on HuggingFace Hub.
+      requires_trust_remote_code=true. REQUIRED Python package: einops
+      (pip install einops; pinned in requirements.txt). Without einops,
+      model load fails with "No module named einops". search_query:/
+      search_document: prefixes are mandatory for retrieval quality (F-07).
+      Tenant config must set embedder.query_prefix and embedder.document_prefix
+      to match.
+
+  # ──────────────────────────────────────────────────────────────────────────
   # OLLAMA — nomic-embed-text
   # WordPiece tokenizer (BERT-based architecture, confirmed from model card).
   # Ollama exposes 2048 token context window.

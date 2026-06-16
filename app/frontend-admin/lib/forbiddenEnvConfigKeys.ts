@@ -3,7 +3,10 @@
  * `app/api/v2/config_api.py` (`_TENANT_JSON_PIPELINE_ENV_KEYS`).
  * Keep in sync with that frozenset.
  */
+import { pipelineBlockHref, type PipelineBlockId } from "./pipelineBlocks";
+
 export const TENANT_JSON_PIPELINE_ENV_KEYS = new Set<string>([
+  "CHUNKING_STRATEGY",
   "CHUNK_SIZE",
   "CHUNK_OVERLAP",
   "MIN_CHUNK_TOKENS",
@@ -65,9 +68,24 @@ export function isTenantJsonEnvKey(key: string): boolean {
   );
 }
 
-export const PIPELINE_SETTINGS_PATH = "/settings/pipeline";
+export const PIPELINE_SETTINGS_PATH = "/pipeline/ai-models";
 
-export function pipelineSettingsHref(clientId: string): string {
+const PIPELINE_BLOCK_IDS = new Set<string>([
+  "parsers",
+  "security",
+  "secrets",
+  "chunking",
+  "embeddings",
+  "retrieval",
+  "prompts",
+  "llm",
+  "orchestration",
+]);
+
+export function pipelineSettingsHref(clientId: string, block?: string): string {
+  if (block && PIPELINE_BLOCK_IDS.has(block)) {
+    return pipelineBlockHref(clientId, block as PipelineBlockId);
+  }
   const q = new URLSearchParams();
   if (clientId && clientId !== "default") q.set("client", clientId);
   const qs = q.toString();

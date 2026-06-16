@@ -44,6 +44,9 @@ from app.core.plugin_registry import ingestor_registry, PluginNotFoundError
 # -----------------------------------------------------------
 UPLOAD_DIR = os.path.join("static", "uploads", "api")
 LOG_PATH = os.path.join("logs", "ingestion.log")
+_LARGE_FILE_ASYNC_THRESHOLD_BYTES = int(
+    os.getenv("INGESTION_ASYNC_FILE_SIZE_BYTES", str(5 * 1024 * 1024))
+)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
 
@@ -153,6 +156,7 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
         saved_path = os.path.join(UPLOAD_DIR, saved_file_name)
 
         content = await file.read()
+        file_size = len(content)
         temp_path = f"{saved_path}.tmp"
         async with aiofiles.open(temp_path, "wb") as tmpf:
             await tmpf.write(content)
@@ -205,12 +209,21 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
             await db.commit()
 
         # ── Celery: offload parse + embed to a background worker ──────────────
-        # Only attempted when CELERY_ENABLED=true in .env.
-        # Falls back transparently to inline (blocking) processing when Celery /
-        # broker is not running, so the server continues to work without a broker.
+        # Large files MUST use async path; smaller files may queue when Celery is enabled.
+        require_async = file_size > _LARGE_FILE_ASYNC_THRESHOLD_BYTES
         try:
             from app.worker.broker_config import is_celery_enabled
-            if is_celery_enabled():
+            celery_enabled = is_celery_enabled()
+            if require_async and not celery_enabled:
+                os.remove(saved_path)
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"File exceeds {_LARGE_FILE_ASYNC_THRESHOLD_BYTES} bytes. "
+                        "Enable Celery async ingestion (CELERY_ENABLED=true) for large uploads."
+                    ),
+                )
+            if celery_enabled:
                 from app.core.config.client_config_resolver import (
                     get_celery_ingestion_enqueue_kwargs,
                 )
@@ -227,9 +240,19 @@ async def route_file_ingestion(file: UploadFile, business_id: str = None):
                     "task_id": task.id,
                     "path": saved_path,
                     "hash": file_hash,
+                    "poll_url": f"/api/v2/ingestion/status/{file_id}",
+                    "async_required": require_async,
                 }
+        except HTTPException:
+            raise
         except Exception:
-            pass  # Celery / broker unavailable — fall through to inline
+            if require_async:
+                os.remove(saved_path)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Large file requires async ingestion but Celery broker is unavailable.",
+                )
+            pass  # Celery / broker unavailable — fall through to inline for small files
 
         # ── Inline fallback (no Celery / broker not running) ──────────────────
         parsed_output = await parser_func(saved_path)

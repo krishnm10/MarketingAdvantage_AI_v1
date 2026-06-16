@@ -114,7 +114,8 @@ class TestContextWindowManager:
             {"text": "high relevance " * 50, "score": 0.95},
             {"text": "low relevance " * 50, "score": 0.1},
         ]
-        result = mgr.apply_budget(chunks, max_context_tokens=200)
-        if result["chunks_dropped"] > 0:
-            remaining_texts = [c["text"] for c in result["trimmed_chunks"]]
-            assert any("high relevance" in t for t in remaining_texts)
+        result = mgr.apply_budget(chunks, max_context_tokens=1700)
+        assert result["chunks_dropped"] >= 1
+        remaining_texts = [c["text"] for c in result["trimmed_chunks"]]
+        assert any("high relevance" in t for t in remaining_texts)
+        assert not any("low relevance" in t for t in remaining_texts)

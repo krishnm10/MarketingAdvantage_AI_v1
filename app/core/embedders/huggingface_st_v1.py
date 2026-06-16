@@ -23,7 +23,7 @@ pip install sentence-transformers
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Optional
 
 from app.core.embedders.base import BaseEmbedder, EmbedderInfo, _l2_normalize
 
@@ -43,6 +43,9 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
         device: str = "auto",      # FIX-7: was "cpu", now "auto"
         batch_size: int = 32,
         normalize: bool = True,
+        trust_remote_code: bool = False,
+        revision: Optional[str] = None,
+        hf_token: Optional[str] = None,
     ):
         try:
             from sentence_transformers import SentenceTransformer  # noqa: F401
@@ -55,6 +58,9 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
         self._device = self._resolve_device(device)   # FIX-6
         self._batch_size = int(batch_size)
         self._normalize = bool(normalize)
+        self._trust_remote_code = bool(trust_remote_code)
+        self._revision = revision.strip() if isinstance(revision, str) and revision.strip() else None
+        self._hf_token = hf_token.strip() if isinstance(hf_token, str) and hf_token.strip() else None
 
         # FIX-4 + FIX-5: do NOT load model here.
         # _load_model() is called on first embed call.
@@ -64,8 +70,8 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
 
         logger.info(
             "[HFSTEmbedder] Configured | model=%s | device=%s | "
-            "batch=%d | normalize=%s",
-            model, self._device, batch_size, normalize,
+            "batch=%d | normalize=%s | trust_remote_code=%s",
+            model, self._device, batch_size, normalize, self._trust_remote_code,
         )
 
     # ------------------------------------------------------------------
@@ -86,6 +92,16 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
             pass
         return "cpu"
 
+    def _sentence_transformer_kwargs(self) -> dict:
+        kwargs = {"device": self._device}
+        if self._revision:
+            kwargs["revision"] = self._revision
+        if self._trust_remote_code:
+            kwargs["trust_remote_code"] = True
+        if self._hf_token:
+            kwargs["token"] = self._hf_token
+        return kwargs
+
     # ------------------------------------------------------------------
     # FIX-4: Lazy loader — called on first embed, not on __init__
     # Thread-safe: no mutable state shared across calls during inference.
@@ -97,7 +113,31 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
         logger.info(
             "[HFSTEmbedder] Loading '%s' on %s ...", self._model_name, self._device
         )
-        self._m = SentenceTransformer(self._model_name, device=self._device)
+        st_kwargs = self._sentence_transformer_kwargs()
+        try:
+            self._m = SentenceTransformer(self._model_name, **st_kwargs)
+        except TypeError:
+            # Older sentence-transformers may not accept top-level trust_remote_code.
+            revision = st_kwargs.pop("revision", None)
+            trust_remote_code = st_kwargs.pop("trust_remote_code", False)
+            token = st_kwargs.pop("token", None)
+            model_kwargs = {}
+            tokenizer_kwargs = {}
+            if trust_remote_code:
+                model_kwargs["trust_remote_code"] = True
+                tokenizer_kwargs["trust_remote_code"] = True
+            if token:
+                model_kwargs["token"] = token
+                tokenizer_kwargs["token"] = token
+            if revision:
+                model_kwargs["revision"] = revision
+                tokenizer_kwargs["revision"] = revision
+            self._m = SentenceTransformer(
+                self._model_name,
+                device=self._device,
+                model_kwargs=model_kwargs or None,
+                tokenizer_kwargs=tokenizer_kwargs or None,
+            )
         self._dim = int(self._m.get_sentence_embedding_dimension())   # FIX-5
         logger.info("[HFSTEmbedder] ✅ Loaded | dim=%d", self._dim)
 
@@ -160,12 +200,11 @@ class HuggingFaceSTEmbedder(BaseEmbedder):
             return [_l2_normalize(v) for v in all_vecs]
         return [[float(x) for x in v] for v in all_vecs]
 
-
-
     def __repr__(self) -> str:
         status = "loaded" if self._m is not None else "lazy/not-loaded"
         return (
             f"HuggingFaceSTEmbedder(model={self._model_name!r}, "
             f"device={self._device!r}, batch={self._batch_size}, "
-            f"normalize={self._normalize}, status={status})"
+            f"normalize={self._normalize}, trust_remote_code={self._trust_remote_code}, "
+            f"status={status})"
         )

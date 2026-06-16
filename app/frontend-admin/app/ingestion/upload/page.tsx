@@ -101,11 +101,18 @@ export default function UploadPage() {
         });
       } catch (err: any) {
         console.error("Upload error:", err);
+        const detail = err?.response?.data?.detail;
+        const isProxyTimeout =
+          err?.response?.status === 504 ||
+          detail === "Upstream request timed out";
         const message =
-          (err?.code === "ECONNABORTED"
-            ? "Upload is taking longer than the default window. The backend may still be ingesting the file; check the ingestion files page shortly."
+          (isProxyTimeout
+            ? "Processing is taking longer than usual. The file may still ingest successfully — check Ingestion → Files in a minute."
             : null) ||
-          err?.response?.data?.detail ||
+          (err?.code === "ECONNABORTED"
+            ? "Upload is taking longer than expected. The backend may still be ingesting the file; check the ingestion files page shortly."
+            : null) ||
+          detail ||
           err?.response?.data?.message ||
           "Upload failed. Please try again.";
 

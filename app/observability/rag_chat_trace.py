@@ -20,7 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -183,6 +183,45 @@ def maybe_start_rag_chat_trace(session_id: str, client_id: str) -> Optional[RagC
     )
 
 
+def _usage_from_ollama_raw(raw: Any) -> Optional[Tuple[int, int, int]]:
+    """Re-read Ollama native counts from stored SDK response when LLMResponse tokens are zero."""
+    if raw is None:
+        return None
+
+    def _get(key: str) -> int:
+        if hasattr(raw, key):
+            val = getattr(raw, key, 0)
+        elif isinstance(raw, dict):
+            val = raw.get(key, 0)
+        else:
+            val = 0
+        try:
+            return int(val or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    usage = None
+    if hasattr(raw, "usage"):
+        usage = getattr(raw, "usage", None)
+    elif isinstance(raw, dict):
+        usage = raw.get("usage")
+
+    if isinstance(usage, dict) and usage:
+        pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+        ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+        tt = int(usage.get("total_tokens") or 0)
+        if tt <= 0 and (pt > 0 or ct > 0):
+            tt = pt + ct
+        if pt > 0 or ct > 0 or tt > 0:
+            return pt, ct, tt
+
+    pt = _get("prompt_eval_count")
+    ct = _get("eval_count")
+    if pt > 0 or ct > 0:
+        return pt, ct, pt + ct
+    return None
+
+
 def llm_usage_payload(resp: Any) -> Dict[str, Any]:
     """Normalize usage from app.core.llms.base.LLMResponse or duck-typed."""
     if resp is None:
@@ -203,11 +242,71 @@ def llm_usage_payload(resp: Any) -> Dict[str, Any]:
         tt_i = int(tt or 0)
     except (TypeError, ValueError):
         pt_i = ct_i = tt_i = 0
-    avail = (pt_i > 0) or (ct_i > 0) or (tt_i > 0) or (fr is not None and str(fr).strip() != "")
+
+    if pt_i <= 0 and ct_i <= 0 and tt_i <= 0:
+        raw_usage = _usage_from_ollama_raw(getattr(resp, "raw", None))
+        if raw_usage is not None:
+            pt_i, ct_i, tt_i = raw_usage
+
+    if tt_i <= 0 and (pt_i > 0 or ct_i > 0):
+        tt_i = pt_i + ct_i
+
+    avail = (pt_i > 0) or (ct_i > 0) or (tt_i > 0)
     return {
         "prompt_tokens": pt_i,
         "completion_tokens": ct_i,
         "total_tokens": tt_i,
         "finish_reason": str(fr) if fr is not None else None,
         "provider_usage_available": bool(avail),
+    }
+
+
+def aggregate_query_token_usage(
+    steps: List[Optional[Tuple[str, Any]]],
+) -> Dict[str, Any]:
+    """
+    Sum provider-reported tokens across executed LLM steps (rewrite, hyde, answer).
+
+    Steps with unavailable usage are included in the breakdown but excluded from totals.
+    """
+    step_entries: List[Dict[str, Any]] = []
+    total_pt = 0
+    total_ct = 0
+    total_tt = 0
+    any_available = False
+
+    for item in steps:
+        if item is None:
+            continue
+        step_name, resp = item
+        usage = llm_usage_payload(resp)
+        entry: Dict[str, Any] = {
+            "step": step_name,
+            "executed": True,
+            "prompt_tokens": usage["prompt_tokens"],
+            "completion_tokens": usage["completion_tokens"],
+            "total_tokens": usage["total_tokens"],
+            "provider_usage_available": usage["provider_usage_available"],
+        }
+        if usage.get("finish_reason") is not None:
+            entry["finish_reason"] = usage["finish_reason"]
+        step_entries.append(entry)
+
+        if usage["provider_usage_available"]:
+            any_available = True
+            total_pt += int(usage["prompt_tokens"])
+            total_ct += int(usage["completion_tokens"])
+            step_tt = int(usage["total_tokens"])
+            if step_tt <= 0:
+                step_tt = int(usage["prompt_tokens"]) + int(usage["completion_tokens"])
+            total_tt += step_tt
+
+    return {
+        "label": "total_query_tokens",
+        "provider_usage_available": any_available,
+        "prompt_tokens": total_pt,
+        "completion_tokens": total_ct,
+        "total_tokens": total_tt,
+        "finish_reason": None,
+        "steps": step_entries,
     }
